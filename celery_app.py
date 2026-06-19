@@ -218,6 +218,20 @@ def retention_purge_task():
         dropped_parts = db.drop_old_partitions(retention_days)
         print(f"[retention_purge] deleted {deleted_scans} scans, "
               f"dropped {len(dropped_parts)} partitions (retention={retention_days}d)")
+        # Reclaim disk: drop server-side PCAP copies + carved artifacts that no
+        # surviving scan references. Never touches the user's source file (the
+        # app only ever wrote the copy under UPLOAD_FOLDER). Isolated try so a
+        # cleanup hiccup can't undo the DB purge above.
+        try:
+            upload_folder = os.environ.get('UPLOAD_FOLDER', 'data/uploads')
+            cu = db.cleanup_orphaned_pcaps(upload_folder)
+            print(f"[retention_purge] reclaimed {len(cu['removed_pcaps'])} "
+                  f"orphaned pcap(s) + {len(cu['removed_artifact_dirs'])} "
+                  f"artifact dir(s), freed {cu['freed_bytes']} bytes")
+            if cu['errors']:
+                print(f"[retention_purge] cleanup errors: {cu['errors'][:5]}")
+        except Exception as ce:
+            print(f"[retention_purge] orphan cleanup error: {ce}")
     except Exception as e:
         print(f"[retention_purge] error: {e}")
 

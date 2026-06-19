@@ -10,6 +10,8 @@ import psycopg2.extras
 from psycopg2 import pool as pg_pool
 import json
 import os
+import shutil
+import time
 from datetime import datetime, timedelta, date
 from contextlib import contextmanager
 import ipaddress
@@ -2731,6 +2733,115 @@ def purge_old_scans(retention_days):
         deleted = cursor.rowcount
         conn.commit()
     return deleted
+
+
+def get_referenced_pcap_filenames():
+    """Return the set of PCAP filenames still referenced by a scan row.
+
+    This is the source of truth for "still in use": a server-side copy under
+    UPLOAD_FOLDER whose basename isn't in this set is an orphan.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT DISTINCT filename FROM scans WHERE filename IS NOT NULL'
+        )
+        return {row['filename'] for row in cursor.fetchall()}
+
+
+def cleanup_orphaned_pcaps(upload_folder, artifacts_root=None,
+                           min_age_seconds=86400, dry_run=False):
+    """Delete server-side PCAP copies (and their carved artifacts) that no scan
+    row references any more.
+
+    SAFETY — this only ever touches files the app itself wrote under
+    ``upload_folder`` / ``artifacts_root``. The file the user analysed lives on
+    *their* machine: on upload Flask streams the HTTP body into a fresh copy in
+    ``upload_folder``, so the original is never reachable from here. Symlinks
+    are skipped outright (a link could point outside the app), and only entries
+    whose basename is NOT referenced by any scan are removed.
+
+    ``min_age_seconds`` guards the upload→analyze race: a freshly uploaded file
+    has no scan row until analysis finishes, so it would otherwise look like an
+    orphan. Files modified within this window are left alone (default 24h, far
+    longer than any analysis; the periodic purge runs daily so the file is
+    reaped on a later pass once its scan either landed or never will).
+
+    Returns a dict: ``{removed_pcaps, removed_artifact_dirs, freed_bytes,
+    errors}``. Per-entry failures are collected, never raised — a single
+    undeletable file must not abort the sweep.
+    """
+    result = {'removed_pcaps': [], 'removed_artifact_dirs': [],
+              'freed_bytes': 0, 'errors': []}
+    if not upload_folder or not os.path.isdir(upload_folder):
+        return result
+
+    referenced = get_referenced_pcap_filenames()
+    # Carving derives the artifacts dir name from the basename WITHOUT extension
+    # (see pcap_analyzer/_core.py), so mirror that to decide which dirs survive.
+    referenced_keys = {os.path.splitext(f)[0] for f in referenced}
+
+    now = time.time()
+    upload_root = os.path.realpath(upload_folder)
+
+    def _too_new(path):
+        try:
+            return (now - os.path.getmtime(path)) < min_age_seconds
+        except OSError:
+            return True  # can't stat -> err on the side of keeping it
+
+    try:
+        entries = os.listdir(upload_root)
+    except OSError as e:
+        result['errors'].append(f'listdir {upload_root}: {e}')
+        return result
+
+    for name in entries:
+        fpath = os.path.join(upload_root, name)
+        # Leave symlinks and anything that isn't a plain file untouched.
+        if os.path.islink(fpath) or not os.path.isfile(fpath):
+            continue
+        if name in referenced or _too_new(fpath):
+            continue
+        try:
+            size = os.path.getsize(fpath)
+        except OSError:
+            size = 0
+        if not dry_run:
+            try:
+                os.remove(fpath)
+            except OSError as e:
+                result['errors'].append(f'remove {name}: {e}')
+                continue
+        result['removed_pcaps'].append(name)
+        result['freed_bytes'] += size
+
+    if artifacts_root is None:
+        artifacts_root = os.path.normpath(
+            os.path.join(upload_root, '..', 'artifacts')
+        )
+    if os.path.isdir(artifacts_root):
+        art_root = os.path.realpath(artifacts_root)
+        try:
+            art_entries = os.listdir(art_root)
+        except OSError as e:
+            result['errors'].append(f'listdir {art_root}: {e}')
+            art_entries = []
+        for key in art_entries:
+            dpath = os.path.join(art_root, key)
+            if os.path.islink(dpath) or not os.path.isdir(dpath):
+                continue
+            if key in referenced_keys or _too_new(dpath):
+                continue
+            if not dry_run:
+                try:
+                    shutil.rmtree(dpath)
+                except OSError as e:
+                    result['errors'].append(f'rmtree {key}: {e}')
+                    continue
+            result['removed_artifact_dirs'].append(key)
+
+    return result
 
 
 def list_alert_partitions():

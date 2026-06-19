@@ -5,7 +5,9 @@ partition listing, audit log.
 tags: [Admin]
 """
 
-from flask import Blueprint, request, jsonify
+import os
+
+from flask import Blueprint, request, jsonify, current_app
 
 import database as db
 from auth import role_required
@@ -151,19 +153,44 @@ def admin_purge():
         retention_days = int(data.get('retention_days') or settings.get('retention_days', 90))
     except (TypeError, ValueError):
         retention_days = 90
+    # Disk reclaim is opt-out: skip with cleanup_disk=false. dry_run previews
+    # without deleting; min_age_hours overrides the 24h upload→analyze guard.
+    cleanup_disk = data.get('cleanup_disk', True)
+    dry_run = bool(data.get('dry_run', False))
+    try:
+        min_age_seconds = int(float(data.get('min_age_hours', 24)) * 3600)
+    except (TypeError, ValueError):
+        min_age_seconds = 86400
     try:
         deleted_scans = db.purge_old_scans(retention_days)
         dropped_parts = db.drop_old_partitions(retention_days)
-        audit_event(action='retention_purge', target_type='system',
-                    extra={'retention_days': retention_days,
-                           'deleted_scans': deleted_scans,
-                           'dropped_partitions': len(dropped_parts)})
-        return jsonify({
+        resp = {
             "success": True,
             "deleted_scans": deleted_scans,
             "dropped_partitions": dropped_parts,
             "retention_days": retention_days,
-        })
+        }
+        audit_extra = {'retention_days': retention_days,
+                       'deleted_scans': deleted_scans,
+                       'dropped_partitions': len(dropped_parts)}
+        if cleanup_disk:
+            upload_folder = current_app.config.get(
+                'UPLOAD_FOLDER', os.environ.get('UPLOAD_FOLDER', 'data/uploads'))
+            cu = db.cleanup_orphaned_pcaps(
+                upload_folder, min_age_seconds=min_age_seconds, dry_run=dry_run)
+            resp["disk_cleanup"] = {
+                "dry_run": dry_run,
+                "removed_pcaps": cu['removed_pcaps'],
+                "removed_artifact_dirs": cu['removed_artifact_dirs'],
+                "freed_bytes": cu['freed_bytes'],
+                "errors": cu['errors'],
+            }
+            audit_extra.update({'orphaned_pcaps': len(cu['removed_pcaps']),
+                                'freed_bytes': cu['freed_bytes'],
+                                'dry_run': dry_run})
+        audit_event(action='retention_purge', target_type='system',
+                    extra=audit_extra)
+        return jsonify(resp)
     except Exception as e:
         return server_error(e)
 
