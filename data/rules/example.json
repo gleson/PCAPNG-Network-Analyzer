@@ -1,0 +1,77 @@
+[
+  {
+    "id": "telnet_outbound",
+    "name": "Telnet to External Host",
+    "severity": "high",
+    "category": "protocol",
+    "enabled": true,
+    "match": {
+      "protocol": "tcp",
+      "dst_port": 23,
+      "direction": "outbound"
+    },
+    "aggregate": {
+      "key": "src+dst+dst_port",
+      "min_count": 1
+    },
+    "alert": {
+      "title": "Telnet Connection to External Host",
+      "description": "{src} -> {dst}:{dst_port} (Telnet outbound, {count} packet(s))",
+      "recommendation": "Telnet sends credentials in cleartext. Replace with SSH (22) and block 23/tcp at the egress firewall.",
+      "mitre": {
+        "technique_id": "T1071",
+        "technique_name": "Application Layer Protocol",
+        "tactic_id": "TA0011",
+        "tactic_name": "Command and Control"
+      }
+    }
+  },
+  {
+    "id": "ftp_login_attempt",
+    "name": "FTP Login Attempt (cleartext credentials)",
+    "severity": "medium",
+    "category": "protocol",
+    "enabled": true,
+    "match": {
+      "protocol": "tcp",
+      "dst_port": 21,
+      "payload_contains": "USER ",
+      "direction": "outbound"
+    },
+    "aggregate": {
+      "key": "src+dst",
+      "min_count": 1
+    },
+    "alert": {
+      "title": "FTP Cleartext Login Attempt",
+      "description": "{src} -> {dst} (FTP USER command in plaintext)",
+      "recommendation": "FTP transmits credentials in cleartext. Migrate to SFTP/FTPS or wrap the channel in a VPN."
+    }
+  },
+  {
+    "id": "log4shell_jndi_probe",
+    "name": "Log4Shell JNDI Probe",
+    "severity": "critical",
+    "category": "http",
+    "enabled": true,
+    "match": {
+      "protocol": "tcp",
+      "payload_regex": "\\$\\{jndi:(ldap|rmi|dns|ldaps):"
+    },
+    "aggregate": {
+      "key": "src+dst+dst_port",
+      "min_count": 1
+    },
+    "alert": {
+      "title": "Log4Shell (CVE-2021-44228) JNDI Probe",
+      "description": "{src} -> {dst}:{dst_port} carried a Log4Shell-style ${{jndi:...}} payload",
+      "recommendation": "Patch any Log4j 2.x < 2.17.1, block JNDI lookups at WAF, audit the target host for exploitation.",
+      "mitre": {
+        "technique_id": "T1190",
+        "technique_name": "Exploit Public-Facing Application",
+        "tactic_id": "TA0001",
+        "tactic_name": "Initial Access"
+      }
+    }
+  }
+]

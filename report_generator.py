@@ -4,6 +4,7 @@ Generates PDF and HTML reports from PCAP analysis results
 """
 import os
 from datetime import datetime
+from html import escape as _html_escape
 from io import BytesIO
 
 from reportlab.lib.pagesizes import letter
@@ -22,6 +23,44 @@ SEVERITY_COLORS = {
     'medium': colors.HexColor('#f39c12'),
     'low': colors.HexColor('#95a5a6'),
 }
+
+
+def _alert_id_text(alert):
+    """Human-referenceable alert id, e.g. '#1234'. Empty when the alert has
+    not been persisted yet (no DB row id)."""
+    aid = alert.get('id')
+    return f"#{aid}" if aid not in (None, '') else ''
+
+
+def _alert_endpoints(alert):
+    """Return (src, dst) strings for the report. Mirrors what the web UI shows:
+    pull src_ip/dst_ip from details when present, fall back to alert.ip on
+    whichever side is empty. For port-scan / host-sweep style alerts the dst
+    string also notes the additional target count."""
+    d = alert.get('details') or {}
+    src = d.get('src_ip') or d.get('source_ip') or ''
+    dst = d.get('dst_ip') or ''
+    fallback = alert.get('ip') or ''
+    if fallback and not src and not dst:
+        src = fallback
+    elif fallback and not src:
+        src = fallback
+    elif fallback and not dst:
+        dst = fallback
+    targets_count = d.get('targets_count')
+    if not targets_count and isinstance(d.get('targets'), list):
+        targets_count = len(d['targets'])
+    if targets_count and targets_count > 1 and dst:
+        dst = f"{dst} (+{targets_count - 1} host(s))"
+    return src or '—', dst or '—'
+
+
+def _alert_title_with_soc(alert):
+    """Prefix the title with [SOC] when soc_match is set."""
+    title = alert.get('title') or ''
+    if alert.get('soc_match'):
+        return f"[SOC] {title}"
+    return title
 
 
 def generate_pdf_report(results, output_path):
@@ -107,16 +146,25 @@ def generate_pdf_report(results, output_path):
 
         # Alert details (top 20)
         story.append(Paragraph("Alert Details", styles['Heading2']))
-        alert_data = [['Severity', 'Title', 'Description', 'IP']]
+        alert_data = [['ID', 'Severity', 'Title', 'ATT&CK', 'Description',
+                       'Source', 'Destination']]
         for a in alerts[:20]:
+            attack = a.get('mitre_attack') or {}
+            attack_label = attack.get('technique_id', '')
+            src, dst = _alert_endpoints(a)
             alert_data.append([
+                _alert_id_text(a),
                 a.get('severity', '').upper(),
-                a.get('title', ''),
+                _alert_title_with_soc(a),
+                attack_label,
                 a.get('description', '')[:80],
-                a.get('ip', '')
+                src,
+                dst,
             ])
 
-        at = Table(alert_data, colWidths=[0.8*inch, 1.8*inch, 3*inch, 1.2*inch])
+        at = Table(alert_data, colWidths=[0.4*inch, 0.55*inch, 1.4*inch,
+                                          0.55*inch, 1.95*inch, 0.95*inch,
+                                          0.95*inch])
         at.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -198,6 +246,136 @@ def generate_pdf_report(results, output_path):
     doc.build(story)
 
 
+def generate_alerts_pdf_report(results, output_path):
+    """Generate a PDF report focused solely on the security alerts of a scan.
+
+    Unlike generate_pdf_report (which caps the alert table at 20 rows as part
+    of a broader report), this lists *every* alert with wrapped cells so the
+    table can flow across pages.
+    """
+    doc = SimpleDocTemplate(output_path, pagesize=letter,
+                            topMargin=0.5*inch, bottomMargin=0.5*inch)
+    story = []
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'AlertsTitle', parent=styles['Title'],
+        fontSize=22, textColor=colors.HexColor('#2c3e50'),
+        spaceAfter=14, alignment=TA_CENTER
+    )
+    subtitle_style = ParagraphStyle(
+        'AlertsSubtitle', parent=styles['Normal'],
+        fontSize=10, textColor=colors.HexColor('#7f8c8d'),
+        alignment=TA_CENTER, spaceAfter=18
+    )
+    cell_style = ParagraphStyle('AlertsCell', parent=styles['Normal'],
+                                fontSize=7, leading=9)
+    cell_bold = ParagraphStyle('AlertsCellBold', parent=cell_style,
+                               fontName='Helvetica-Bold')
+
+    summary = results.get('summary', {})
+    alerts = results.get('alerts', [])
+
+    # PCAP-derived strings (titles, descriptions, IPs, SNI...) are attacker-
+    # controlled. reportlab's Paragraph parses XML-like markup, so escape
+    # everything before wrapping it in a Paragraph.
+    def cell(text, style=cell_style):
+        return Paragraph(_html_escape(str(text or '')), style)
+
+    story.append(Paragraph("PCAP Security Alerts Report", title_style))
+    story.append(Paragraph(
+        f"File: {_html_escape(str(summary.get('filename', 'N/A')))} &nbsp;|&nbsp; "
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; "
+        f"Total alerts: {len(alerts)}",
+        subtitle_style
+    ))
+
+    if not alerts:
+        story.append(Paragraph("No security alerts detected.", styles['Normal']))
+        doc.build(story)
+        return
+
+    # Severity breakdown
+    sev_counts = {}
+    for a in alerts:
+        s = (a.get('severity') or 'unknown').lower()
+        sev_counts[s] = sev_counts.get(s, 0) + 1
+
+    story.append(Paragraph("Severity Breakdown", styles['Heading2']))
+    sev_data = [['Severity', 'Count']]
+    for s in ['critical', 'high', 'medium', 'low', 'info']:
+        if s in sev_counts:
+            sev_data.append([s.upper(), str(sev_counts[s])])
+
+    st = Table(sev_data, colWidths=[2*inch, 1.5*inch])
+    sev_style = [
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+    ]
+    for i, row in enumerate(sev_data[1:], start=1):
+        color = SEVERITY_COLORS.get(row[0].lower())
+        if color:
+            sev_style.append(('BACKGROUND', (0, i), (0, i), color))
+            sev_style.append(('TEXTCOLOR', (0, i), (0, i), colors.whitesmoke))
+            sev_style.append(('FONTNAME', (0, i), (0, i), 'Helvetica-Bold'))
+    st.setStyle(TableStyle(sev_style))
+    story.append(st)
+    story.append(Spacer(1, 16))
+
+    # Full alert listing
+    story.append(Paragraph("Alert Details", styles['Heading2']))
+    header = ['ID', 'Severity', 'Category', 'Title', 'ATT&CK',
+              'Source', 'Destination', 'Description']
+    alert_data = [[Paragraph(h, cell_bold) for h in header]]
+    body_style = [
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('FONTSIZE', (0, 0), (-1, -1), 7),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]
+    for i, a in enumerate(alerts, start=1):
+        sev = (a.get('severity') or '').lower()
+        attack = a.get('mitre_attack') or {}
+        src, dst = _alert_endpoints(a)
+        alert_data.append([
+            cell(_alert_id_text(a), cell_bold),
+            cell((a.get('severity') or '').upper(), cell_bold),
+            cell(a.get('category', '')),
+            cell(_alert_title_with_soc(a)),
+            cell(attack.get('technique_id', '')),
+            cell(src),
+            cell(dst),
+            cell(a.get('description', '')),
+        ])
+        color = SEVERITY_COLORS.get(sev)
+        if color:
+            # Severity is column 1 now that ID occupies column 0.
+            body_style.append(('BACKGROUND', (1, i), (1, i), color))
+            body_style.append(('TEXTCOLOR', (1, i), (1, i), colors.whitesmoke))
+
+    at = Table(alert_data,
+               colWidths=[0.4*inch, 0.5*inch, 0.7*inch, 1.2*inch,
+                          0.55*inch, 0.85*inch, 0.85*inch, 1.45*inch],
+               repeatRows=1)
+    at.setStyle(TableStyle(body_style))
+    story.append(at)
+
+    # Footer
+    story.append(Spacer(1, 24))
+    footer_style = ParagraphStyle(
+        'AlertsFooter', parent=styles['Normal'],
+        fontSize=8, textColor=colors.grey, alignment=TA_CENTER
+    )
+    story.append(Paragraph("Generated by PCAP Network Analyzer v3.0", footer_style))
+
+    doc.build(story)
+
+
 def generate_html_report(results):
     """Generate standalone HTML report"""
     html_template = """<!DOCTYPE html>
@@ -232,6 +410,7 @@ def generate_html_report(results):
         .badge-low { background: #95a5a6; }
         .badge-success { background: #2ecc71; }
         .badge-danger { background: #e74c3c; }
+        .badge-soc { background: #0d6efd; }
         .footer { text-align: center; padding: 20px; color: #95a5a6; font-size: 12px; }
         @media print { body { background: white; } .container { max-width: 100%; } }
     </style>
@@ -277,22 +456,28 @@ def generate_html_report(results):
                 <table>
                     <thead>
                         <tr>
+                            <th>ID</th>
                             <th>Severity</th>
                             <th>Category</th>
                             <th>Title</th>
+                            <th>Source</th>
+                            <th>Destination</th>
                             <th>Description</th>
-                            <th>IP</th>
                             <th>Recommendation</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for alert in alerts[:30] %}
                         <tr>
+                            <td><code>{% if alert.id is not none %}#{{ alert.id }}{% endif %}</code></td>
                             <td><span class="badge badge-{{ alert.severity }}">{{ alert.severity|upper }}</span></td>
                             <td>{{ alert.category }}</td>
-                            <td><strong>{{ alert.title }}</strong></td>
+                            <td>
+                                {% if alert.soc_match %}<span class="badge badge-soc">SOC</span> {% endif %}<strong>{{ alert.title }}</strong>
+                            </td>
+                            <td><code>{{ alert.endpoints[0] }}</code></td>
+                            <td><code>{{ alert.endpoints[1] }}</code></td>
                             <td>{{ alert.description }}</td>
-                            <td><code>{{ alert.ip }}</code></td>
                             <td style="font-size:11px;">{{ alert.recommendation }}</td>
                         </tr>
                         {% endfor %}
@@ -358,12 +543,22 @@ def generate_html_report(results):
 </body>
 </html>"""
 
-    template = Template(html_template)
+    # autoescape=True is mandatory: alert titles/descriptions, IPs, SNI, HTTP
+    # hosts and filenames all originate from the analysed PCAP — i.e. they are
+    # attacker-controlled. Without escaping, a crafted capture injects <script>
+    # into the downloadable report (stored XSS).
+    template = Template(html_template, autoescape=True)
+
+    # Attach (src, dst) tuple to each alert so the template can render the
+    # two new columns without re-running the resolution logic in Jinja.
+    alerts = results.get('alerts', [])
+    for a in alerts:
+        a['endpoints'] = _alert_endpoints(a)
 
     return template.render(
         summary=results.get('summary', {}),
         ips=results.get('ips', []),
         protocols=results.get('protocols', []),
-        alerts=results.get('alerts', []),
+        alerts=alerts,
         generated_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )

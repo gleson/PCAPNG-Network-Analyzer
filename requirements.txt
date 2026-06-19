@@ -1,4 +1,6 @@
 Flask==3.0.0
+Flask-Login==0.6.3
+flasgger==0.9.7.1
 scapy==2.5.0
 python-magic==0.4.27
 psycopg2-binary==2.9.10
@@ -7,3 +9,7 @@ celery==5.3.4
 redis==5.0.1
 reportlab==4.0.7
 matplotlib==3.8.2
+scikit-learn==1.4.0
+defusedxml>=0.7.1
+yara-python>=4.3.0
+gunicorn==23.0.0

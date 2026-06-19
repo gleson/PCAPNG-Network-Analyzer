@@ -1,6 +1,15 @@
+# Credentials and secrets come from a local .env file (see .env.example).
+# .env is gitignored and is NOT copied into the image. POSTGRES_PASSWORD is
+# mandatory — `${VAR:?msg}` makes `docker compose up` fail fast if it is unset.
 services:
   web:
+    # `build: .` é o que faz `docker compose up --build` reconstruir esta
+    # imagem a partir do Dockerfile multi-stage (stage `frontend` roda o
+    # `npm run build` do Vite). Sem isto, o flag --build é silenciosamente
+    # ignorado e o serviço sobe a imagem antiga.
     build: .
+    image: pcap_analyzer-web:latest
+    mem_limit: 1g
     ports:
       - "5000:5000"
     depends_on:
@@ -9,40 +18,139 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://pcap_user:pcap_pass@db:5432/pcap_analyzer
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-pcap_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/${POSTGRES_DB:-pcap_analyzer}
       - UPLOAD_FOLDER=/app/data/uploads
       - FLASK_ENV=production
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
+      - PCAP_DEFAULT_ADMIN_PASSWORD=${PCAP_DEFAULT_ADMIN_PASSWORD:-}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
       - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      # /app on sys.path: Celery/Gunicorn only add the project dir while
+      # loading the entrypoint, so lazy imports of root-level modules
+      # (behavioral, correlation, notifications, mitre_attack, user_rules,
+      # host_risk, host_roles, file_carving) fail inside worker tasks
+      # without this. A swallowed ModuleNotFoundError there silently drops
+      # MITRE / behavioral / correlation / notification analysis.
+      - PYTHONPATH=/app
     volumes:
+      # Source code is NOT bind-mounted: the container runs the code baked into
+      # the image (COPY . . in the Dockerfile). A bind-mount would (a) let a
+      # compromised container write to the host source tree and (b) let the
+      # container run code that differs from what was reviewed/built.
+      # app_data persists runtime state (settings.json, data/rules, artifacts);
+      # uploads_data keeps the captured PCAPs on their own volume.
+      - app_data:/app/data
       - uploads_data:/app/data/uploads
-      - settings_data:/app/data/settings
     restart: unless-stopped
 
-  celery_worker:
-    build: .
-    command: celery -A celery_app.celery worker --loglevel=info --concurrency=2
+  celery_fast:
+    image: pcap_analyzer-web:latest
+    # Heaviest service: streaming PCAP parsing + detections. mem_limit caps RAM
+    # so a runaway analysis fails this container alone (com erro) em vez de o
+    # OOM-killer do host matar o worker com SIGKILL. memswap_limit == mem_limit
+    # desativa swap (swap mascara o problema e deixa a análise lentíssima).
+    mem_limit: 6g
+    memswap_limit: 6g
+    # Override ENTRYPOINT: db is already healthy via depends_on, no need for the
+    # postgres-wait script. Run celery directly.
+    entrypoint: ["celery", "-A", "celery_app.celery", "worker",
+                 "-Q", "pcap.fast", "--loglevel=info", "--concurrency=2",
+                 "-n", "fast@%h"]
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://pcap_user:pcap_pass@db:5432/pcap_analyzer
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-pcap_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/${POSTGRES_DB:-pcap_analyzer}
       - UPLOAD_FOLDER=/app/data/uploads
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
       - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      # /app on sys.path: Celery/Gunicorn only add the project dir while
+      # loading the entrypoint, so lazy imports of root-level modules
+      # (behavioral, correlation, notifications, mitre_attack, user_rules,
+      # host_risk, host_roles, file_carving) fail inside worker tasks
+      # without this. A swallowed ModuleNotFoundError there silently drops
+      # MITRE / behavioral / correlation / notification analysis.
+      - PYTHONPATH=/app
     volumes:
+      - app_data:/app/data
       - uploads_data:/app/data/uploads
-      - settings_data:/app/data/settings
+    restart: unless-stopped
+
+  celery_slow:
+    image: pcap_analyzer-web:latest
+    # Enrichment (geo + threat intel): network-bound, leve em memória.
+    mem_limit: 1g
+    entrypoint: ["celery", "-A", "celery_app.celery", "worker",
+                 "-Q", "pcap.slow", "--loglevel=info", "--concurrency=4",
+                 "-n", "slow@%h"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-pcap_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/${POSTGRES_DB:-pcap_analyzer}
+      - UPLOAD_FOLDER=/app/data/uploads
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      # /app on sys.path: Celery/Gunicorn only add the project dir while
+      # loading the entrypoint, so lazy imports of root-level modules
+      # (behavioral, correlation, notifications, mitre_attack, user_rules,
+      # host_risk, host_roles, file_carving) fail inside worker tasks
+      # without this. A swallowed ModuleNotFoundError there silently drops
+      # MITRE / behavioral / correlation / notification analysis.
+      - PYTHONPATH=/app
+    volumes:
+      - app_data:/app/data
+      - uploads_data:/app/data/uploads
+    restart: unless-stopped
+
+  celery_beat:
+    image: pcap_analyzer-web:latest
+    mem_limit: 256m
+    entrypoint: ["celery", "-A", "celery_app.celery", "beat", "--loglevel=info"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-pcap_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/${POSTGRES_DB:-pcap_analyzer}
+      - UPLOAD_FOLDER=/app/data/uploads
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      # /app on sys.path: Celery/Gunicorn only add the project dir while
+      # loading the entrypoint, so lazy imports of root-level modules
+      # (behavioral, correlation, notifications, mitre_attack, user_rules,
+      # host_risk, host_roles, file_carving) fail inside worker tasks
+      # without this. A swallowed ModuleNotFoundError there silently drops
+      # MITRE / behavioral / correlation / notification analysis.
+      - PYTHONPATH=/app
+    volumes:
+      - app_data:/app/data
+      - uploads_data:/app/data/uploads
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    mem_limit: 512m
+    # Redis is the Celery broker. It is not published to the host, but
+    # --requirepass is defence-in-depth: without it any process that reaches
+    # the compose network could enqueue/inspect tasks.
+    command: ["redis-server", "--requirepass",
+              "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL",
+             "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -50,14 +158,15 @@ services:
 
   db:
     image: postgres:15-alpine
+    mem_limit: 1g
     environment:
-      - POSTGRES_DB=pcap_analyzer
-      - POSTGRES_USER=pcap_user
-      - POSTGRES_PASSWORD=pcap_pass
+      - POSTGRES_DB=${POSTGRES_DB:-pcap_analyzer}
+      - POSTGRES_USER=${POSTGRES_USER:-pcap_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pcap_user -d pcap_analyzer"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pcap_user} -d ${POSTGRES_DB:-pcap_analyzer}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -65,5 +174,5 @@ services:
 
 volumes:
   postgres_data:
+  app_data:
   uploads_data:
-  settings_data:

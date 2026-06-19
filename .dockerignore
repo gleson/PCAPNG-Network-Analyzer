@@ -8,3 +8,13 @@ data/results.json
 .gitignore
 *.md
 !README.md
+
+# Secrets / runtime state — must never be baked into the image.
+.env
+data/settings.json
+data/uploads/
+data/artifacts/
+
+# Frontend build artifacts — rebuilt inside the Docker stage.
+node_modules/
+static/dist/

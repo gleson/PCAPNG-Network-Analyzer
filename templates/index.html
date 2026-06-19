@@ -5,17 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PCAP Network Analyzer</title>
 
-    <!-- Bootstrap CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-
-    <!-- DataTables CSS -->
-    <link href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css" rel="stylesheet">
-
-    <!-- Font Awesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-
-    <!-- Custom CSS -->
-    <link rel="stylesheet" href="/static/css/style.css">
+    {# Bootstrap, DataTables, Font Awesome, custom CSS and all JS are
+       bundled by Vite and injected here. CSS is loaded in <head> to avoid
+       FOUC; the <script type="module"> tag is naturally deferred so it
+       fires after DOM parsing. #}
+    {{ vite_assets() }}
 </head>
 <body>
     <!-- Navbar -->
@@ -31,6 +25,49 @@
                 <span class="text-light" id="status-indicator">
                     <i class="fas fa-circle text-secondary"></i> <span id="status-text">Idle</span>
                 </span>
+                <!-- User dropdown (visible after login) -->
+                <div class="dropdown d-none" id="nav-user-info">
+                    <button class="btn btn-sm btn-outline-light dropdown-toggle d-flex align-items-center gap-2"
+                            type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        <i class="fas fa-user-circle"></i>
+                        <span id="nav-username"></span>
+                        <span class="badge bg-secondary" id="nav-user-role"></span>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end shadow">
+                        <li><h6 class="dropdown-header" id="nav-dropdown-header">
+                            <i class="fas fa-circle-user me-1"></i>Minha Conta
+                        </h6></li>
+                        <li>
+                            <a class="dropdown-item" href="#" onclick="showChangePasswordModal()">
+                                <i class="fas fa-key me-2 text-warning"></i>Alterar Senha
+                            </a>
+                        </li>
+                        <li id="nav-audit-log-item" class="d-none">
+                            <a class="dropdown-item" href="#" onclick="showAuditLogModal()">
+                                <i class="fas fa-clipboard-list me-2 text-info"></i>Log de Auditoria
+                            </a>
+                        </li>
+                        <li id="nav-user-mgmt-item" class="d-none">
+                            <a class="dropdown-item" href="#" onclick="showUserMgmtModal()">
+                                <i class="fas fa-users-cog me-2 text-primary"></i>Gerenciar Usuários
+                            </a>
+                        </li>
+                        <li id="nav-admin-settings-item" class="d-none">
+                            <a class="dropdown-item" href="#" onclick="showAdminSettingsModal()">
+                                <i class="fas fa-shield-virus me-2 text-success"></i>Threat Intel &amp; API Keys
+                            </a>
+                        </li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li>
+                            <a class="dropdown-item text-danger" href="#" onclick="logout()">
+                                <i class="fas fa-sign-out-alt me-2"></i>Sair
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                <button id="nav-login-btn" class="btn btn-sm btn-outline-light d-none" onclick="showLoginModal()">
+                    <i class="fas fa-sign-in-alt"></i> Entrar
+                </button>
             </div>
         </div>
     </nav>
@@ -48,7 +85,7 @@
                             <div class="col-md-8">
                                 <input type="file" class="form-control" id="pcap-file" accept=".pcap,.pcapng">
                                 <small class="form-text text-muted">
-                                    Supported formats: .pcap, .pcapng | Max size: 500MB
+                                    Supported formats: .pcap, .pcapng
                                 </small>
                             </div>
                             <div class="col-md-4">
@@ -58,11 +95,22 @@
                             </div>
                         </div>
                         <div id="upload-progress" class="mt-3" style="display:none;">
-                            <div class="progress">
+                            <div class="progress" style="height: 22px;">
                                 <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated"
                                      role="progressbar" style="width: 0%">0%</div>
                             </div>
-                            <p class="text-center mt-2" id="progress-message">Analyzing...</p>
+                            <p class="text-center mt-2 mb-1" id="progress-message">Analyzing...</p>
+                            <div class="d-flex flex-wrap justify-content-center gap-3 small text-muted"
+                                 id="progress-details">
+                                <span><i class="fas fa-layer-group"></i>
+                                    <span id="progress-phase">—</span></span>
+                                <span><i class="fas fa-list-ol"></i>
+                                    <span id="progress-packets">0</span> pacotes</span>
+                                <span><i class="fas fa-database"></i>
+                                    <span id="progress-bytes">0</span></span>
+                                <span><i class="fas fa-clock"></i>
+                                    <span id="progress-elapsed">0s</span></span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -88,11 +136,11 @@
                         <!-- Date Filter -->
                         <div class="row mb-3" id="date-filter-section">
                             <div class="col-md-3">
-                                <label class="form-label small"><i class="fas fa-calendar"></i> Data Inicial</label>
+                                <label class="form-label small"><i class="fas fa-calendar"></i> Inserido De <small class="text-muted">(análise)</small></label>
                                 <input type="date" class="form-control form-control-sm" id="filter-date-from">
                             </div>
                             <div class="col-md-3">
-                                <label class="form-label small"><i class="fas fa-calendar"></i> Data Final</label>
+                                <label class="form-label small"><i class="fas fa-calendar"></i> Inserido Até <small class="text-muted">(análise)</small></label>
                                 <input type="date" class="form-control form-control-sm" id="filter-date-to">
                             </div>
                             <div class="col-md-3 d-flex align-items-end gap-2">
@@ -109,13 +157,13 @@
                         </div>
 
                         <div id="scan-history-content">
-                            <div class="table-responsive">
+                            <div>
                                 <table class="table table-sm table-hover" id="scans-table">
                                     <thead>
                                         <tr>
-                                            <th><input type="checkbox" id="select-all-scans"></th>
+                                            <th><input type="checkbox" id="select-all-scans" class="select-all-scans-cb"></th>
                                             <th>Arquivo</th>
-                                            <th>Data</th>
+                                            <th>Data Captura</th>
                                             <th>Pacotes</th>
                                             <th>Dados</th>
                                             <th>IPs</th>
@@ -184,6 +232,25 @@
                     <button class="nav-link" id="alerts-tab" data-bs-toggle="tab"
                             data-bs-target="#alerts" type="button" role="tab">
                         <i class="fas fa-exclamation-triangle"></i> Alertas <span id="alerts-badge" class="badge bg-danger">0</span>
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="killchain-tab" data-bs-toggle="tab"
+                            data-bs-target="#killchain" type="button" role="tab">
+                        <i class="fas fa-crosshairs"></i> Kill-Chain
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="graph-tab" data-bs-toggle="tab"
+                            data-bs-target="#graph" type="button" role="tab">
+                        <i class="fas fa-project-diagram"></i> Graph
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="carved-tab" data-bs-toggle="tab"
+                            data-bs-target="#carved" type="button" role="tab">
+                        <i class="fas fa-file-archive"></i> Carved
+                        <span id="carved-badge" class="badge bg-secondary">0</span>
                     </button>
                 </li>
                 <li class="nav-item" role="presentation">
@@ -328,10 +395,12 @@
                                     <tr>
                                         <th>IP Address</th>
                                         <th>Nome</th>
+                                        <th>Dispositivo</th>
                                         <th>Grupo</th>
                                         <th>Tipo</th>
                                         <th>Localização</th>
                                         <th>Reputação</th>
+                                        <th title="Score 0-100 agregando severidade, persistência, reputação e desvio do baseline">Risk</th>
                                         <th>Pacotes Env.</th>
                                         <th>Pacotes Rec.</th>
                                         <th>Bytes Env.</th>
@@ -351,24 +420,53 @@
                 <!-- TAB 3: PROTOCOLOS -->
                 <div class="tab-pane fade" id="protocols" role="tabpanel">
                     <div class="card shadow-sm">
-                        <div class="card-header">
-                            <i class="fas fa-layer-group"></i> Protocolos Detectados
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <span><i class="fas fa-layer-group"></i> Protocolos Detectados</span>
+                            <div class="btn-group btn-group-sm" role="group" aria-label="Visão de protocolos">
+                                <button type="button" class="btn btn-outline-primary active" id="protocols-view-by-proto">
+                                    <i class="fas fa-layer-group"></i> Por Protocolo
+                                </button>
+                                <button type="button" class="btn btn-outline-primary" id="protocols-view-by-ip">
+                                    <i class="fas fa-server"></i> Por IP
+                                </button>
+                            </div>
                         </div>
                         <div class="card-body">
-                            <table id="protocols-table" class="table table-striped table-hover" style="width:100%">
-                                <thead>
-                                    <tr>
-                                        <th>Protocolo</th>
-                                        <th>Pacotes</th>
-                                        <th>Bytes</th>
-                                        <th>Percentual</th>
-                                        <th>Risco</th>
-                                        <th>Avisos</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="protocols-tbody">
-                                </tbody>
-                            </table>
+                            <div id="protocols-by-proto-section">
+                                <table id="protocols-table" class="table table-striped table-hover" style="width:100%">
+                                    <thead>
+                                        <tr>
+                                            <th>Protocolo</th>
+                                            <th>Pacotes</th>
+                                            <th>Bytes</th>
+                                            <th>Percentual</th>
+                                            <th>Risco</th>
+                                            <th>Avisos</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="protocols-tbody">
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div id="protocols-by-ip-section" style="display: none;">
+                                <p class="text-muted small mb-2">
+                                    Clique em um IP para ver os protocolos utilizados e os peers correspondentes.
+                                </p>
+                                <table id="ip-protocols-table" class="table table-striped table-hover" style="width:100%">
+                                    <thead>
+                                        <tr>
+                                            <th>IP</th>
+                                            <th>Nome</th>
+                                            <th>Tipo</th>
+                                            <th>Protocolos</th>
+                                            <th>Pacotes</th>
+                                            <th>Bytes</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ip-protocols-tbody">
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -376,14 +474,41 @@
                 <!-- TAB 4: ALERTAS -->
                 <div class="tab-pane fade" id="alerts" role="tabpanel">
                     <div class="card shadow-sm">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <span><i class="fas fa-exclamation-triangle"></i> Alertas de Segurança</span>
-                            <div>
-                                <button class="btn btn-sm btn-outline-secondary" data-filter="all">Todos</button>
-                                <button class="btn btn-sm btn-outline-danger" data-filter="critical">Crítico</button>
-                                <button class="btn btn-sm btn-outline-warning" data-filter="high">Alto</button>
-                                <button class="btn btn-sm btn-outline-info" data-filter="medium">Médio</button>
-                                <button class="btn btn-sm btn-outline-secondary" data-filter="low">Baixo</button>
+                        <div class="card-header">
+                            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                                <span class="d-flex align-items-center gap-2">
+                                    <span><i class="fas fa-exclamation-triangle"></i> Alertas de Segurança</span>
+                                    <button class="btn btn-sm btn-outline-danger" id="export-alerts-pdf-btn"
+                                            onclick="downloadAlertsReport()">
+                                        <i class="fas fa-file-pdf"></i> Exportar PDF
+                                    </button>
+                                </span>
+                                <div>
+                                    <button class="btn btn-sm btn-outline-secondary active" data-filter="all">Todos</button>
+                                    <button class="btn btn-sm btn-outline-danger" data-filter="critical">Crítico</button>
+                                    <button class="btn btn-sm btn-outline-warning" data-filter="high">Alto</button>
+                                    <button class="btn btn-sm btn-outline-info" data-filter="medium">Médio</button>
+                                    <button class="btn btn-sm btn-outline-secondary" data-filter="low">Baixo</button>
+                                </div>
+                            </div>
+                            <div class="mt-2 d-flex align-items-center flex-wrap gap-2">
+                                <small class="text-muted me-1"><i class="fas fa-tags"></i> Categoria:</small>
+                                <button class="btn btn-sm btn-outline-secondary active" data-status-filter="all">Todas</button>
+                                <button class="btn btn-sm btn-outline-warning" data-status-filter="analisar">Analisar</button>
+                                <button class="btn btn-sm btn-outline-info" data-status-filter="falso_positivo">Falso Positivo</button>
+                                <button class="btn btn-sm btn-outline-success" data-status-filter="resolvido">Resolvido</button>
+                                <button class="btn btn-sm btn-outline-secondary" data-status-filter="sem_risco">Sem Risco</button>
+                            </div>
+                            <div class="mt-2 d-flex align-items-center flex-wrap gap-2">
+                                <small class="text-muted me-1"><i class="fas fa-user-shield"></i> Selo:</small>
+                                <button class="btn btn-sm btn-outline-secondary active" data-soc-filter="all">Todos</button>
+                                <button class="btn btn-sm btn-outline-primary" data-soc-filter="soc">
+                                    <span class="badge bg-primary">SOC</span> Apenas SOC
+                                </button>
+                                <button class="btn btn-sm btn-outline-danger ms-auto d-none" id="alerts-bulk-fp-btn"
+                                        title="Marcar todos os alertas filtrados como Falso Positivo">
+                                    <i class="fas fa-check-double"></i> Marcar filtrados como FP
+                                </button>
                             </div>
                         </div>
                         <div class="card-body">
@@ -395,6 +520,163 @@
                 </div>
 
                 <!-- TAB 5: PACOTES (Wireshark-style viewer) -->
+                <!-- TAB: KILL-CHAIN TIMELINE -->
+                <div class="tab-pane fade" id="killchain" role="tabpanel">
+                    <div class="card shadow-sm">
+                        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                            <span>
+                                <i class="fas fa-crosshairs"></i>
+                                Kill-Chain por Host
+                                <small class="text-muted ms-2" id="killchain-summary"></small>
+                            </span>
+                            <div class="d-flex align-items-center gap-2">
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox" id="killchain-show-empty">
+                                    <label class="form-check-label small" for="killchain-show-empty">
+                                        Mostrar táticas vazias
+                                    </label>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" id="killchain-export-navigator"
+                                        title="Baixar layer JSON do MITRE ATT&amp;CK Navigator">
+                                    <i class="fas fa-download"></i> Navigator Layer
+                                </button>
+                                <button class="btn btn-sm btn-outline-secondary" id="killchain-reload">
+                                    <i class="fas fa-sync"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted small mb-3">
+                                Eixo horizontal: táticas MITRE ATT&amp;CK ordenadas pelo ciclo de
+                                ataque (Recon → Initial Access → … → Impact). Cada linha é um host;
+                                os marcadores são alertas, coloridos pela severidade. Clique em um
+                                marcador para ver o alerta correspondente.
+                            </p>
+                            <div id="killchain-container">
+                                <p class="text-muted">Selecione um scan para visualizar a kill-chain.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: GRAPH VIEW (B.6) -->
+                <div class="tab-pane fade" id="graph" role="tabpanel">
+                    <div class="card shadow-sm">
+                        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                            <span>
+                                <i class="fas fa-project-diagram"></i>
+                                Graph View
+                                <small class="text-muted ms-2" id="graph-summary"></small>
+                            </span>
+                            <div class="d-flex align-items-center gap-2 flex-wrap">
+                                <label class="small mb-0">Top-N
+                                    <select id="graph-top-n" class="form-select form-select-sm d-inline-block w-auto ms-1">
+                                        <option value="50">50</option>
+                                        <option value="100">100</option>
+                                        <option value="200" selected>200</option>
+                                        <option value="500">500</option>
+                                    </select>
+                                </label>
+                                <label class="small mb-0">Layout
+                                    <select id="graph-layout" class="form-select form-select-sm d-inline-block w-auto ms-1">
+                                        <option value="physics" selected>Physics</option>
+                                        <option value="hierarchical">Hierárquico</option>
+                                    </select>
+                                </label>
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox" id="graph-hide-isolated" checked>
+                                    <label class="form-check-label small" for="graph-hide-isolated">
+                                        Ocultar nós isolados
+                                    </label>
+                                </div>
+                                <button class="btn btn-sm btn-outline-secondary" id="graph-fit" title="Encaixar na tela">
+                                    <i class="fas fa-expand"></i>
+                                </button>
+                                <button class="btn btn-sm btn-outline-secondary" id="graph-reload" title="Recarregar">
+                                    <i class="fas fa-sync"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted small mb-2">
+                                Nós = IPs · arestas = tráfego agregado · espessura = bytes
+                                (escala log) · cor do nó = reputação/severidade · tamanho = volume total.
+                                Clique num nó para abrir o detalhe; duplo-clique vai para a aba IPs.
+                            </p>
+                            <div class="d-flex gap-2 mb-2 flex-wrap small">
+                                <span class="kc-legend-dot" style="background:#6f1d1b"></span> malicioso
+                                <span class="kc-legend-dot" style="background:#dc3545"></span> alerta crítico/alto
+                                <span class="kc-legend-dot" style="background:#ffc107"></span> alerta médio
+                                <span class="kc-legend-dot" style="background:#0d6efd"></span> local
+                                <span class="kc-legend-dot" style="background:#6c757d"></span> externo
+                            </div>
+                            <div class="row g-2">
+                                <div class="col-lg-9">
+                                    <div id="graph-container" style="height:640px;border:1px solid var(--bs-border-color,#dee2e6);border-radius:6px;background:var(--bs-body-bg,#fff);">
+                                        <p class="text-muted p-3">Selecione um scan para visualizar o graph.</p>
+                                    </div>
+                                </div>
+                                <div class="col-lg-3">
+                                    <div id="graph-detail" class="border rounded p-2 small" style="height:640px;overflow-y:auto;">
+                                        <p class="text-muted mb-0">Clique num nó ou aresta para ver detalhes.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: CARVED FILES (A.1/A.2/A.4) -->
+                <div class="tab-pane fade" id="carved" role="tabpanel">
+                    <div class="card shadow-sm">
+                        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                            <span>
+                                <i class="fas fa-file-archive"></i>
+                                Arquivos Esculpidos (HTTP)
+                                <small class="text-muted ms-2" id="carved-summary"></small>
+                            </span>
+                            <div class="d-flex align-items-center gap-2 flex-wrap">
+                                <div class="btn-group btn-group-sm" role="group" aria-label="Filtro de arquivos">
+                                    <input type="radio" class="btn-check" name="carved-filter" id="carved-filter-all" value="all" checked>
+                                    <label class="btn btn-outline-secondary" for="carved-filter-all">Todos</label>
+                                    <input type="radio" class="btn-check" name="carved-filter" id="carved-filter-malicious" value="malicious">
+                                    <label class="btn btn-outline-danger" for="carved-filter-malicious">Maliciosos</label>
+                                    <input type="radio" class="btn-check" name="carved-filter" id="carved-filter-yara" value="yara">
+                                    <label class="btn btn-outline-warning" for="carved-filter-yara">YARA</label>
+                                </div>
+                                <button class="btn btn-sm btn-outline-secondary" id="carved-reload" title="Recarregar">
+                                    <i class="fas fa-sync"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted small mb-2">
+                                Arquivos extraídos de respostas HTTP e uploads multipart durante a análise.
+                                Hashes consultados em VirusTotal/MalwareBazaar e escaneados com regras YARA.
+                                Download disponível apenas para administradores.
+                            </p>
+                            <table id="carved-table" class="table table-striped table-hover" style="width:100%">
+                                <thead>
+                                    <tr>
+                                        <th></th>
+                                        <th>Arquivo</th>
+                                        <th>Tipo</th>
+                                        <th>Tamanho</th>
+                                        <th>SHA-256</th>
+                                        <th>Origem</th>
+                                        <th>Reputação</th>
+                                        <th>YARA</th>
+                                        <th>Capturado</th>
+                                        <th>Ações</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="carved-tbody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="tab-pane fade" id="packets" role="tabpanel">
                     <div class="card shadow-sm">
                         <div class="card-header d-flex justify-content-between align-items-center">
@@ -540,6 +822,51 @@
                                 </div>
                             </div>
                         </div>
+
+                        <!-- SOC IPs -->
+                        <div class="col-md-6 mb-3">
+                            <div class="card shadow-sm">
+                                <div class="card-header d-flex justify-content-between align-items-center">
+                                    <span><i class="fas fa-user-shield text-primary"></i> IPs do SOC</span>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <label class="small text-muted mb-0">Padrão</label>
+                                        <select id="soc-default-mode" class="form-select form-select-sm w-auto">
+                                            <option value="either">Either (recomendado)</option>
+                                            <option value="src_only">Apenas origem</option>
+                                            <option value="dst_only">Apenas destino</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <p class="text-muted small mb-2">
+                                        Alertas com IP de origem ou destino dentro destes ranges
+                                        recebem o selo <span class="badge bg-primary">SOC</span>.
+                                        Não muda a severidade nem a triagem — serve para o analista
+                                        identificar tráfego de varredura legítima e marcar como
+                                        falso positivo em lote.
+                                    </p>
+                                    <div id="soc-ips-list" class="mb-3">
+                                        <!-- Preenchido dinamicamente -->
+                                    </div>
+                                    <hr>
+                                    <h6>Adicionar IP/CIDR do SOC</h6>
+                                    <div class="input-group input-group-sm mb-2">
+                                        <input type="text" class="form-control" id="new-soc-cidr"
+                                               placeholder="192.168.100.111/32 ou 10.10.0.0/24">
+                                        <input type="text" class="form-control" id="new-soc-desc"
+                                               placeholder="Descrição (ex: Kali do SOC)">
+                                        <select id="new-soc-mode" class="form-select" style="max-width:11rem">
+                                            <option value="either" selected>Either (recomendado)</option>
+                                            <option value="src_only">Apenas origem</option>
+                                            <option value="dst_only">Apenas destino</option>
+                                        </select>
+                                        <button class="btn btn-success" id="add-soc-btn">
+                                            <i class="fas fa-plus"></i> Adicionar
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Clear Analysis -->
@@ -581,6 +908,24 @@
                         <input type="text" class="form-control" id="edit-ip-name" placeholder="Ex: Servidor Web, PC João, Router Principal">
                     </div>
                     <div class="mb-3">
+                        <label class="form-label">Tipo de Dispositivo</label>
+                        <select class="form-select" id="edit-ip-device-type">
+                            <option value="Computador" selected>Computador</option>
+                            <option value="Roteador">Roteador</option>
+                            <option value="Impressora">Impressora</option>
+                            <option value="IoT">IoT</option>
+                            <option value="Smartphone">Smartphone</option>
+                            <option value="Servidor">Servidor</option>
+                            <option value="Switch">Switch</option>
+                            <option value="NAS">NAS</option>
+                            <option value="Camera">Camera</option>
+                            <option value="TV/Streaming">TV/Streaming</option>
+                            <option value="Console">Console</option>
+                            <option value="Virtual">Virtual</option>
+                            <option value="Desconhecido">Desconhecido</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label">Descrição (opcional)</label>
                         <textarea class="form-control" id="edit-ip-description" rows="2" placeholder="Descrição adicional..."></textarea>
                     </div>
@@ -604,24 +949,54 @@
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
+                    <div class="d-flex justify-content-end gap-2 mb-3">
+                        <button class="btn btn-sm btn-outline-primary" id="export-ip-names-btn" title="Baixar JSON com todos os IPs cadastrados">
+                            <i class="fas fa-file-export"></i> Exportar
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary" id="import-ip-names-btn" title="Importar IPs de um arquivo JSON">
+                            <i class="fas fa-file-import"></i> Importar
+                        </button>
+                        <input type="file" id="import-ip-names-file" accept=".json,application/json" hidden>
+                    </div>
                     <div class="mb-3">
-                        <h6>Adicionar Novo</h6>
+                        <h6 id="ip-names-form-title">Adicionar Novo</h6>
                         <div class="row g-2">
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <input type="text" class="form-control" id="new-ip-address" placeholder="IP Address">
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <input type="text" class="form-control" id="new-ip-name" placeholder="Nome">
+                            </div>
+                            <div class="col-md-2">
+                                <select class="form-select" id="new-ip-device-type">
+                                    <option value="Computador" selected>Computador</option>
+                                    <option value="Roteador">Roteador</option>
+                                    <option value="Impressora">Impressora</option>
+                                    <option value="IoT">IoT</option>
+                                    <option value="Smartphone">Smartphone</option>
+                                    <option value="Servidor">Servidor</option>
+                                    <option value="Switch">Switch</option>
+                                    <option value="NAS">NAS</option>
+                                    <option value="Camera">Camera</option>
+                                    <option value="TV/Streaming">TV/Streaming</option>
+                                    <option value="Console">Console</option>
+                                    <option value="Virtual">Virtual</option>
+                                    <option value="Desconhecido">Desconhecido</option>
+                                </select>
                             </div>
                             <div class="col-md-3">
                                 <input type="text" class="form-control" id="new-ip-desc" placeholder="Descrição">
                             </div>
                             <div class="col-md-1">
-                                <button class="btn btn-success w-100" id="add-ip-name-btn">
-                                    <i class="fas fa-plus"></i>
+                                <button class="btn btn-success w-100" id="add-ip-name-btn" title="Adicionar / Atualizar">
+                                    <i class="fas fa-plus" id="add-ip-name-icon"></i>
                                 </button>
                             </div>
                         </div>
+                        <small id="ip-names-edit-hint" class="text-muted d-none">
+                            <i class="fas fa-info-circle"></i> Editando IP existente — clique em
+                            <a href="#" id="cancel-edit-ip-name">cancelar</a> para sair do modo edição.
+                        </small>
                     </div>
                     <hr>
                     <div class="table-responsive">
@@ -630,6 +1005,7 @@
                                 <tr>
                                     <th>IP</th>
                                     <th>Nome</th>
+                                    <th>Dispositivo</th>
                                     <th>Descrição</th>
                                     <th>Ações</th>
                                 </tr>
@@ -697,20 +1073,346 @@
         </div>
     </div>
 
-    <!-- jQuery -->
-    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <!-- Modal: Alterar Senha -->
+    <div class="modal fade" id="changePasswordModal" tabindex="-1">
+        <div class="modal-dialog modal-sm modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-key me-2 text-warning"></i>Alterar Senha</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="chpwd-error" class="alert alert-danger d-none" role="alert"></div>
+                    <div id="chpwd-success" class="alert alert-success d-none" role="alert"></div>
+                    <form id="change-password-form" onsubmit="submitChangePassword(event)">
+                        <div class="mb-3" id="chpwd-current-group">
+                            <label class="form-label small fw-semibold">Senha Atual</label>
+                            <input type="password" class="form-control" id="chpwd-current"
+                                   autocomplete="current-password">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold">Nova Senha <small class="text-muted">(mín. 8 chars)</small></label>
+                            <input type="password" class="form-control" id="chpwd-new"
+                                   autocomplete="new-password" required minlength="8">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold">Confirmar Nova Senha</label>
+                            <input type="password" class="form-control" id="chpwd-confirm"
+                                   autocomplete="new-password" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary" id="chpwd-btn">
+                                <i class="fas fa-save me-1"></i> Salvar
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    <!-- Bootstrap JS -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Modal: Log de Auditoria -->
+    <div class="modal fade" id="auditLogModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-clipboard-list me-2 text-info"></i>Log de Auditoria</h5>
+                    <div class="d-flex align-items-center gap-2 ms-auto me-3">
+                        <select class="form-select form-select-sm" id="audit-filter-action"
+                                style="width:160px" onchange="loadAuditLog()">
+                            <option value="">Todas as ações</option>
+                            <option value="login">login</option>
+                            <option value="logout">logout</option>
+                            <option value="upload_pcap">upload_pcap</option>
+                            <option value="delete_scan">delete_scan</option>
+                            <option value="triage_alert">triage_alert</option>
+                            <option value="create_user">create_user</option>
+                            <option value="delete_user">delete_user</option>
+                            <option value="export_scan">export_scan</option>
+                            <option value="replay_pcap">replay_pcap</option>
+                            <option value="retention_purge">retention_purge</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="audit-filter-limit"
+                                style="width:100px" onchange="loadAuditLog()">
+                            <option value="100">100</option>
+                            <option value="200" selected>200</option>
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                        </select>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="loadAuditLog()" title="Recarregar">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-hover mb-0">
+                            <thead class="table-dark" style="position:sticky;top:0;z-index:1">
+                                <tr>
+                                    <th>Data/Hora</th>
+                                    <th>Usuário</th>
+                                    <th>IP</th>
+                                    <th>Ação</th>
+                                    <th>Tipo</th>
+                                    <th>ID</th>
+                                    <th>Status</th>
+                                    <th>Detalhes</th>
+                                </tr>
+                            </thead>
+                            <tbody id="audit-log-body">
+                                <tr><td colspan="8" class="text-center text-muted py-4">Carregando...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <small class="text-muted me-auto" id="audit-count-label"></small>
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    <!-- DataTables JS -->
-    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+    <!-- Modal: Gerenciar Usuários (admin) -->
+    <div class="modal fade" id="userMgmtModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-users-cog me-2 text-primary"></i>Gerenciar Usuários</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="usermgmt-msg" class="d-none mb-3"></div>
+                    <div class="table-responsive mb-4">
+                        <table class="table table-sm table-hover align-middle">
+                            <thead class="table-dark">
+                                <tr>
+                                    <th>Usuário</th>
+                                    <th>Papel</th>
+                                    <th>Status</th>
+                                    <th>Criado em</th>
+                                    <th>Último Login</th>
+                                    <th class="text-end">Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody id="users-table-body">
+                                <tr><td colspan="6" class="text-center text-muted py-3">Carregando...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <hr>
+                    <h6 class="mb-3"><i class="fas fa-user-plus me-1 text-success"></i>Novo Usuário</h6>
+                    <form id="new-user-form" onsubmit="createUser(event)">
+                        <div class="row g-2">
+                            <div class="col-md-3">
+                                <input type="text" class="form-control form-control-sm"
+                                       placeholder="Nome de usuário" id="new-user-username" required>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="password" class="form-control form-control-sm"
+                                       placeholder="Senha (mín. 8 chars)" id="new-user-password"
+                                       required minlength="8">
+                            </div>
+                            <div class="col-md-3">
+                                <select class="form-select form-select-sm" id="new-user-role">
+                                    <option value="viewer">viewer — somente leitura</option>
+                                    <option value="analyst" selected>analyst — análise + triagem</option>
+                                    <option value="admin">admin — acesso total</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <button type="submit" class="btn btn-sm btn-success w-100" id="new-user-btn">
+                                    <i class="fas fa-plus me-1"></i> Criar
+                                </button>
+                            </div>
+                        </div>
+                        <small class="text-muted">O usuário deverá alterar a senha no primeiro acesso.</small>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Modal: Admin Settings — Threat Intel & API Keys -->
+    <div class="modal fade" id="adminSettingsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-shield-virus me-2 text-success"></i>Threat Intelligence &amp; API Keys
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Tabs -->
+                    <ul class="nav nav-tabs mb-3" id="adminSettingsTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="apikeys-tab" data-bs-toggle="tab"
+                                    data-bs-target="#apikeys-pane" type="button" role="tab">
+                                <i class="fas fa-key me-1"></i>Chaves de API
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="lookup-tab" data-bs-toggle="tab"
+                                    data-bs-target="#lookup-pane" type="button" role="tab">
+                                <i class="fas fa-search me-1"></i>Consulta de Indicadores
+                            </button>
+                        </li>
+                    </ul>
 
-    <!-- Custom JS -->
-    <script src="/static/js/app.js"></script>
+                    <div class="tab-content">
+                        <!-- API Keys Tab -->
+                        <div class="tab-pane fade show active" id="apikeys-pane" role="tabpanel">
+                            <p class="text-muted small mb-3">
+                                Configure as chaves de API para serviços de threat intelligence. As chaves são
+                                armazenadas em <code>data/settings.json</code> e ficam disponíveis automaticamente
+                                nas análises de PCAP.
+                            </p>
+                            <div id="api-keys-loading" class="text-center py-3">
+                                <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+                                <span class="ms-2 text-muted">Carregando...</span>
+                            </div>
+                            <div id="api-keys-content" class="d-none">
+                                <!-- Free services -->
+                                <h6 class="text-success mb-2">
+                                    <i class="fas fa-unlock me-1"></i>Serviços Gratuitos (sem chave)
+                                </h6>
+                                <div class="table-responsive mb-4">
+                                    <table class="table table-sm align-middle">
+                                        <thead><tr>
+                                            <th style="width:160px">Serviço</th>
+                                            <th>Descrição</th>
+                                            <th style="width:100px">Tipos</th>
+                                            <th style="width:80px">Status</th>
+                                        </tr></thead>
+                                        <tbody id="free-services-tbody"></tbody>
+                                    </table>
+                                </div>
+                                <!-- Paid/key services -->
+                                <h6 class="text-warning mb-2">
+                                    <i class="fas fa-lock me-1"></i>Serviços com Chave de API
+                                </h6>
+                                <div class="table-responsive">
+                                    <table class="table table-sm align-middle">
+                                        <thead><tr>
+                                            <th style="width:130px">Serviço</th>
+                                            <th>Descrição</th>
+                                            <th style="width:90px">Tipos</th>
+                                            <th style="width:80px">Status</th>
+                                            <th>Chave de API</th>
+                                            <th style="width:90px"></th>
+                                        </tr></thead>
+                                        <tbody id="paid-services-tbody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Lookup Tab -->
+                        <div class="tab-pane fade" id="lookup-pane" role="tabpanel">
+                            <p class="text-muted small mb-3">
+                                Consulte um IP ou domínio em todos os feeds configurados em tempo real.
+                            </p>
+                            <form id="lookup-form" onsubmit="runManualLookup(event)">
+                                <div class="row g-2 align-items-end mb-3">
+                                    <div class="col-md-5">
+                                        <label class="form-label small fw-semibold">Indicador</label>
+                                        <input type="text" class="form-control" id="lookup-indicator"
+                                               placeholder="Ex: 8.8.8.8  ou  malicious.com" required>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <label class="form-label small fw-semibold">Tipo</label>
+                                        <select class="form-select" id="lookup-type">
+                                            <option value="ip">IP</option>
+                                            <option value="domain">Domínio</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <button type="submit" class="btn btn-primary w-100" id="lookup-btn">
+                                            <i class="fas fa-search me-1"></i>Consultar
+                                        </button>
+                                    </div>
+                                </div>
+                            </form>
+                            <div id="lookup-result-area" class="d-none">
+                                <hr>
+                                <div id="lookup-result-content"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Login -->
+    <div class="modal fade" id="loginModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-sm modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-lock me-2"></i>Autenticação necessária</h5>
+                </div>
+                <div class="modal-body">
+                    <div id="login-error" class="alert alert-danger d-none" role="alert"></div>
+                    <form id="login-form" onsubmit="submitLogin(event)">
+                        <div class="mb-3">
+                            <label for="login-username" class="form-label">Usuário</label>
+                            <input type="text" class="form-control" id="login-username" autocomplete="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="login-password" class="form-label">Senha</label>
+                            <input type="password" class="form-control" id="login-password" autocomplete="current-password" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary" id="login-submit-btn">
+                                <i class="fas fa-sign-in-alt me-1"></i> Entrar
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Notificação genérica -->
+    <div class="modal fade" id="notifyModal" tabindex="-1" aria-labelledby="notifyModalLabel" aria-live="assertive">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-body py-4 px-4 text-center">
+                    <div class="mb-3">
+                        <i id="notify-modal-icon" class="fas fa-info-circle fa-2x text-info"></i>
+                    </div>
+                    <p id="notify-modal-body" class="mb-0 fw-semibold"></p>
+                </div>
+                <div class="modal-footer justify-content-center border-0 pt-0">
+                    <button type="button" class="btn btn-primary px-4" data-bs-dismiss="modal">OK</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Confirmação de ação -->
+    <div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-body py-4 px-4 text-center">
+                    <div class="mb-3">
+                        <i id="confirm-modal-icon" class="fas fa-question-circle fa-2x text-warning"></i>
+                    </div>
+                    <h6 id="confirm-modal-title" class="fw-bold mb-2"></h6>
+                    <p id="confirm-modal-body" class="mb-0 text-muted small"></p>
+                </div>
+                <div id="confirm-modal-footer" class="modal-footer justify-content-center border-0 pt-0"></div>
+            </div>
+        </div>
+    </div>
+
 </body>
 </html>

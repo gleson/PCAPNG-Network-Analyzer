@@ -20,9 +20,14 @@ env/
 data/analyzer.db
 data/*.db
 
+# Runtime settings — accrues secrets (api_keys, smtp.password) at runtime.
+# Versioned template lives in data/settings.example.json instead.
+data/settings.json
+
 # Results and uploads
 data/results.json
 data/uploads/
+data/artifacts/
 *.pcap
 *.pcapng
 
@@ -37,6 +42,13 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Frontend (Vite + npm)
+node_modules/
+static/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Flask
 instance/
