@@ -32,6 +32,7 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_http_post_detectors.py` | HTTP post-detectors: scanner UA, exploit paths (high/medium), unusual method (TRACE), injection (SQLi), file-share host, Cobalt Strike checksum8 stager + negatives |
 | `test_quic_mac_post_detectors.py` | high-volume QUIC to new dest (lowered threshold), IP-with-multiple-MACs + negatives |
 | `test_aggregators.py` | aggregator output contract: summary, protocol stats, IP↔MAC mapping, asset inventory, flow-list sections |
+| `test_residual_post_detectors.py` | suspicious SNI (IP-literal / no-SNI-to-external), Encrypted Client Hello (ext 0xfe0d) — both via a hand-built ClientHello record — plus GreyNoise RIOT and CISA KEV enrichment driven by a stubbed `threat_intel` module |
 
 ## Running locally
 
@@ -62,7 +63,15 @@ docker compose run --rm \
   explicitly when timing matters; `build_pcap` fills any gaps.
 - **No network**: network-backed post-detectors (threat-intel feeds, JA3
   SSLBL, CISA KEV) no-op without `requests` / API keys, so the suite is
-  offline.
+  offline. To *positively* test a feed path (GreyNoise RIOT, CISA KEV) without
+  the network, inject a stub `threat_intel` module into `sys.modules` (see
+  `test_residual_post_detectors.py::_fake_threat_intel`). The detectors import
+  it lazily inside `run()`, so the stub is resolved there — and this also works
+  where the real module can't import (it pulls in `requests`).
+- **Crafted ClientHello**: the SNI/ECH-extension detectors key on fields scapy's
+  TLS layer doesn't surface the way JA3 does, so `_client_hello` in
+  `test_residual_post_detectors.py` builds the TLS record byte-for-byte (server_name
+  ext 0x0000, encrypted_client_hello ext 0xfe0d) — no capture needed.
 - **Thresholds**: most fixtures cross the *default* thresholds. Volume exfil's
   10 MB default is lowered via `settings` to avoid building 10 MB of packets —
   this still exercises the byte-accounting and ratio logic.
