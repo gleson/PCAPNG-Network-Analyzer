@@ -16,6 +16,9 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_kerberos_detector.py` | Kerberoasting (RC4 TGS-REQ) + AES negative |
 | `test_smb_pipe_detector.py` | SMB2 named-pipe lateral movement + benign negative + SMB1 `\PIPE\` |
 | `test_dcerpc_bind_detector.py` | DCERPC bind to high-risk interfaces (PetitPotam/DCSync) + unknown-UUID negative |
+| `test_credential_detectors.py` | SSH brute force + below-threshold negative; cleartext FTP + HTTP Basic auth |
+| `test_dns_c2_detectors.py` | DGA domain + pronounceable negative; Cobalt Strike DNS beacon + normal-subdomain negative |
+| `test_http_exploit_detector.py` | exploit payloads (Log4Shell/cmd injection on 80/8080) + benign negative |
 | `test_scan_detectors.py` | port scan, ping sweep, horizontal scan, SNMP walk, ARP host discovery + a below-threshold negative |
 | `test_dns_detectors.py` | DNS tunneling (long high-entropy subdomain) + negatives |
 | `test_protocol_detectors.py` | insecure protocols (FTP/Telnet) + HTTPS negative; LLMNR + NBT-NS poisoning + below-threshold negative |

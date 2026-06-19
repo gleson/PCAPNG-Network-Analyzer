@@ -70,6 +70,18 @@ except Exception:
     _ScapyDceRpc5Bind = None  # type: ignore
     _ScapyDceRpc5Alter = None  # type: ignore
 
+# HTTP over TCP/80 and TCP/8080: scapy auto-binds the HTTP layer to these ports
+# and dissects the request/response into HTTP/HTTPRequest/HTTPResponse, removing
+# the Raw layer. Every HTTP-derived consumer reads pkt[Raw] — HttpInfoAggregator
+# (-> exploit payloads, cleartext Basic auth, Cobalt Strike HTTP C2, scanner UA,
+# injection paths) and TcpFlowAggregator (-> HTTP reassembly + carving). So on
+# real captures, with no Raw, ALL of it goes silent. We re-expose the full TCP
+# payload as Raw to restore them.
+try:
+    from scapy.layers.http import HTTP as _ScapyHTTP
+except Exception:
+    _ScapyHTTP = None  # type: ignore
+
 try:
     from scapy.layers.inet import IPerror, TCPerror, UDPerror
 except Exception:
@@ -343,6 +355,18 @@ def extract_pkt_view(pkt):
     # This intentionally replaces any partial Raw set above.
     if (_ScapyKerberosTCP is not None and TCP in pkt
             and _ScapyKerberosTCP in pkt):
+        try:
+            full = bytes(pkt[TCP].payload)
+            if full:
+                layer = _RawLayerView()
+                layer.load = full
+                view._layers[Raw] = layer
+        except Exception:
+            pass
+
+    # HTTP/TCP override: same idea — scapy's HTTP layer consumes the payload on
+    # 80/8080, so re-expose the full TCP payload as Raw for the HTTP consumers.
+    if _ScapyHTTP is not None and TCP in pkt and _ScapyHTTP in pkt:
         try:
             full = bytes(pkt[TCP].payload)
             if full:
