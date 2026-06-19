@@ -91,7 +91,7 @@ except Exception:
 
 
 class _IPLayerView:
-    __slots__ = ('src', 'dst', 'ttl')
+    __slots__ = ('src', 'dst', 'ttl', 'proto')
 
 
 class _TCPLayerView:
@@ -221,6 +221,9 @@ def extract_pkt_view(pkt):
             layer.src = ip.src
             layer.dst = ip.dst
             layer.ttl = int(ip.ttl) if ip.ttl is not None else 64
+            # IP protocol number — ModernTunnelStreamingDetector reads this to
+            # spot layer-3 encapsulation (GRE 47, IPIP 4, SIT 41, ...).
+            layer.proto = int(ip.proto) if ip.proto is not None else 0
             view._layers[IP] = layer
         except Exception:
             pass
@@ -231,6 +234,7 @@ def extract_pkt_view(pkt):
             layer.src = str(v6.src)
             layer.dst = str(v6.dst)
             layer.ttl = int(getattr(v6, 'hlim', 64) or 64)
+            layer.proto = int(getattr(v6, 'nh', 0) or 0)
             view._layers[IPv6] = layer
         except Exception:
             pass

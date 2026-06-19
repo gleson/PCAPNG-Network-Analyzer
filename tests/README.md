@@ -23,6 +23,9 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_dns_detectors.py` | DNS tunneling (long high-entropy subdomain) + negatives |
 | `test_protocol_detectors.py` | insecure protocols (FTP/Telnet) + HTTPS negative; LLMNR + NBT-NS poisoning + below-threshold negative |
 | `test_exfil_beacon_detectors.py` | volume exfiltration, beaconing |
+| `test_dns_intel_detectors.py` | fast-flux (many IPs / low TTL), NXDOMAIN spike, suspicious TLD + negatives |
+| `test_tunnel_detectors.py` | DoT (known vs unknown resolver), WireGuard / OpenVPN handshakes on non-standard ports, GRE IP-encapsulation + negatives |
+| `test_ics_detectors.py` | ICS/OT protocol presence (Modbus/TCP), Modbus write FC from external IP (critical) + internal/read negatives |
 
 ## Running locally
 
@@ -58,7 +61,16 @@ docker compose run --rm \
   10 MB default is lowered via `settings` to avoid building 10 MB of packets —
   this still exercises the byte-accounting and ratio logic.
 
-## Bug found & fixed while writing this suite
+## Bugs found & fixed while writing this suite
+
+`ModernTunnelStreamingDetector` (WireGuard / OpenVPN / DoQ / GRE-IPIP-SIT
+tunnels) was **dead** on every real capture. It read `pkt[IP].proto` and
+`bytes(pkt[UDP].payload)`, but the compact `PktView` carried neither: `_IPLayerView`
+had no `proto` field and `_UDPLayerView` no payload, so every signature check
+silently saw `proto=None` / empty payload. Fix: `pkt_view.py` now exposes
+`IP.proto`, and the detector reads the UDP handshake bytes from the already-
+extracted `Raw` layer (scapy keeps an unrecognised UDP payload as `Raw`), which
+adds no extra memory. Covered by `test_tunnel_detectors.py`.
 
 `LlmnrNbtnsStreamingDetector` was **dead** on every scapy-parsed capture. It
 guarded on `if DNS in pkt`, but scapy dissects LLMNR (UDP 5355) as

@@ -3666,8 +3666,12 @@ class ModernTunnelStreamingDetector(StreamingDetector):
         dst = pkt[IP].dst
         sport = int(pkt[UDP].sport)
         dport = int(pkt[UDP].dport)
+        # The UDP payload of an unrecognised protocol (WireGuard/OpenVPN init,
+        # QUIC) is kept by PktView as the Raw layer — _UDPLayerView carries no
+        # payload. Read it from Raw so the handshake-signature checks below see
+        # the bytes on real captures.
         try:
-            payload = bytes(pkt[UDP].payload) if pkt[UDP].payload else b''
+            payload = bytes(pkt[Raw].load) if Raw in pkt else b''
         except Exception:
             payload = b''
 
