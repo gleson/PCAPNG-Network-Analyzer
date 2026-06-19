@@ -29,6 +29,9 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_arp_spray_detectors.py` | ARP spoofing (MAC change / gratuitous flood), password spraying (one source → many SMB hosts) + negatives |
 | `test_tls_ja3_detectors.py` | known-malicious JA3 / JA3S match (uses the checked-in `fixtures/tls_handshake.pcap`) + clean / unrelated-fingerprint negatives |
 | `test_tls12_detectors.py` | TLS 1.2 post-detectors: certificate CN/SNI mismatch (uses `fixtures/tls12_handshake.pcap`), DoH SNI match, ALPN-h2-on-DB-port, obsolete TLS 1.0 (synthetic hello) + negatives |
+| `test_http_post_detectors.py` | HTTP post-detectors: scanner UA, exploit paths (high/medium), unusual method (TRACE), injection (SQLi), file-share host, Cobalt Strike checksum8 stager + negatives |
+| `test_quic_mac_post_detectors.py` | high-volume QUIC to new dest (lowered threshold), IP-with-multiple-MACs + negatives |
+| `test_aggregators.py` | aggregator output contract: summary, protocol stats, IP↔MAC mapping, asset inventory, flow-list sections |
 
 ## Running locally
 
