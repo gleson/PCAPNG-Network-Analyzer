@@ -28,6 +28,7 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_ics_detectors.py` | ICS/OT protocol presence (Modbus/TCP), Modbus write FC from external IP (critical) + internal/read negatives |
 | `test_arp_spray_detectors.py` | ARP spoofing (MAC change / gratuitous flood), password spraying (one source → many SMB hosts) + negatives |
 | `test_tls_ja3_detectors.py` | known-malicious JA3 / JA3S match (uses the checked-in `fixtures/tls_handshake.pcap`) + clean / unrelated-fingerprint negatives |
+| `test_tls12_detectors.py` | TLS 1.2 post-detectors: certificate CN/SNI mismatch (uses `fixtures/tls12_handshake.pcap`), DoH SNI match, ALPN-h2-on-DB-port, obsolete TLS 1.0 (synthetic hello) + negatives |
 
 ## Running locally
 
@@ -69,6 +70,14 @@ docker compose run --rm \
   rewritten to the suite constants. JA3/JA3S cover only the TLS record (never
   the IPs or SNI), so the rewrite preserves the fingerprints and leaks nothing.
   `*.pcap` is gitignored except `tests/fixtures/*.pcap` (see `.gitignore`).
+- **TLS 1.2 fixture**: the cert is only sent in the clear under TLS 1.2 (1.3
+  encrypts it), and on the wire it spans several TCP segments while the
+  aggregator parses per packet — so `fixtures/tls12_handshake.pcap` carries a
+  real Certificate record *reassembled into one packet*. Its ClientHello and
+  Certificate come from two different real flows, paired so the requested SNI
+  doesn't match the cert CN — a deterministic, clock-independent CN/SNI
+  mismatch. The obsolete-TLS test needs no capture: a minimal TLS 1.0
+  ClientHello is synthesised inline.
 
 ## Bugs found & fixed while writing this suite
 
