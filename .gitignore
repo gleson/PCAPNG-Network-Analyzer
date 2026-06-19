@@ -30,6 +30,8 @@ data/uploads/
 data/artifacts/
 *.pcap
 *.pcapng
+# ...except small, scrubbed handshake fixtures the test suite needs.
+!tests/fixtures/*.pcap
 
 # Logs
 *.log

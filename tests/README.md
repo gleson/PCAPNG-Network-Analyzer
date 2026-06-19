@@ -26,6 +26,8 @@ test reads as a spec for the traffic it exercises and stays diffable.
 | `test_dns_intel_detectors.py` | fast-flux (many IPs / low TTL), NXDOMAIN spike, suspicious TLD + negatives |
 | `test_tunnel_detectors.py` | DoT (known vs unknown resolver), WireGuard / OpenVPN handshakes on non-standard ports, GRE IP-encapsulation + negatives |
 | `test_ics_detectors.py` | ICS/OT protocol presence (Modbus/TCP), Modbus write FC from external IP (critical) + internal/read negatives |
+| `test_arp_spray_detectors.py` | ARP spoofing (MAC change / gratuitous flood), password spraying (one source → many SMB hosts) + negatives |
+| `test_tls_ja3_detectors.py` | known-malicious JA3 / JA3S match (uses the checked-in `fixtures/tls_handshake.pcap`) + clean / unrelated-fingerprint negatives |
 
 ## Running locally
 
@@ -60,6 +62,13 @@ docker compose run --rm \
 - **Thresholds**: most fixtures cross the *default* thresholds. Volume exfil's
   10 MB default is lowered via `settings` to avoid building 10 MB of packets —
   this still exercises the byte-accounting and ratio logic.
+- **TLS fixtures**: JA3/JA3S are md5s over the exact ciphers/extensions a stack
+  offers — not practical to forge byte-accurate with scapy — so
+  `test_tls_ja3_detectors.py` uses `fixtures/tls_handshake.pcap`, one real
+  ClientHello + ServerHello carved from a capture with the IP/TCP addressing
+  rewritten to the suite constants. JA3/JA3S cover only the TLS record (never
+  the IPs or SNI), so the rewrite preserves the fingerprints and leaks nothing.
+  `*.pcap` is gitignored except `tests/fixtures/*.pcap` (see `.gitignore`).
 
 ## Bugs found & fixed while writing this suite
 
