@@ -594,25 +594,28 @@ def save_scan(results, filename):
 
         scan_id = cursor.fetchone()['id']
 
-        # Insert IP stats
-        for ip_data in ips:
-            cursor.execute('''
-                INSERT INTO ip_stats (
+        # Insert IP stats — one round-trip via execute_values instead of one
+        # INSERT per IP (captures with thousands of hosts paid that in latency).
+        if ips:
+            psycopg2.extras.execute_values(
+                cursor,
+                '''INSERT INTO ip_stats (
                     scan_id, ip_address, is_local, packets_sent, packets_received,
                     bytes_sent, bytes_received, protocols, ports, alert_count
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                scan_id,
-                ip_data.get('ip'),
-                ip_data.get('is_local', False),
-                ip_data.get('packets_sent', 0),
-                ip_data.get('packets_received', 0),
-                ip_data.get('bytes_sent', 0),
-                ip_data.get('bytes_received', 0),
-                json.dumps(ip_data.get('protocols', [])),
-                json.dumps(ip_data.get('ports', [])),
-                ip_data.get('alert_count', 0)
-            ))
+                ) VALUES %s''',
+                [(
+                    scan_id,
+                    ip_data.get('ip'),
+                    ip_data.get('is_local', False),
+                    ip_data.get('packets_sent', 0),
+                    ip_data.get('packets_received', 0),
+                    ip_data.get('bytes_sent', 0),
+                    ip_data.get('bytes_received', 0),
+                    json.dumps(ip_data.get('protocols', [])),
+                    json.dumps(ip_data.get('ports', [])),
+                    ip_data.get('alert_count', 0),
+                ) for ip_data in ips],
+            )
 
         # Derive alert_date from the scan's analyzed_at (used as partition key).
         analyzed_at_str = summary.get('analyzed_at', datetime.now().isoformat())
@@ -648,7 +651,13 @@ def save_scan(results, filename):
         # Insert alerts. Each alert starts in 'analisar'; suppression rules and
         # learned FP signatures demote it to 'sem_risco' (auto-classified as
         # not worth attention). Only 'analisar' alerts count towards the badge.
+        # The per-alert triage decision stays in Python; the DB write is a
+        # single execute_values with RETURNING, whose rows come back in the
+        # SAME order as the params list — so we can zip the ids straight back
+        # onto the alert dicts (the notification dispatch right after save_scan
+        # needs a stable id on every alert).
         analisar_count = 0
+        alert_params = []
         for alert in alerts:
             matched_rule = None
             triage_status = 'analisar'
@@ -664,14 +673,7 @@ def save_scan(results, filename):
                     fp_signature_hits[matched_sig] = fp_signature_hits.get(matched_sig, 0) + 1
             if triage_status == 'analisar':
                 analisar_count += 1
-            cursor.execute('''
-                INSERT INTO alerts (
-                    scan_id, alert_date, severity, category, title, description,
-                    ip_address, details, recommendation, timestamp,
-                    triage_status, suppressed_by_rule
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            ''', (
+            alert_params.append((
                 scan_id,
                 alert_date,
                 alert.get('severity'),
@@ -685,11 +687,19 @@ def save_scan(results, filename):
                 triage_status,
                 matched_rule,
             ))
-            # Write the freshly-assigned row id back onto the alert dict. The
-            # `alerts` list is the same object as results['alerts'], so the
-            # notification dispatch that runs right after save_scan can quote
-            # a stable, human-referenceable id for every alert.
-            alert['id'] = cursor.fetchone()['id']
+        if alert_params:
+            inserted = psycopg2.extras.execute_values(
+                cursor,
+                '''INSERT INTO alerts (
+                    scan_id, alert_date, severity, category, title, description,
+                    ip_address, details, recommendation, timestamp,
+                    triage_status, suppressed_by_rule
+                ) VALUES %s RETURNING id''',
+                alert_params,
+                fetch=True,
+            )
+            for alert, row in zip(alerts, inserted):
+                alert['id'] = row['id']
 
         # scans.alert_count tracks only alerts that still need attention
         # ('analisar') — alerts auto-filed as 'sem_risco' don't inflate the
@@ -700,37 +710,47 @@ def save_scan(results, filename):
         )
 
         # Insert protocol stats
-        for proto in protocols:
-            cursor.execute('''
-                INSERT INTO protocol_stats (
+        if protocols:
+            psycopg2.extras.execute_values(
+                cursor,
+                '''INSERT INTO protocol_stats (
                     scan_id, name, packets, bytes, percentage, risk_level, warning
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                scan_id,
-                proto.get('name'),
-                proto.get('packets', 0),
-                proto.get('bytes', 0),
-                proto.get('percentage', 0),
-                proto.get('risk_level'),
-                proto.get('warning')
-            ))
-
-        # Insert protocol-IP stats
-        protocol_ips = results.get('protocol_ips', {})
-        for proto_name, ip_list in protocol_ips.items():
-            for ip_data in ip_list:
-                cursor.execute('''
-                    INSERT INTO protocol_ip_stats (
-                        scan_id, protocol_name, ip_address, packets, bytes, is_local
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                ''', (
+                ) VALUES %s''',
+                [(
                     scan_id,
-                    proto_name,
-                    ip_data.get('ip'),
-                    ip_data.get('packets', 0),
-                    ip_data.get('bytes', 0),
-                    ip_data.get('is_local', False)
-                ))
+                    proto.get('name'),
+                    proto.get('packets', 0),
+                    proto.get('bytes', 0),
+                    proto.get('percentage', 0),
+                    proto.get('risk_level'),
+                    proto.get('warning'),
+                ) for proto in protocols],
+            )
+
+        # Insert protocol-IP stats — flatten the nested dict into one bulk
+        # insert. This is the biggest of the four tables (protocol × IP), so
+        # collapsing N round-trips here is the main win.
+        protocol_ips = results.get('protocol_ips', {})
+        proto_ip_params = [
+            (
+                scan_id,
+                proto_name,
+                ip_data.get('ip'),
+                ip_data.get('packets', 0),
+                ip_data.get('bytes', 0),
+                ip_data.get('is_local', False),
+            )
+            for proto_name, ip_list in protocol_ips.items()
+            for ip_data in ip_list
+        ]
+        if proto_ip_params:
+            psycopg2.extras.execute_values(
+                cursor,
+                '''INSERT INTO protocol_ip_stats (
+                    scan_id, protocol_name, ip_address, packets, bytes, is_local
+                ) VALUES %s''',
+                proto_ip_params,
+            )
 
         conn.commit()
 
