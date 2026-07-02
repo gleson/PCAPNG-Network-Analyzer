@@ -60,11 +60,16 @@ def _ip_in_net(ip_str, net):
 def _collect_alert_ips(alert):
     """Return (src_ips, dst_ips) sets gathered from the alert's known fields.
 
-    Detectors are inconsistent about where they put endpoints — some use
-    src_ip/dst_ip, some put a single IP at alert['ip'], some use targets/peer_ips.
-    We err on the side of collecting too much so the operator can spot scans
-    even when the detector didn't model a clean pair.
+    Alerts that went through alert_schema.normalize_alerts carry canonical
+    top-level src_ips/dst_ips covering every detector field variant — prefer
+    those. The legacy detail-key path below stays for alerts persisted before
+    normalization existed (old DB blobs re-tagged on settings change).
     """
+    if 'src_ips' in alert or 'dst_ips' in alert:
+        src = {ip for ip in (alert.get('src_ips') or []) if isinstance(ip, str)}
+        dst = {ip for ip in (alert.get('dst_ips') or []) if isinstance(ip, str)}
+        return src, dst
+
     d = alert.get('details') or {}
     src = set()
     dst = set()

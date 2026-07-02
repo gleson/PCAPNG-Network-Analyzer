@@ -1940,9 +1940,9 @@ class GreyNoiseRiotDetector(PostDetector):
         return alerts
 
 
-# CVE pattern reused by the KEV enricher. Matches "CVE-YYYY-NNNN+" tokens
-# anywhere in alert title/description/details (case-insensitive).
-_CVE_RE = _re.compile(r'CVE[-\s]?(\d{4})[-\s]?(\d{4,7})', _re.IGNORECASE)
+# CVE pattern reused by the KEV enricher — shared with alert_schema so the
+# canonical `cves` field and KEV matching extract the exact same token set.
+from ..alert_schema import CVE_RE as _CVE_RE  # noqa: E402
 
 
 class KevEnricherDetector(PostDetector):

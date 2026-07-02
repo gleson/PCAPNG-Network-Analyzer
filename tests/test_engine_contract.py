@@ -97,3 +97,10 @@ def test_all_emitted_alerts_satisfy_schema(analyze):
         assert a.get("category"), a
         assert a.get("title"), a
         assert isinstance(a.get("details", {}), dict), a
+        # Canonical schema (alert_schema.normalize_alerts): every emitted
+        # alert must carry the normalized endpoint/port/protocol/CVE fields.
+        for field in ("src_ips", "dst_ips", "ports", "protocols", "cves"):
+            assert isinstance(a.get(field), list), (field, a)
+        assert a["src_ips"] or a["dst_ips"], (
+            "alert has no endpoint on either side", a,
+        )

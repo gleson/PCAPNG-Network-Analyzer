@@ -411,6 +411,15 @@ class PCAPAnalyzer:
                 sev = alert.get('severity', 'medium')
                 alert['confidence'] = _CONFIDENCE_DEFAULT_BY_SEV.get(sev, 50)
 
+        # Canonical schema: every alert gets src_ips/dst_ips/ports/protocols/
+        # cves derived from whatever legacy keys the detector used. Must run
+        # before SOC tagging and dedup — both key off the canonical fields.
+        try:
+            from .alert_schema import normalize_alerts
+            normalize_alerts(alerts)
+        except Exception as e:
+            print(f"[pcap_analyzer] alert normalization failed: {e}")
+
         try:
             from mitre_attack import annotate_alerts
             annotate_alerts(alerts)
@@ -457,7 +466,14 @@ class PCAPAnalyzer:
     _SEV_RANK = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'info': 0}
 
     def _dedupe_alerts(self):
-        """Collapse alerts with identical (category, title, src_ip, dst_ip).
+        """Collapse alerts with identical (category, title, src_ips, dst_ips,
+        ports) — the canonical endpoint fields set by alert_schema.
+
+        The pre-2026-07 key read details['src_ip']/['dst_ip'] directly; most
+        detectors use other field names, so unrelated alerts (same title,
+        DIFFERENT hosts) all landed on ('cat', 'title', '', '') and were
+        silently merged into one. Keying on the normalized fields keeps one
+        alert per real (endpoints, ports) finding.
 
         - Preserves the worst-severity / highest-confidence representative.
         - Sums `count` (defaults to 1 each) so the analyst sees how often the
@@ -481,7 +497,16 @@ class PCAPAnalyzer:
             if a.get('dedupe') is False:
                 # Unique tag — keep as-is under a unique key.
                 k = ('__nodedup__', id(a))
+            elif 'src_ips' in a or 'dst_ips' in a:
+                k = (
+                    a.get('category') or '',
+                    a.get('title') or '',
+                    tuple(a.get('src_ips') or []),
+                    tuple(a.get('dst_ips') or []),
+                    tuple(a.get('ports') or []),
+                )
             else:
+                # Normalization didn't run (import failure) — legacy key.
                 details = a.get('details') or {}
                 k = (
                     a.get('category') or '',
