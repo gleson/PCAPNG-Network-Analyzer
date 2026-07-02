@@ -70,6 +70,16 @@ def test_flow_list_sections_present(analyze):
     assert isinstance(results.get("traffic_timeline"), list)
 
 
+def test_summary_filename_is_basename(analyze):
+    # Regression (2026-07): the summary used filepath.split('/') — on Windows
+    # paths use '\\', so summary.filename carried the whole absolute path and
+    # get_packets/replay (UPLOAD_FOLDER + filename) could not find the file.
+    results = analyze(_mixed_capture())
+    fn = results["summary"]["filename"]
+    assert "/" not in fn and "\\" not in fn
+    assert fn.endswith(".pcap")
+
+
 def test_ipv6_packet_counted_once_in_ip_stats(analyze):
     # Regression (2026-07): pkt_view dual-keys the IPv6 layer under IP, so the
     # old separate `if IP` + `if IPv6` blocks BOTH ran and every v6 packet was

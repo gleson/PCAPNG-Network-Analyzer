@@ -87,6 +87,13 @@ def upload_file():
                 "error": "Filename rejected: would escape upload directory"
             }), 400
 
+        # Never overwrite an existing PCAP: older scans locate their source
+        # file by this name (packet viewer / replay / diff), so a same-name
+        # re-upload would silently rebind them to the new bytes. On collision
+        # the stored name gains a numeric suffix (capture.pcap → capture-2.pcap).
+        from upload_utils import claim_unique_upload_path
+        filepath, filename = claim_unique_upload_path(upload_root, filename)
+
         file.save(filepath)
 
         audit_event(action='upload_pcap', target_type='pcap', target_id=filename,

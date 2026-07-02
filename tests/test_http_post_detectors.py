@@ -97,3 +97,22 @@ def test_cobalt_strike_checksum8_stager_is_critical(analyze):
 def test_normal_get_does_not_trigger_cobalt(analyze):
     results = analyze([_http("GET", "/index.html")])
     assert not has_alert(results, title="Cobalt Strike")
+
+
+def test_long_path_matching_checksum_does_not_trigger_cobalt(analyze):
+    # Regression (2026-07): ~0.8% of ALL paths sum to 92/93 mod 256, so a
+    # benign long URL could raise a critical CS alert on its own. Stager URIs
+    # are short single-segment strings; the shape gate must reject this path
+    # even though its checksum8 matches.
+    path = "/aaaaaaaaaaII"  # 12 chars, sums to 92 (mod 256)
+    assert sum(map(ord, path[1:])) % 256 == 92
+    results = analyze([_http("GET", path)])
+    assert not has_alert(results, title="Cobalt Strike")
+
+
+def test_dotted_path_matching_checksum_does_not_trigger_cobalt(analyze):
+    # An extension dot means a real resource, not a generated stager URI.
+    path = "/a.al"  # 4 chars, sums to 92 (mod 256)
+    assert sum(map(ord, path[1:])) % 256 == 92
+    results = analyze([_http("GET", path)])
+    assert not has_alert(results, title="Cobalt Strike")

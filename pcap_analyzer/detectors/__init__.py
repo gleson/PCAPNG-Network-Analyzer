@@ -3979,10 +3979,11 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
     followed by long base32-ish random labels that encode beacon metadata.
 
     A single hit isn't conclusive (legitimate APIs use api.* too) — we
-    require the prefix + a long random subdomain label co-located. The
-    detector emits CRITICAL on the first match per (src, parent_zone) and
-    medium on subsequent matches of the same parent, so the temporal
-    *first-hit* of a CS DNS Beacon is treated as the most actionable signal.
+    require the prefix + a long random subdomain label co-located. One alert
+    is emitted per (src, parent_zone); severity is monotonic in evidence:
+    1-2 matching queries = high (a lone hit can be an unlucky api.* label),
+    3+ = critical (sustained encoded-label querying of one zone is the
+    beacon-channel signature).
     """
     name = 'cs_dns_beacon'
 
@@ -4070,9 +4071,10 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
             qtypes_str = sorted(
                 qtype_name.get(q, str(q)) for q in rec['qtypes']
             )
-            severity = 'critical' if rec['hits'] == 1 else (
-                'high' if rec['hits'] < 5 else 'critical'
-            )
+            # Monotonic in evidence — the pre-2026-07 ladder was inverted
+            # (1 hit = critical, 3 hits = high), so the most FP-prone case
+            # (one unlucky api.* label) outranked a sustained beacon.
+            severity = 'critical' if rec['hits'] >= 3 else 'high'
             alerts.append({
                 'severity': severity,
                 'category': 'c2',
@@ -4354,8 +4356,20 @@ class IcsProtocolStreamingDetector(StreamingDetector):
         sport = int(pkt[TCP].sport)
         dport = int(pkt[TCP].dport)
 
+        # Portas ICS altas (20000/DNP3, 44818/EtherNet-IP, 47808/BACnet) caem
+        # na faixa efêmera do SO: um cliente comum pode sortear uma delas como
+        # porta de ORIGEM ao falar HTTPS/SSH etc., e o fluxo virava um falso
+        # "ICS/OT Protocol Detected". Quando o outro lado do pacote é um
+        # serviço conhecido (<1024 ou porta web), a interpretação correta é
+        # "cliente de outro protocolo", não ICS — numa sessão ICS real o lado
+        # oposto à porta ICS é sempre um efêmero alto arbitrário.
+        def _other_side_is_known_service(port):
+            return port < 1024 or port in self._c.ALPN_WEB_OK_PORTS
+
         ics_port = None
         if dport in self._c.ICS_PORTS:
+            if _other_side_is_known_service(sport):
+                return
             ics_port = dport
             direction_dst = dst
             direction_src = src
@@ -4363,6 +4377,8 @@ class IcsProtocolStreamingDetector(StreamingDetector):
                 dst, src, dport, pkt, sender_is_client=True,
             )
         elif sport in self._c.ICS_PORTS:
+            if _other_side_is_known_service(dport):
+                return
             ics_port = sport
             direction_dst = src
             direction_src = dst

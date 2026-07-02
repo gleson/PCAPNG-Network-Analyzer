@@ -13,6 +13,7 @@ Extracted from pcap_analyzer/_core.py.
 import math
 import hashlib
 import ipaddress
+import os
 import time
 from collections import defaultdict, Counter
 from datetime import datetime
@@ -155,7 +156,10 @@ class SummaryAggregator(StreamingAggregator):
         first = self.first_ts or 0
         last = self.last_ts or 0
         results['summary'] = {
-            'filename': self.analyzer.filepath.split('/')[-1],
+            # basename, não split('/'): no Windows o caminho usa '\\' e o
+            # split devolvia o path inteiro — get_packets/replay montam
+            # UPLOAD_FOLDER + summary.filename e não achavam o arquivo.
+            'filename': os.path.basename(self.analyzer.filepath),
             'analyzed_at': datetime.now().isoformat(),
             'packet_count': self.count,
             'duration': float(last - first),

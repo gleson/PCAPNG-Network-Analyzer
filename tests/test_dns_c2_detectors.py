@@ -27,11 +27,28 @@ def test_pronounceable_domain_does_not_fire_dga(analyze):
 
 
 def test_cobalt_strike_dns_beacon_fires(analyze):
-    # post.<long high-entropy label>.<zone> -> CS DNS beacon (single hit = critical).
+    # post.<long high-entropy label>.<zone> -> CS DNS beacon.
     results = analyze([_dns_query(f"post.{_HE_LABEL}.example.com")])
     hits = find_alerts(results, title="Cobalt Strike DNS Beacon", category="c2")
     assert hits
     assert hits[0]["details"]["prefix"] == "post"
+
+
+def test_cs_beacon_severity_scales_with_hits(analyze):
+    # Regression (2026-07): the severity ladder was inverted — a single hit
+    # (the most FP-prone case, e.g. an unlucky api.* label) rated critical
+    # while 3 hits rated high. Severity must grow with evidence.
+    one = analyze([_dns_query(f"post.{_HE_LABEL}.evil-one.com")])
+    single = find_alerts(one, title="Cobalt Strike DNS Beacon")
+    assert single and single[0]["severity"] == "high"
+
+    many = analyze([
+        _dns_query(f"post.{_HE_LABEL}{i}.evil-many.com", sport=30000 + i)
+        for i in range(4)
+    ])
+    sustained = find_alerts(many, title="Cobalt Strike DNS Beacon")
+    assert sustained and sustained[0]["severity"] == "critical"
+    assert sustained[0]["details"]["hits"] == 4
 
 
 def test_normal_subdomain_does_not_trigger_cs_beacon(analyze):
