@@ -726,6 +726,35 @@ class PCAPAnalyzer:
         except ValueError:
             return False
 
+    def _hostname_index(self):
+        """Lazy map external_server_ip -> set(hostnames) from TLS SNI and HTTP
+        Host observed in THIS capture. Lets flow-level detectors (exfil) name
+        the destination and check it against sanctioned-destination lists
+        without a reverse-DNS lookup. Built once, cached on the analyzer.
+
+        Only server-side endpoints are indexed: ClientHello dst (the server
+        the client asked `sni` of) and HTTP request dst (the `Host:`)."""
+        idx = getattr(self, '_hostname_idx_cache', None)
+        if idx is not None:
+            return idx
+        idx = {}
+        tls = self._tls_info if isinstance(self._tls_info, dict) else {}
+        for ch in tls.get('client_hellos') or []:
+            sni = (ch.get('sni') or '').lower().strip().rstrip('.')
+            dst = ch.get('dst')
+            if sni and dst:
+                idx.setdefault(dst, set()).add(sni)
+        http = self._http_info if isinstance(self._http_info, dict) else {}
+        for req in http.get('requests') or []:
+            host = (req.get('host') or '').lower().strip().rstrip('.')
+            if ':' in host:
+                host = host.split(':', 1)[0]
+            dst = req.get('dst')
+            if host and dst:
+                idx.setdefault(dst, set()).add(host)
+        self._hostname_idx_cache = idx
+        return idx
+
     # --------------------------------------------------- post-processing
 
     def _classify_protocol_risks(self):

@@ -356,6 +356,108 @@ class KnownBadJa3sDetector(PostDetector):
         return alerts
 
 
+class KnownBadJa4Detector(PostDetector):
+    """Match TLS JA4 (client) and JA4S (server) fingerprints against known-bad
+    lists. JA4 (FoxIO) is the modern successor to JA3 — more stable across
+    library versions, so operator-supplied intel ages better. Built-in lists
+    are small; extend via settings['known_malicious_ja4'] / ['..._ja4s'].
+    """
+    name = 'known_bad_ja4'
+
+    def run(self):
+        analyzer = self.analyzer
+        tls = analyzer._tls_info
+        if not tls:
+            return []
+        from ..constants import KNOWN_MALICIOUS_JA4, KNOWN_MALICIOUS_JA4S
+
+        bad_ja4 = dict(KNOWN_MALICIOUS_JA4)
+        user_ja4 = analyzer.settings.get('known_malicious_ja4') or {}
+        if isinstance(user_ja4, dict):
+            bad_ja4.update(user_ja4)
+        bad_ja4s = dict(KNOWN_MALICIOUS_JA4S)
+        user_ja4s = analyzer.settings.get('known_malicious_ja4s') or {}
+        if isinstance(user_ja4s, dict):
+            bad_ja4s.update(user_ja4s)
+        if not bad_ja4 and not bad_ja4s:
+            return []
+
+        alerts = []
+        seen = set()
+
+        for ch in tls.get('client_hellos') or []:
+            h = ch.get('ja4')
+            if not h or h not in bad_ja4:
+                continue
+            key = ('ja4', ch.get('src'), ch.get('dst'), h)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = bad_ja4[h]
+            alerts.append({
+                'severity': 'critical',
+                'category': 'tls',
+                'title': 'Known Malicious JA4 Fingerprint',
+                'description': (
+                    f'Host {ch.get("src")} TLS ClientHello matches JA4 of '
+                    f'{label} (JA4 {h}).'
+                ),
+                'ip': ch.get('src'),
+                'details': {
+                    'ja4': h,
+                    'matches': label,
+                    'src': ch.get('src'),
+                    'dst': ch.get('dst'),
+                    'dport': ch.get('dport'),
+                    'sni': ch.get('sni'),
+                    'ja3_md5': ch.get('ja3_md5'),
+                },
+                'recommendation': (
+                    f'JA4 {h} is associated with {label}. Isolate the host, '
+                    'preserve memory/disk for forensics, and block the '
+                    'destination. JA4 is more stable than JA3, so this match '
+                    'is higher-confidence than a JA3 hit alone.'
+                ),
+            })
+
+        for sh in tls.get('server_hellos') or []:
+            h = sh.get('ja4s')
+            if not h or h not in bad_ja4s:
+                continue
+            server_ip = sh.get('src')
+            client_ip = sh.get('dst')
+            key = ('ja4s', server_ip, sh.get('sport'), h)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = bad_ja4s[h]
+            alerts.append({
+                'severity': 'high',
+                'category': 'tls',
+                'title': 'Known Malicious JA4S Fingerprint',
+                'description': (
+                    f'Server {server_ip}:{sh.get("sport")} TLS ServerHello '
+                    f'matches JA4S of {label} (JA4S {h}).'
+                ),
+                'ip': client_ip or server_ip,
+                'details': {
+                    'ja4s': h,
+                    'matches': label,
+                    'server_ip': server_ip,
+                    'client_ip': client_ip,
+                    'sport': sh.get('sport'),
+                    'ja3s_md5': sh.get('ja3s_md5'),
+                },
+                'recommendation': (
+                    f'JA4S {h} ({label}) suggests the server runs a C2 '
+                    'framework with a default TLS stack. Combine with '
+                    'destination reputation and any client-side JA4 hits '
+                    'before blocking.'
+                ),
+            })
+        return alerts
+
+
 class AlpnPortInconsistencyDetector(PostDetector):
     """Onda 6 — B.6. ALPN-vs-port consistency.
 
@@ -2093,6 +2195,7 @@ POST_DETECTORS = [
     SuspiciousSniDetector,
     KnownBadJa3Detector,
     KnownBadJa3sDetector,
+    KnownBadJa4Detector,
     AlpnPortInconsistencyDetector,
     TlsCertificateDetector,
     ScannerUserAgentDetector,

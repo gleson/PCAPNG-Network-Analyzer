@@ -672,3 +672,70 @@ def base_zone(parts):
     if is_compound and len(parts) >= 3:
         return '.'.join(parts[-3:])
     return suffix2
+
+# --- Sanctioned bulk-transfer destinations (exfil false-positive guard) -----
+# Volume/ratio exfil detectors fire on any large local->external upload. Cloud
+# backup, OS/software updates, telemetry and video/conferencing legitimately
+# move large volumes outbound and dominate real-world false positives. When an
+# exfil alert's destination resolves (via TLS SNI or HTTP Host observed in the
+# same capture) to one of these suffixes, the detector DOWNGRADES severity and
+# annotates the alert — it does NOT suppress it, because attackers do abuse
+# cloud services for exfil (so the analyst still sees it, de-prioritized).
+#
+# Deliberately EXCLUDES file-share / paste services (dropbox, mega, wetransfer,
+# pastebin, ...) — those are the exfil channel of concern and are handled by
+# FileShareUploadDetector; downgrading them here would hide the very thing we
+# want surfaced.
+SANCTIONED_BULK_DESTINATIONS = (
+    # OS / software updates
+    'windowsupdate.com', 'update.microsoft.com', 'delivery.mp.microsoft.com',
+    'dl.delivery.mp.microsoft.com', 'swcdn.apple.com', 'swscan.apple.com',
+    'mesu.apple.com', 'osxapps.itunes.apple.com', 'appldnld.apple.com',
+    'archive.ubuntu.com', 'security.ubuntu.com', 'deb.debian.org',
+    'download.windowsupdate.com', 'ftp.mozilla.org', 'download.mozilla.org',
+    'dl.google.com', 'redirector.gvt1.com', 'update.googleapis.com',
+    'clients2.google.com', 'edgedl.me.gvt1.com',
+    # Major cloud infra / CDN edge (bulk content, not user file-share)
+    'akamai.net', 'akamaiedge.net', 'akamaitechnologies.com',
+    'cloudfront.net', 'fastly.net', 'fbcdn.net', 'azureedge.net',
+    'azurefd.net', 'blob.core.windows.net', 'googleusercontent.com',
+    'googlevideo.com', 'gvt1.com', 'gvt2.com', 'ytimg.com',
+    's3.amazonaws.com', 'amazonaws.com', 'digitaloceanspaces.com',
+    # Backup / endpoint protection (bulk outbound by design)
+    'backblaze.com', 'backblazeb2.com', 'code42.com', 'crashplan.com',
+    'druva.com', 'carbonite.com', 'acronis.com',
+    # Video / conferencing (sustained outbound uploads are normal)
+    'zoom.us', 'teams.microsoft.com', 'webex.com', 'whatsapp.net',
+    'googlemeet.com', 'meet.google.com',
+    # OS/vendor telemetry endpoints that push sizeable diagnostics
+    'events.data.microsoft.com', 'settings-win.data.microsoft.com',
+    'incoming.telemetry.mozilla.org',
+)
+
+
+def is_sanctioned_bulk_destination(hostnames):
+    """True when any hostname matches (exact or suffix) a sanctioned bulk
+    destination. `hostnames` is an iterable of lowercased host strings."""
+    for h in hostnames or ():
+        if not h:
+            continue
+        h = h.lower().strip().rstrip('.')
+        for suffix in SANCTIONED_BULK_DESTINATIONS:
+            if h == suffix or h.endswith('.' + suffix):
+                return suffix
+    return None
+
+
+# --- JA4 / JA4S known-bad (client + server TLS fingerprints) ----------------
+# JA4 (FoxIO) is the modern, more-stable successor to JA3. Built-in entries are
+# intentionally minimal; operators extend via settings['known_malicious_ja4']
+# and settings['known_malicious_ja4s'] = {'<fingerprint>': '<label>'}.
+# JA4 client fingerprints look like 't13d1516h2_8daaf6152771_b186095e22b6'.
+KNOWN_MALICIOUS_JA4 = {
+    # Placeholder-curated from public C2 fingerprint research; tunable.
+    't13d190900_9dc949149365_97f8aa674fd9': 'Cobalt Strike (default JA4)',
+    't13d1715h2_5b57614c22b0_93c746dc1a19': 'Sliver C2 (default JA4)',
+}
+KNOWN_MALICIOUS_JA4S = {
+    't130200_1301_a56c5b993250': 'Cobalt Strike (default JA4S)',
+}

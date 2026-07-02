@@ -22,7 +22,7 @@ from datetime import datetime
 from scapy.all import IP, IPv6, TCP, UDP, ARP, DNS, DNSQR, DNSRR, ICMP, Raw, Ether
 
 from ..pkt_view import (
-    LLMNR_LAYER, NBNS_LAYER, SMB2_CREATE_LAYER, DCERPC_BIND_LAYER,
+    LLMNR_LAYER, NBNS_LAYER, SMB2_CREATE_LAYER, DCERPC_BIND_LAYER, NDP_LAYER,
 )
 
 
@@ -51,6 +51,59 @@ class StreamingDetector:
 
     def finalize(self):
         return []
+
+
+# Severity ladder used by the sanctioned-destination downgrade below.
+_SEV_LADDER = ['info', 'low', 'medium', 'high', 'critical']
+
+
+def _apply_sanctioned_downgrade(analyzer, dst_ip, severity, details,
+                                description, recommendation):
+    """If `dst_ip` resolves (via TLS SNI / HTTP Host seen in the capture) to a
+    sanctioned bulk-transfer destination (cloud backup, OS update, CDN,
+    video/conferencing), lower the severity one notch and annotate the alert.
+
+    Returns (severity, description, recommendation) — possibly modified.
+    Never suppresses: attackers do abuse cloud services for exfil, so the
+    analyst still sees it, just de-prioritized. Mutates `details` in place to
+    record the match and the matched hostnames.
+    """
+    from ..constants import is_sanctioned_bulk_destination
+    try:
+        hostnames = analyzer._hostname_index().get(dst_ip) or set()
+    except Exception:
+        hostnames = set()
+    if not hostnames:
+        return severity, description, recommendation
+    match = is_sanctioned_bulk_destination(hostnames)
+    if not match:
+        details['dest_hostnames'] = sorted(hostnames)[:5]
+        return severity, description, recommendation
+    try:
+        idx = _SEV_LADDER.index(severity)
+    except ValueError:
+        idx = 2
+    new_severity = _SEV_LADDER[max(0, idx - 1)]
+    details['likely_sanctioned'] = True
+    details['sanctioned_match'] = match
+    details['dest_hostnames'] = sorted(hostnames)[:5]
+    details['severity_original'] = severity
+    details['severity_reason'] = (
+        f'Downgraded: destination resolves to sanctioned bulk-transfer '
+        f'service ({match}). Verify the upload is expected before dismissing.'
+    )
+    description += (
+        f' Destination matches a sanctioned bulk service ({match}) — '
+        'likely legitimate cloud/backup/update traffic, but confirm.'
+    )
+    recommendation = (
+        f'The destination ({match}) is a known cloud/backup/update/'
+        'conferencing service that legitimately moves large volumes '
+        'outbound. Confirm the owning application and that the upload is '
+        'expected; note that these services are also abused for exfil, so '
+        'do not dismiss without checking what was transferred. ' + recommendation
+    )
+    return new_severity, description, recommendation
 
 
 class TcpFlowTracker:
@@ -846,6 +899,99 @@ class ArpHostDiscoveryStreamingDetector(StreamingDetector):
                 ),
             })
         return alerts
+
+
+class NdpSpoofingStreamingDetector(StreamingDetector):
+    """IPv6 Neighbor Discovery spoofing — the v6 analogue of ARP spoofing.
+
+    A Neighbor Advertisement (ICMPv6 type 136) asserts "IPv6 `tgt` is at MAC
+    `lladdr`". Forging NAs poisons neighbor caches for MITM, exactly like
+    gratuitous ARP on v4. ArpSpoofingStreamingDetector only sees v4, so this
+    closes the gap opened when IPv6 coverage was added.
+
+    Signals:
+      * **tgt->MAC conflict** (critical): the same IPv6 target address is
+        advertised with two different link-layer addresses — a live poisoning
+        race or MITM insertion.
+      * **Unsolicited NA flood** (high): many override-flag NAs from one MAC.
+        `Responder`/`parasite6`-style tools spam override NAs to keep a
+        poisoned mapping fresh; a burst above threshold is the signature.
+    """
+    name = 'ndp_spoofing'
+
+    def __init__(self, analyzer):
+        super().__init__(analyzer)
+        self.threshold = self.thresholds.get('ndp_override_max', 5)
+        self.tgt_to_mac = {}
+        self.override_count = defaultdict(int)
+        self.alerts = []
+
+    def update(self, pkt):
+        if NDP_LAYER is None or NDP_LAYER not in pkt:
+            return
+        nd = pkt[NDP_LAYER]
+        # Only advertisements assert an address→MAC binding.
+        if int(getattr(nd, 'nd_type', 0)) != 136:
+            return
+        tgt = getattr(nd, 'tgt', None)
+        mac = getattr(nd, 'lladdr', None)
+        if not tgt or not mac:
+            return
+        if tgt in self.tgt_to_mac and self.tgt_to_mac[tgt] != mac:
+            self.alerts.append({
+                'severity': 'critical',
+                'category': 'arp',
+                'title': 'IPv6 NDP Spoofing Detected',
+                'description': (
+                    f'IPv6 {tgt} changed MAC from {self.tgt_to_mac[tgt]} '
+                    f'to {mac} in a Neighbor Advertisement'
+                ),
+                'ip': tgt,
+                'details': {
+                    'src_ip': tgt,
+                    'target_ip': tgt,
+                    'old_mac': self.tgt_to_mac[tgt],
+                    'new_mac': mac,
+                    'protocol': 'ICMPv6-ND',
+                },
+                'recommendation': (
+                    'A changing IPv6→MAC binding in Neighbor Advertisements '
+                    'is the v6 equivalent of ARP spoofing (MITM). Enable RA '
+                    'Guard / ND inspection on switches, verify which host '
+                    'legitimately owns the address, and isolate the '
+                    'advertising MAC.'
+                ),
+            })
+        self.tgt_to_mac[tgt] = mac
+        # Unsolicited (override-flag) NAs: the poisoning-refresh signature.
+        if int(getattr(nd, 'override', 0)):
+            self.override_count[mac] += 1
+            if self.override_count[mac] == self.threshold:
+                self.alerts.append({
+                    'severity': 'high',
+                    'category': 'arp',
+                    'title': 'Unsolicited IPv6 NA Flood',
+                    'description': (
+                        f'MAC {mac} sent {self.override_count[mac]} override '
+                        'Neighbor Advertisements (unsolicited)'
+                    ),
+                    'ip': getattr(nd, 'src_ip', None) or tgt,
+                    'details': {
+                        'mac': mac,
+                        'src_ip': getattr(nd, 'src_ip', None),
+                        'count': self.override_count[mac],
+                        'protocol': 'ICMPv6-ND',
+                    },
+                    'recommendation': (
+                        'Bursts of unsolicited override NAs are how v6 '
+                        'poisoning tools (parasite6, Responder) keep a '
+                        'spoofed cache entry alive. Enable RA Guard / ND '
+                        'inspection and monitor this MAC.'
+                    ),
+                })
+
+    def finalize(self):
+        return self.alerts
 
 
 class DnsTunnelingStreamingDetector(StreamingDetector):
@@ -1965,30 +2111,38 @@ class VolumeExfiltrationStreamingDetector(StreamingDetector):
                 continue
             duration = (s['last_ts'] or 0) - (s['first_ts'] or 0)
             severity = 'high' if s['out'] >= self.threshold_bytes * 5 else 'medium'
+            details = {
+                'src': src, 'dst': dst,
+                'src_ip': src, 'dst_ip': dst,
+                'bytes_out': s['out'],
+                'bytes_in': s['in'],
+                'ratio': round(ratio, 2),
+                'duration_seconds': round(duration, 2),
+                'first_ts': s['first_ts'],
+                'last_ts': s['last_ts'],
+            }
+            description = (
+                f'Host {src} uploaded {s["out"] / 1024 / 1024:.1f} MB to '
+                f'{dst} (out/in ratio {ratio:.1f}x)'
+            )
+            recommendation = (
+                'High upload-to-download ratio is consistent with data '
+                'exfiltration. Investigate the destination IP, '
+                'application owning the connection and the type of data '
+                'transferred.'
+            )
+            severity, description, recommendation = _apply_sanctioned_downgrade(
+                self.analyzer, dst, severity, details,
+                description, recommendation,
+            )
             alerts.append({
                 'severity': severity,
                 'category': 'exfil',
                 'title': 'Possible Data Exfiltration (Upload Volume)',
-                'description': (
-                    f'Host {src} uploaded {s["out"] / 1024 / 1024:.1f} MB to '
-                    f'{dst} (out/in ratio {ratio:.1f}x)'
-                ),
+                'description': description,
                 'ip': src,
-                'details': {
-                    'src': src, 'dst': dst,
-                    'bytes_out': s['out'],
-                    'bytes_in': s['in'],
-                    'ratio': round(ratio, 2),
-                    'duration_seconds': round(duration, 2),
-                    'first_ts': s['first_ts'],
-                    'last_ts': s['last_ts'],
-                },
-                'recommendation': (
-                    'High upload-to-download ratio is consistent with data '
-                    'exfiltration. Investigate the destination IP, '
-                    'application owning the connection and the type of data '
-                    'transferred.'
-                ),
+                'details': details,
+                'recommendation': recommendation,
             })
         return alerts
 
@@ -2074,34 +2228,42 @@ class SustainedExfilRatioStreamingDetector(StreamingDetector):
                 severity = 'high'
             else:
                 severity = 'medium'
+            details = {
+                'src': src, 'dst': dst,
+                'src_ip': src, 'dst_ip': dst,
+                'bytes_out': out_b,
+                'bytes_in': s['in'],
+                'ratio': round(ratio, 2),
+                'duration_seconds': round(duration, 1),
+                'bytes_per_second': round(bps, 1),
+                'first_ts': s['first_ts'],
+                'last_ts': s['last_ts'],
+            }
+            description = (
+                f'Host {src} uploaded {out_b / 1024:.0f} KB to {dst} '
+                f'sustained over {duration / 60:.1f} min with out/in '
+                f'ratio {ratio:.1f}x (~{bps / 1024:.1f} KB/s). Volume '
+                f'fica abaixo do alerta de exfil tradicional, mas '
+                f'o padrão lento+constante é típico de implant.'
+            )
+            recommendation = (
+                'Confirme a aplicação local responsável pelo flow e '
+                'verifique se a destinação é legítima (cloud-sync, '
+                'telemetria) ou C2. Em RDR/EDR procure por processos '
+                'com conexões persistentes a esse IP.'
+            )
+            severity, description, recommendation = _apply_sanctioned_downgrade(
+                self.analyzer, dst, severity, details,
+                description, recommendation,
+            )
             alerts.append({
                 'severity': severity,
                 'category': 'exfil',
                 'title': 'Sustained Exfiltration Ratio (Slow Drip)',
-                'description': (
-                    f'Host {src} uploaded {out_b / 1024:.0f} KB to {dst} '
-                    f'sustained over {duration / 60:.1f} min with out/in '
-                    f'ratio {ratio:.1f}x (~{bps / 1024:.1f} KB/s). Volume '
-                    f'fica abaixo do alerta de exfil tradicional, mas '
-                    f'o padrão lento+constante é típico de implant.'
-                ),
+                'description': description,
                 'ip': src,
-                'details': {
-                    'src': src, 'dst': dst,
-                    'bytes_out': out_b,
-                    'bytes_in': s['in'],
-                    'ratio': round(ratio, 2),
-                    'duration_seconds': round(duration, 1),
-                    'bytes_per_second': round(bps, 1),
-                    'first_ts': s['first_ts'],
-                    'last_ts': s['last_ts'],
-                },
-                'recommendation': (
-                    'Confirme a aplicação local responsável pelo flow e '
-                    'verifique se a destinação é legítima (cloud-sync, '
-                    'telemetria) ou C2. Em RDR/EDR procure por processos '
-                    'com conexões persistentes a esse IP.'
-                ),
+                'details': details,
+                'recommendation': recommendation,
             })
         return alerts
 
@@ -4625,6 +4787,7 @@ STREAMING_DETECTORS = [
     SuspiciousPortsStreamingDetector,
     ArpSpoofingStreamingDetector,
     ArpHostDiscoveryStreamingDetector,
+    NdpSpoofingStreamingDetector,
     DnsTunnelingStreamingDetector,
     DnsCumulativeExfilStreamingDetector,
     InsecureProtocolsStreamingDetector,

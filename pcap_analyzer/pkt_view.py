@@ -102,6 +102,24 @@ except Exception:
     _ScapyICMPv6EchoReq = None  # type: ignore
     _ScapyICMPv6EchoRep = None  # type: ignore
 
+# IPv6 Neighbor Discovery (RFC 4861) is the v6 analogue of ARP. A Neighbor
+# Advertisement (ICMPv6 type 136) claims "IPv6 target `tgt` is at link-layer
+# address `lladdr`" — forging it is v6 ARP spoofing / MITM. We normalise NA
+# (and NS, type 135) into a small view so a v6 spoofing detector can track
+# tgt->MAC conflicts and unsolicited-NA floods.
+try:
+    from scapy.layers.inet6 import (
+        ICMPv6ND_NA as _ScapyICMPv6NA,
+        ICMPv6ND_NS as _ScapyICMPv6NS,
+        ICMPv6NDOptDstLLAddr as _ScapyNDOptDstLL,
+        ICMPv6NDOptSrcLLAddr as _ScapyNDOptSrcLL,
+    )
+except Exception:
+    _ScapyICMPv6NA = None  # type: ignore
+    _ScapyICMPv6NS = None  # type: ignore
+    _ScapyNDOptDstLL = None  # type: ignore
+    _ScapyNDOptSrcLL = None  # type: ignore
+
 
 class _IPLayerView:
     __slots__ = ('src', 'dst', 'ttl', 'proto')
@@ -178,6 +196,18 @@ class _NameResponseView:
 class _Smb2CreateView:
     """The filename requested in an SMB2 CREATE (the named-pipe target)."""
     __slots__ = ('name',)
+
+
+class _NdpView:
+    """Normalised IPv6 Neighbor Discovery view.
+
+    ``nd_type`` is 136 (Advertisement) or 135 (Solicitation); ``tgt`` is the
+    IPv6 target address being (advertised as | queried for); ``lladdr`` is the
+    claimed link-layer (MAC) address from the NA target-LL / NS source-LL
+    option, or None; ``override`` is the NA O-flag (set on unsolicited
+    "believe me" announcements, the poisoning signature).
+    """
+    __slots__ = ('nd_type', 'tgt', 'lladdr', 'override', 'src_ip')
 
 
 class _DcerpcBindView:
@@ -369,6 +399,40 @@ def extract_pkt_view(pkt):
             except Exception:
                 pass
 
+    # IPv6 Neighbor Discovery (NA/NS) → normalised view for the v6 spoofing
+    # detector. Keyed under the NA class (re-exported as NDP_LAYER).
+    if _ScapyICMPv6NA is not None:
+        nd = None
+        nd_type = None
+        if _ScapyICMPv6NA in pkt:
+            nd = pkt[_ScapyICMPv6NA]
+            nd_type = 136
+        elif _ScapyICMPv6NS is not None and _ScapyICMPv6NS in pkt:
+            nd = pkt[_ScapyICMPv6NS]
+            nd_type = 135
+        if nd is not None:
+            try:
+                layer = _NdpView()
+                layer.nd_type = nd_type
+                layer.tgt = str(getattr(nd, 'tgt', '') or '')
+                layer.override = int(getattr(nd, 'O', 0) or 0)
+                layer.src_ip = None
+                if IPv6 in pkt:
+                    try:
+                        layer.src_ip = str(pkt[IPv6].src)
+                    except Exception:
+                        layer.src_ip = None
+                lladdr = None
+                # NA carries the MAC in a Target-LL option; NS in a Source-LL.
+                if _ScapyNDOptDstLL is not None and _ScapyNDOptDstLL in pkt:
+                    lladdr = getattr(pkt[_ScapyNDOptDstLL], 'lladdr', None)
+                elif _ScapyNDOptSrcLL is not None and _ScapyNDOptSrcLL in pkt:
+                    lladdr = getattr(pkt[_ScapyNDOptSrcLL], 'lladdr', None)
+                layer.lladdr = str(lladdr).lower() if lladdr else None
+                view._layers[_ScapyICMPv6NA] = layer
+            except Exception:
+                pass
+
     if ARP in pkt:
         try:
             a = pkt[ARP]
@@ -531,6 +595,7 @@ LLMNR_LAYER = _ScapyLLMNRResp
 NBNS_LAYER = _ScapyNBNS
 SMB2_CREATE_LAYER = _ScapySMB2Create
 DCERPC_BIND_LAYER = _ScapyDceRpc5Bind
+NDP_LAYER = _ScapyICMPv6NA
 
 
 __all__ = [
@@ -540,8 +605,10 @@ __all__ = [
     "NBNS_LAYER",
     "SMB2_CREATE_LAYER",
     "DCERPC_BIND_LAYER",
+    "NDP_LAYER",
     "_NameResponseView",
     "_Smb2CreateView",
+    "_NdpView",
     "_DcerpcBindView",
     "_IPLayerView",
     "_TCPLayerView",
