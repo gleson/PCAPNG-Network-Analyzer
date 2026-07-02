@@ -22,7 +22,7 @@ VALID_SEVERITIES = {"critical", "high", "medium", "low", "info", "informational"
 def test_registry_counts():
     """Registry sizes are part of the engine's contract; a silent drop of a
     detector should fail here, not in production."""
-    assert len(STREAMING_DETECTORS) == 32
+    assert len(STREAMING_DETECTORS) == 33
     assert len(POST_DETECTORS) == 19
     assert len(STREAMING_AGGREGATORS) == 14
 

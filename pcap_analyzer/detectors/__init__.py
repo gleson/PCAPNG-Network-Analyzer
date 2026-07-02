@@ -2440,6 +2440,236 @@ class BeaconingStreamingDetector(StreamingDetector):
         return list(alerts_by_key.values())
 
 
+class ConnectionBeaconingStreamingDetector(StreamingDetector):
+    """Detect C2 beaconing INSIDE a persistent connection.
+
+    BeaconingStreamingDetector conta SYNs — um timestamp por conexão nova.
+    C2 moderno (HTTP2 multiplexado, WebSocket, TLS keep-alive, Sliver/Mythic
+    com long-poll) abre UMA conexão e faz check-ins periódicos dentro dela:
+    um único SYN, muitos beacons — invisível ao detector clássico.
+
+    Aqui o sinal é a periodicidade de *bursts* de payload cliente→servidor
+    dentro de um mesmo fluxo (src, sport, dst, dport) local→externo. O
+    agrupamento em bursts é feito online durante o streaming: um pacote de
+    dados que chega mais de ``burst_gap`` segundos após o anterior inicia um
+    burst novo, e só o timestamp de início (+ tamanho do primeiro payload)
+    de cada burst é retido — custo de memória por fluxo é O(bursts), não
+    O(pacotes). No finalize, os inícios de burst passam pela MESMA bateria
+    do detector clássico: jitter linear, autocorrelação binada, âncora de
+    wallclock (NTP-sleep) e uniformidade de tamanho.
+
+    FP conhecido: canais de push/long-poll legítimos (WhatsApp Web, push
+    de notificação, MQTT keep-alive) também são periódicos. Por isso a
+    severidade base é mais conservadora que a do detector de SYN — critical
+    exige os dois sinais extras (phase-lock + tamanho uniforme) — e
+    keep-alives TCP puros (payload de 0-1 byte) são filtrados pelo
+    ``min_payload``.
+    """
+    name = 'connection_beaconing'
+
+    # Bound state on pathological captures: after this many distinct flows,
+    # only already-tracked flows keep updating.
+    MAX_FLOWS = 100_000
+    # A flow that accumulates this many bursts is a chatty long-poll app,
+    # not something we need more evidence on.
+    MAX_BURSTS_PER_FLOW = 10_000
+
+    def __init__(self, analyzer):
+        super().__init__(analyzer)
+        t = self.thresholds
+        self.min_bursts = t.get('conn_beacon_min_bursts', 8)
+        self.burst_gap = float(t.get('conn_beacon_burst_gap', 5.0))
+        self.min_payload = int(t.get('conn_beacon_min_payload', 8))
+        self.min_duration = float(t.get('conn_beacon_min_duration', 120.0))
+        # Periodicity thresholds shared with the SYN-based detector so the
+        # two stay consistent when the operator tunes them.
+        self.max_jitter_percent = t.get('beaconing_max_jitter_percent', 10)
+        self.ac_min_samples = t.get('beaconing_ac_min_samples', 16)
+        self.ac_min_score = t.get('beaconing_ac_min_score', 0.5)
+        # (src, sport, dst, dport) -> burst state
+        self.flows = {}
+
+    def update(self, pkt):
+        if TCP not in pkt or IP not in pkt or Raw not in pkt:
+            return
+        src = pkt[IP].src
+        dst = pkt[IP].dst
+        if not (self.analyzer._is_local_ip(src)
+                and not self.analyzer._is_local_ip(dst)):
+            return
+        try:
+            size = len(pkt[Raw].load)
+        except Exception:
+            return
+        # TCP keepalive probes carry 0-1 garbage bytes — not check-ins.
+        if size < self.min_payload:
+            return
+        key = (src, int(pkt[TCP].sport), dst, int(pkt[TCP].dport))
+        rec = self.flows.get(key)
+        ts = float(pkt.time)
+        if rec is None:
+            if len(self.flows) >= self.MAX_FLOWS:
+                return
+            rec = {
+                'burst_ts': [ts],
+                'burst_sizes': [size],
+                'last_ts': ts,
+                'packets': 1,
+                'bytes': size,
+            }
+            self.flows[key] = rec
+            return
+        rec['packets'] += 1
+        rec['bytes'] += size
+        if ts - rec['last_ts'] > self.burst_gap:
+            if len(rec['burst_ts']) < self.MAX_BURSTS_PER_FLOW:
+                rec['burst_ts'].append(ts)
+                rec['burst_sizes'].append(size)
+        if ts > rec['last_ts']:
+            rec['last_ts'] = ts
+
+    def _size_stats(self, sizes):
+        """(cv, n) over burst first-payload sizes; cv None below 5 samples."""
+        if len(sizes) < 5:
+            return None, len(sizes)
+        mean = sum(sizes) / len(sizes)
+        if mean <= 0:
+            return None, len(sizes)
+        var = sum((s - mean) ** 2 for s in sizes) / len(sizes)
+        return (var ** 0.5) / mean, len(sizes)
+
+    def finalize(self):
+        alerts = []
+        for (src, sport, dst, dport), rec in self.flows.items():
+            timestamps = rec['burst_ts']
+            n = len(timestamps)
+            if n < self.min_bursts:
+                continue
+            duration = timestamps[-1] - timestamps[0]
+            if duration < self.min_duration:
+                continue
+            intervals = [timestamps[i] - timestamps[i - 1]
+                         for i in range(1, n)]
+            mean_interval = sum(intervals) / len(intervals)
+            if mean_interval <= 0:
+                continue
+
+            max_dev = max(abs(iv - mean_interval) for iv in intervals)
+            jitter_percent = (max_dev / mean_interval) * 100
+
+            method = None
+            ac_peak = None
+            ac_lag = None
+            if jitter_percent < self.max_jitter_percent:
+                method = 'jitter'
+            elif n >= self.ac_min_samples:
+                ac_lag, ac_peak, _bins = (
+                    self.analyzer._binned_autocorrelation_peak(
+                        timestamps, mean_interval,
+                    )
+                )
+                if ac_lag is not None and ac_peak >= self.ac_min_score:
+                    method = 'autocorrelation'
+            if method is None:
+                continue
+
+            clean_interval, phase_locked = (
+                BeaconingStreamingDetector._check_ntp_anchor(
+                    timestamps, mean_interval,
+                )
+            )
+            size_cv, size_n = self._size_stats(rec['burst_sizes'])
+            size_uniform = (size_cv is not None and size_cv < 0.20)
+
+            # Mais conservador que o detector de SYN: long-poll legítimo
+            # também é periódico, então critical exige AMBOS os sinais
+            # extras; periodicidade forte sozinha fica em high.
+            if phase_locked and size_uniform:
+                severity = 'critical'
+            elif jitter_percent < 5 or (ac_peak or 0) >= 0.75:
+                severity = 'high'
+            else:
+                severity = 'medium'
+            if method == 'jitter':
+                base_conf = max(35, min(95, int(95 - jitter_percent * 5)))
+            else:
+                base_conf = max(35, min(95, int((ac_peak or 0) * 95)))
+            confidence = min(99, base_conf
+                             + (10 if phase_locked else 0)
+                             + (10 if size_uniform else 0))
+
+            desc = (
+                f'Host {src} keeps ONE TCP connection to {dst}:{dport} '
+                f'(src port {sport}) and sends data in {n} periodic bursts '
+                f'(~{mean_interval:.1f}s interval'
+            )
+            if method == 'jitter':
+                desc += f', {jitter_percent:.1f}% jitter'
+            else:
+                desc += f', autocorrelation peak {ac_peak:.2f} at lag {ac_lag}'
+            desc += (
+                f') over {duration / 60:.1f} min. Beacons inside a persistent '
+                'connection (HTTP2/WebSocket/keep-alive C2) never show up in '
+                'SYN-based beaconing.'
+            )
+            if phase_locked:
+                desc += (
+                    f' Wallclock-aligned to {clean_interval}s grid '
+                    '(NTP-anchored sleep timer).'
+                )
+            if size_uniform:
+                desc += (
+                    f' Uniform check-in size (CV={size_cv:.2f}, n={size_n}).'
+                )
+
+            alerts.append({
+                'severity': severity,
+                'confidence': confidence,
+                'category': 'beaconing',
+                'title': 'In-Connection Beaconing (Persistent C2 Channel)',
+                'description': desc,
+                'ip': src,
+                'details': {
+                    'src_ip': src,
+                    'dst_ip': dst,
+                    'src_port': sport,
+                    'port': dport,
+                    'burst_count': n,
+                    'packet_count': rec['packets'],
+                    'bytes_c2s': rec['bytes'],
+                    'mean_interval_seconds': round(mean_interval, 2),
+                    'jitter_percent': round(jitter_percent, 2),
+                    'autocorrelation_peak': (round(ac_peak, 3)
+                                             if ac_peak is not None else None),
+                    'autocorrelation_lag': ac_lag,
+                    'duration_seconds': round(duration, 2),
+                    'burst_gap_seconds': self.burst_gap,
+                    'method': method,
+                    'clean_interval': clean_interval,
+                    'wallclock_phase_locked': bool(phase_locked),
+                    'size_uniformity_cv': (round(size_cv, 3)
+                                           if size_cv is not None else None),
+                    'size_samples': size_n,
+                    'size_uniform': bool(size_uniform),
+                    'first_ts': float(timestamps[0]),
+                    'last_ts': float(timestamps[-1]),
+                    'connection_status': 'established',
+                    'connection_established': True,
+                    'bytes_exchanged': rec['bytes'],
+                },
+                'recommendation': (
+                    'Periodic check-ins inside one long-lived connection are '
+                    'how HTTP2/WebSocket C2 (Sliver, Mythic, custom implants) '
+                    'evade per-connection beacon detection. Identify the '
+                    f'process on {src} holding the connection to '
+                    f'{dst}:{dport}. Legitimate look-alikes: push/notification '
+                    'channels and MQTT keep-alives — confirm the destination '
+                    'reputation and the owning application before blocking.'
+                ),
+            })
+        return alerts
+
+
 class KerberosAbuseStreamingDetector(StreamingDetector):
     """Detect Kerberos credential-access patterns on port 88.
 
@@ -4409,6 +4639,7 @@ STREAMING_DETECTORS = [
     SustainedExfilRatioStreamingDetector,
     InternalLateralStreamingDetector,
     BeaconingStreamingDetector,
+    ConnectionBeaconingStreamingDetector,
     KerberosAbuseStreamingDetector,
     BruteForceStreamingDetector,
     PasswordSprayingStreamingDetector,
