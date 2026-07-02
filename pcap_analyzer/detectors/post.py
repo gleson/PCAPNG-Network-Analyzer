@@ -18,7 +18,6 @@ Extracted from pcap_analyzer/_core.py.
 
 from __future__ import annotations
 
-import fnmatch
 import ipaddress
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -873,8 +872,14 @@ def _cert_matches_sni(cert, sni):
             continue
         if n == sni:
             return True
-        if n.startswith('*.') and fnmatch.fnmatch(sni, n):
-            return True
+        if n.startswith('*.'):
+            # RFC 6125 §6.4.3: the wildcard covers exactly ONE label —
+            # *.example.com matches a.example.com but NOT a.b.example.com
+            # (fnmatch's '*' crossed dots, silently accepting deeper names
+            # and hiding real mismatches).
+            sni_parts = sni.split('.', 1)
+            if len(sni_parts) == 2 and sni_parts[0] and sni_parts[1] == n[2:]:
+                return True
     return False
 
 
@@ -2197,7 +2202,11 @@ class KevEnricherDetector(PostDetector):
         return new_alerts
 
 
-# Order doesn't matter — alerts are aggregated and timestamped later.
+# Ordering constraint: KevEnricherDetector MUST stay last. It reads
+# analyzer._pending_alerts — the shared in-flight list that _run_detections
+# extends after each post-detector — so any detector placed after it would
+# have its CVE references invisible to KEV matching. The rest are
+# order-independent (guarded by test_engine_contract).
 POST_DETECTORS = [
     IpMacChangesDetector,
     OldTlsVersionDetector,

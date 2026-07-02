@@ -152,6 +152,19 @@ class SummaryAggregator(StreamingAggregator):
 
     def finalize(self, results):
         if self.count == 0:
+            # Empty capture: still emit a minimal summary. Leaving it {} made
+            # every consumer of summary['filename'] (packet viewer, replay,
+            # UI header) blow up with KeyError → opaque 500.
+            results['summary'] = {
+                'filename': os.path.basename(self.analyzer.filepath),
+                'analyzed_at': datetime.now().isoformat(),
+                'packet_count': 0,
+                'duration': 0.0,
+                'start_time': None,
+                'end_time': None,
+                'total_bytes': 0,
+                'truncated': False,
+            }
             return
         first = self.first_ts or 0
         last = self.last_ts or 0
@@ -1133,7 +1146,10 @@ class AssetInventoryAggregator(StreamingAggregator):
         super().__init__(analyzer)
         self.obs = defaultdict(lambda: {
             'ips': set(),
-            'ttl_min': None,
+            # Highest TTL seen for the MAC — the closest sample to the OS's
+            # initial TTL (hops only decrement it), which is what the
+            # fingerprint wants. (Was misleadingly named 'ttl_min'.)
+            'ttl_max': None,
             'ttl_initial_candidates': set(),
             'dhcp_vendor': None,
             'dhcp_hostname': None,
@@ -1164,8 +1180,8 @@ class AssetInventoryAggregator(StreamingAggregator):
             except Exception:
                 ttl = 0
             if ttl > 0:
-                if rec['ttl_min'] is None or ttl > rec['ttl_min']:
-                    rec['ttl_min'] = ttl
+                if rec['ttl_max'] is None or ttl > rec['ttl_max']:
+                    rec['ttl_max'] = ttl
                 try:
                     from asset_inventory import _classify_ttl
                     initial, _ = _classify_ttl(ttl)
@@ -1213,7 +1229,7 @@ class AssetInventoryAggregator(StreamingAggregator):
             return
         assets = {}
         for mac, rec in self.obs.items():
-            ttl_observed = rec['ttl_min']
+            ttl_observed = rec['ttl_max']
             ttl_initial, ttl_label = (None, None)
             if rec['ttl_initial_candidates']:
                 ttl_initial = max(rec['ttl_initial_candidates'])

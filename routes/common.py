@@ -363,4 +363,9 @@ def analyze_pcap_background(filepath, filename, job_id):
         print(f"Error during analysis: {e}")
         import traceback
         traceback.print_exc()
-        update_job(job_id, status="error", phase="error", message=str(e))
+        # Full detail stays in the server log (above); the client-visible
+        # message carries only the exception class — same policy as
+        # server_error() and the Celery FAILURE snapshot.
+        update_job(job_id, status="error", phase="error",
+                   message=f"Analysis failed ({type(e).__name__}) — "
+                           "check server logs")

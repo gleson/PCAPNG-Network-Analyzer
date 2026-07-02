@@ -182,9 +182,15 @@ def _refresh_status_snapshot(task_id=None):
             "phase": "done",
         })
     elif state == 'FAILURE':
+        # Raw exception text (paths, SQL, library internals) never reaches
+        # the client — same policy as server_error(). The worker already
+        # logged the full traceback; expose only the exception class.
+        exc_name = type(task.info).__name__ if task.info is not None else ''
         snap.update({
             "status": "error",
-            "message": str(task.info) if task.info else 'Unknown error',
+            "message": ("Analysis failed"
+                        + (f" ({exc_name})" if exc_name else "")
+                        + " — check server logs"),
             "phase": "error",
         })
     elif common.get_job(task_id) is None:
@@ -509,7 +515,10 @@ def get_packets(scan_id):
         if not scan:
             return jsonify({"success": False, "error": "Scan not found"}), 404
 
-        filename = scan['summary']['filename']
+        filename = (scan.get('summary') or {}).get('filename')
+        if not filename:
+            return jsonify({"success": False,
+                            "error": "scan has no source filename"}), 404
         filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
 
         if not os.path.exists(filepath):
@@ -570,7 +579,10 @@ def get_packet_detail(scan_id, packet_num):
         if not scan:
             return jsonify({"success": False, "error": "Scan not found"}), 404
 
-        filename = scan['summary']['filename']
+        filename = (scan.get('summary') or {}).get('filename')
+        if not filename:
+            return jsonify({"success": False,
+                            "error": "scan has no source filename"}), 404
         filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
 
         if not os.path.exists(filepath):

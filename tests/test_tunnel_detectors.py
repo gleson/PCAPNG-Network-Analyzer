@@ -98,6 +98,27 @@ def test_openvpn_nonzero_key_id_does_not_fire(analyze):
     assert not has_alert(results, title="OpenVPN")
 
 
+# --- DNS-over-QUIC (DoQ) ----------------------------------------------------
+
+def test_doq_long_header_to_external_fires(analyze):
+    # QUIC long header (0x80 bit) + version 1 on udp/853 to an external
+    # resolver -> DoQ alert.
+    payload = bytes([0xC3, 0x00, 0x00, 0x00, 0x01]) + b"\x00" * 30
+    pkt = IP(src=LOCAL_IP, dst=EXTERNAL_IP) / UDP(sport=50000, dport=853) / Raw(payload)
+    results = analyze([pkt])
+    assert has_alert(results, title="DNS-over-QUIC", category="tunneling")
+
+
+def test_non_quic_datagram_on_853_does_not_fire_doq(analyze):
+    # Regression (2026-07): ANY udp/853 datagram used to count as DoQ (plain
+    # DNS to a mis-ported resolver, DTLS, garbage). The flow must start with
+    # a QUIC long header.
+    pkt = (IP(src=LOCAL_IP, dst=EXTERNAL_IP)
+           / UDP(sport=50001, dport=853) / Raw(b"\x12\x34" + b"\x00" * 20))
+    results = analyze([pkt])
+    assert not has_alert(results, title="DNS-over-QUIC")
+
+
 # --- IP-layer encapsulation ------------------------------------------------
 
 def test_gre_encapsulation_to_external_fires(analyze):

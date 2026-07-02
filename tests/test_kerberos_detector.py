@@ -46,3 +46,58 @@ def test_aes_tgs_req_does_not_fire_kerberoasting(analyze):
     pkt.time = 1_000_000.0
     results = analyze([pkt])
     assert not [a for a in results["alerts"] if "Kerberoasting" in a["title"]]
+
+
+# --- AS-REP Roasting ---------------------------------------------------------
+
+_KDC = "10.0.0.10"
+# PA-DATA padata-type [1] INTEGER 2 = PA-ENC-TIMESTAMP (normal pre-auth logon).
+_PA_ENC_TS = b"\xa1\x03\x02\x01\x02"
+
+
+def _krb_msg(tag, extra=b"", src=LOCAL_IP, dst=_KDC, sport=40000, dport=88):
+    """TCP/88 Kerberos message: 4-byte length prefix + tag + filler + extra."""
+    body = bytes([tag, 0x82, 0x01, 0x00]) + b"\x30\x82" + b"\x00" * 20 + extra + b"\x00" * 40
+    wire = len(body).to_bytes(4, "big") + body
+    return IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags="PA") / Raw(wire)
+
+
+def _asrep_alerts(results):
+    return [a for a in results["alerts"] if "AS-REP Roasting" in a["title"]]
+
+
+def test_asrep_roasting_fires_when_requests_lack_preauth(analyze):
+    # Roasting profile: AS-REQs without PA-ENC-TIMESTAMP answered directly by
+    # AS-REPs, zero PREAUTH_REQUIRED errors (GetNPUsers / kerbrute).
+    pkts = []
+    for i in range(5):
+        pkts.append(_krb_msg(0x6A, sport=40000 + i))
+        pkts.append(_krb_msg(0x6B, src=_KDC, dst=LOCAL_IP, sport=88, dport=40000 + i))
+    results = analyze(pkts)
+    hits = _asrep_alerts(results)
+    assert hits
+    assert hits[0]["details"]["as_req_with_preauth"] == 0
+
+
+def test_asrep_with_preauth_requests_does_not_fire(analyze):
+    # Regression (2026-07): clients with cached pre-auth send PA-ENC-TIMESTAMP
+    # in their FIRST AS-REQ, so a busy KDC produced 5+ AS-REPs with zero
+    # PREAUTH_REQUIRED errors in the window — the old trigger fired on every
+    # mid-stream capture of normal logons.
+    pkts = []
+    for i in range(5):
+        pkts.append(_krb_msg(0x6A, extra=_PA_ENC_TS, sport=41000 + i))
+        pkts.append(_krb_msg(0x6B, src=_KDC, dst=LOCAL_IP, sport=88, dport=41000 + i))
+    results = analyze(pkts)
+    assert not _asrep_alerts(results)
+
+
+def test_asrep_only_capture_does_not_fire(analyze):
+    # One-sided tap: responses alone cannot prove the requests lacked
+    # pre-auth (documented recall trade-off of the FP fix).
+    pkts = [
+        _krb_msg(0x6B, src=_KDC, dst=LOCAL_IP, sport=88, dport=42000 + i)
+        for i in range(6)
+    ]
+    results = analyze(pkts)
+    assert not _asrep_alerts(results)

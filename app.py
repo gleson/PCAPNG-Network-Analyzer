@@ -64,10 +64,17 @@ def create_app():
     @app.before_request
     def _limit_request_body():
         length = request.content_length
-        if length is None or length <= SMALL_BODY_LIMIT:
-            return None
         path = request.path or ''
-        if any(path.startswith(p) for p in LARGE_BODY_PREFIXES):
+        exempt = any(path.startswith(p) for p in LARGE_BODY_PREFIXES)
+        if length is None:
+            # Chunked (Transfer-Encoding) bodies carry no Content-Length and
+            # used to bypass the cap entirely. Require a declared length on
+            # every non-upload endpoint.
+            if request.headers.get('Transfer-Encoding') and not exempt:
+                return jsonify({"success": False,
+                                "error": "chunked request body not allowed"}), 411
+            return None
+        if length <= SMALL_BODY_LIMIT or exempt:
             return None
         return jsonify({"success": False,
                         "error": "request body too large"}), 413

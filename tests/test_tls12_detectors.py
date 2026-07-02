@@ -80,6 +80,19 @@ def test_valid_external_cert_not_self_signed_alert():
     assert not has_alert(results, title="Invalid TLS Certificate Validity")
 
 
+def test_cert_wildcard_matches_exactly_one_label():
+    # Regression (2026-07): fnmatch let '*.example.com' cross label
+    # boundaries and match a.b.example.com, hiding real SNI mismatches.
+    # RFC 6125 §6.4.3: the wildcard covers exactly one label.
+    from pcap_analyzer.detectors.post import _cert_matches_sni
+    cert = {"cn": "*.example.com", "sans": []}
+    assert _cert_matches_sni(cert, "api.example.com")
+    assert _cert_matches_sni(cert, "API.EXAMPLE.COM.")  # case/dot tolerant
+    assert not _cert_matches_sni(cert, "a.b.example.com")
+    assert not _cert_matches_sni(cert, "example.com")
+    assert not _cert_matches_sni(cert, "notexample.com")
+
+
 # --- DoH -------------------------------------------------------------------
 
 def test_doh_fires_when_sni_matches_operator_host():

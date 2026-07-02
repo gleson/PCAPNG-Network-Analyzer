@@ -27,6 +27,13 @@ def test_registry_counts():
     assert len(STREAMING_AGGREGATORS) == 14
 
 
+def test_kev_enricher_is_last_post_detector():
+    # KevEnricherDetector reads analyzer._pending_alerts (grown after each
+    # post-detector runs); anything placed after it would escape KEV matching.
+    from pcap_analyzer.detectors.post import KevEnricherDetector
+    assert POST_DETECTORS[-1] is KevEnricherDetector
+
+
 def test_streaming_detector_names_are_unique():
     names = [c.name for c in STREAMING_DETECTORS]
     assert len(names) == len(set(names)), "duplicate detector .name values"
@@ -48,8 +55,14 @@ def test_empty_pcap_does_not_crash(tmp_path):
     wrpcap(str(pcap), [])
     results = PCAPAnalyzer(str(pcap), {}).analyze()
     assert results["alerts"] == []
-    assert "summary" in results
     assert "ips" in results
+    # Regression (2026-07): an empty capture left summary as {} — every
+    # consumer of summary['filename'] (packet viewer, replay, UI header)
+    # blew up with KeyError. A minimal summary must always be emitted.
+    summary = results["summary"]
+    assert summary["filename"] == "empty.pcap"
+    assert summary["packet_count"] == 0
+    assert summary["total_bytes"] == 0
 
 
 def test_clean_traffic_raises_no_scan_or_exfil_alerts(analyze):

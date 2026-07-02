@@ -1111,8 +1111,8 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
     única zona externa, é forte indicador de tunelamento por baixo do
     radar de entropia.
 
-    A zona-base é extraída como os 2 últimos rótulos do qname
-    (heurística leve — não usa PSL); um servidor exfil tipicamente é
+    A zona-base é extraída via constants.base_zone, que entende sufixos
+    públicos compostos (co.uk, com.br); um servidor exfil tipicamente é
     `something.evil.com`, então `evil.com` agrega todos os subdomínios.
     """
     name = 'dns_cumulative_exfil'
@@ -2925,8 +2925,9 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
         sinaliza extração de TGS para crack offline.
       * **AS-REP Roasting** (T1558.004) — sequência repetida de AS-REQ →
         AS-REP do mesmo (src,dst) sem KRB-ERROR(KDC_ERR_PREAUTH_REQUIRED)
-        intermediário. Indica enumeração de contas com bit
-        DONT_REQUIRE_PREAUTH ativado.
+        intermediário E sem PA-ENC-TIMESTAMP nos AS-REQ (logon normal com
+        pre-auth em cache carrega o timestamp já no primeiro AS-REQ).
+        Indica enumeração de contas com bit DONT_REQUIRE_PREAUTH ativado.
       * **RC4 downgrade** (T1562.010) — AS-REQ cujo etype list inclui só
         RC4 (sem AES) em ambiente moderno.
 
@@ -2953,6 +2954,12 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
     # INTEGER element. Search the byte pattern `02 01 19` to detect the
     # PREAUTH-REQUIRED reply.
     PREAUTH_REQUIRED_SIG = b'\x02\x01\x19'
+    # PA-DATA { padata-type [1] INTEGER (2 = PA-ENC-TIMESTAMP) }: an AS-REQ
+    # carrying this is a NORMAL pre-authenticated logon. Roasting tools
+    # (GetNPUsers, kerbrute) send AS-REQ without it — distinguishing the two
+    # kills the mid-stream false positive where cached-preauth clients get
+    # AS-REPs with zero PREAUTH_REQUIRED errors in the capture window.
+    PA_ENC_TIMESTAMP_SIG = b'\xa1\x03\x02\x01\x02'
 
     MSG_LIMIT = 2048
 
@@ -2965,6 +2972,7 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
             'tgs_req': 0,
             'tgs_req_rc4': 0,
             'as_req_rc4_only': 0,
+            'as_req_preauth': 0,
             'preauth_required': 0,
             'first_ts': 0.0,
             'last_ts': 0.0,
@@ -3000,6 +3008,8 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
             rec['as_req'] += 1
             if has_rc4 and not has_aes:
                 rec['as_req_rc4_only'] += 1
+            if self.PA_ENC_TIMESTAMP_SIG in body:
+                rec['as_req_preauth'] += 1
         elif tag == self.KRB_TAG_AS_REP:
             rec['as_rep'] += 1
         elif tag == self.KRB_TAG_TGS_REQ:
@@ -3100,14 +3110,16 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                 })
 
             # ---- AS-REP Roasting: enumeração ativa de contas sem preauth.
-            # Sinal: muitos AS-REQ retornando AS-REP sem PREAUTH_REQUIRED
-            # intermediário (proporcionalmente). Em condições normais cada
-            # AS-REQ inicial é respondida com KRB-ERROR(PREAUTH_REQUIRED),
-            # depois o cliente reenvia com PA-ENC-TIMESTAMP. Se AS-REPs
-            # vêm com poucas/nenhuma PREAUTH-REQUIRED, ou as contas têm
-            # DONT_REQUIRE_PREAUTH set (roastable) ou alguém forçou esse
-            # caminho.
-            if rec['as_rep'] >= 5 and rec['preauth_required'] == 0:
+            # Sinal: AS-REQs SEM PA-ENC-TIMESTAMP retornando AS-REP direto,
+            # sem KRB-ERROR(PREAUTH_REQUIRED) no meio. Exigir que os AS-REQ
+            # observados não carreguem pre-auth elimina o falso positivo de
+            # captura mid-stream: clientes Windows com pre-auth em cache
+            # mandam PA-ENC-TIMESTAMP já no primeiro AS-REQ, então um
+            # terminal server com 5+ logons gerava 5 AS-REP com zero erros —
+            # o antigo gatilho. Trade-off: captura só-de-respostas (tap
+            # unidirecional, as_req=0) deixa de alertar.
+            if (rec['as_rep'] >= 5 and rec['preauth_required'] == 0
+                    and rec['as_req'] >= 1 and rec['as_req_preauth'] == 0):
                 alerts.append({
                     'severity': 'high',
                     'category': 'brute_force',
@@ -3128,6 +3140,7 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                         'kdc_ip': dst,
                         'as_req': rec['as_req'],
                         'as_rep': rec['as_rep'],
+                        'as_req_with_preauth': rec['as_req_preauth'],
                         'preauth_required_errors': rec['preauth_required'],
                         'first_ts': rec['first_ts'],
                         'last_ts': rec['last_ts'],
@@ -4171,14 +4184,19 @@ class ModernTunnelStreamingDetector(StreamingDetector):
         except Exception:
             payload = b''
 
-        # DoQ (RFC 9250) — UDP/853 com payload que parece QUIC
+        # DoQ (RFC 9250) — UDP/853 com payload que parece QUIC. O fluxo só
+        # nasce ao ver um long header (bit alto do byte 0, RFC 9000 §17.2 —
+        # todo handshake DoQ começa por um Initial assim); antes, QUALQUER
+        # datagrama em 853 (DNS clássico mal-portado, DTLS, lixo) contava
+        # como DoQ. Pacotes seguintes do mesmo fluxo (short header) somam.
         if (dport == self._c.DOQ_PORT or sport == self._c.DOQ_PORT) \
                 and not analyzer._is_local_ip(dst):
             key = (src, dst, self._c.DOQ_PORT)
-            rec = self.doq_flows.setdefault(
-                key, {'count': 0, 'ts': float(pkt.time)},
-            )
-            rec['count'] += 1
+            rec = self.doq_flows.get(key)
+            if rec is not None:
+                rec['count'] += 1
+            elif len(payload) >= 5 and (payload[0] & 0x80):
+                self.doq_flows[key] = {'count': 1, 'ts': float(pkt.time)}
 
         # WireGuard handshake init: payload exatamente 148 bytes, type=0x01
         # nos primeiros 4 bytes (little-endian 0x00000001 — message_type=1,
