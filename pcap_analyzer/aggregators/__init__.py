@@ -229,43 +229,38 @@ class IpStatsAggregator(StreamingAggregator):
 
     def update(self, pkt):
         pkt_size = len(pkt)
+        # pkt_view dual-keys the IPv6 layer under IP as well, so a v6 packet
+        # satisfies both `IP in pkt` and `IPv6 in pkt` with the SAME view.
+        # Count through one unified branch — running a separate IPv6 block in
+        # sequence (pre-2026-07) doubled packets/bytes for every v6 packet.
         if IP in pkt:
             ip = pkt[IP]
-            src_ip, dst_ip = ip.src, ip.dst
-            s = self.ip_stats[src_ip]
-            s['packets_sent'] += 1
-            s['bytes_sent'] += pkt_size
-            s['is_local'] = self.analyzer._is_local_ip(src_ip)
-            d = self.ip_stats[dst_ip]
-            d['packets_received'] += 1
-            d['bytes_received'] += pkt_size
-            d['is_local'] = self.analyzer._is_local_ip(dst_ip)
-            if TCP in pkt:
-                s['protocols'].add('TCP')
-                s['ports'].add(pkt[TCP].dport)
-            elif UDP in pkt:
-                s['protocols'].add('UDP')
-                s['ports'].add(pkt[UDP].dport)
-            elif ICMP in pkt:
-                s['protocols'].add('ICMP')
-            if Ether in pkt:
-                s['macs'].add(pkt[Ether].src)
-                d['macs'].add(pkt[Ether].dst)
+        elif IPv6 in pkt:
+            ip = pkt[IPv6]
+        else:
+            return
+        src_ip, dst_ip = ip.src, ip.dst
+        s = self.ip_stats[src_ip]
+        s['packets_sent'] += 1
+        s['bytes_sent'] += pkt_size
+        s['is_local'] = self.analyzer._is_local_ip(src_ip)
+        d = self.ip_stats[dst_ip]
+        d['packets_received'] += 1
+        d['bytes_received'] += pkt_size
+        d['is_local'] = self.analyzer._is_local_ip(dst_ip)
+        if TCP in pkt:
+            s['protocols'].add('TCP')
+            s['ports'].add(pkt[TCP].dport)
+        elif UDP in pkt:
+            s['protocols'].add('UDP')
+            s['ports'].add(pkt[UDP].dport)
+        elif ICMP in pkt:
+            s['protocols'].add('ICMP')
         if IPv6 in pkt:
-            v6 = pkt[IPv6]
-            src_ip, dst_ip = v6.src, v6.dst
-            s = self.ip_stats[src_ip]
-            s['packets_sent'] += 1
-            s['bytes_sent'] += pkt_size
-            s['is_local'] = self.analyzer._is_local_ip(src_ip)
             s['protocols'].add('IPv6')
-            d = self.ip_stats[dst_ip]
-            d['packets_received'] += 1
-            d['bytes_received'] += pkt_size
-            d['is_local'] = self.analyzer._is_local_ip(dst_ip)
-            if Ether in pkt:
-                s['macs'].add(pkt[Ether].src)
-                d['macs'].add(pkt[Ether].dst)
+        if Ether in pkt:
+            s['macs'].add(pkt[Ether].src)
+            d['macs'].add(pkt[Ether].dst)
 
     def finalize(self, results):
         ips_list = [
@@ -385,8 +380,11 @@ class ProtocolStatsAggregator(StreamingAggregator):
                 # QUIC version. Zero version means Version Negotiation, which
                 # we still count as QUIC. The check is intentionally cheap so
                 # we don't pay a parsing tax on every UDP packet.
+                # The payload lives on the Raw layer — _UDPLayerView carries
+                # none, so the old `u.payload` read raised AttributeError into
+                # the except and QUIC never showed up in the protocol table.
                 try:
-                    payload = bytes(u.payload) if not hasattr(u, 'load') else bytes(u.payload)
+                    payload = bytes(pkt[Raw].load)
                     if len(payload) >= 5 and (payload[0] & 0x80):
                         self._add('QUIC', pkt_size, src_ip, dst_ip)
                 except Exception:

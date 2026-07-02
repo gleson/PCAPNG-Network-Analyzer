@@ -4194,20 +4194,26 @@ class ModernTunnelStreamingDetector(StreamingDetector):
             })
             rec['count'] += 1
 
-        # OpenVPN UDP: primeiro byte high-5-bits = opcode. Hard-Reset Client/
-        # Server V2 são os "passwords-of-life" para identificar OpenVPN
-        # mesmo sem conhecer a porta. 24 bytes mínimos.
-        if len(payload) >= 14:
-            opcode = (payload[0] >> 3) & 0x1f
-            if opcode in (1, 7, 8) and dport not in self._c.OPENVPN_PORTS_BENIGN \
-                    and sport not in self._c.OPENVPN_PORTS_BENIGN:
-                key = (src, dst, dport)
-                rec = self.openvpn_flows.setdefault(key, {
-                    'count': 0, 'ts': float(pkt.time),
-                    'sport': sport, 'dport': dport, 'opcodes': set(),
-                })
-                rec['count'] += 1
-                rec['opcodes'].add(opcode)
+        # OpenVPN UDP: hard-resets são os "passwords-of-life" para identificar
+        # OpenVPN mesmo sem conhecer a porta. O primeiro byte é comparado por
+        # inteiro contra OPENVPN_RESET_FIRST_BYTES (opcode<<3 com key_id=0) —
+        # olhar só os 5 bits altos multiplicava por 8 a colisão com payloads
+        # aleatórios. Portas QUIC (443/80) são excluídas: o short header 1-RTT
+        # começa em 0x40-0x47 e cada fluxo HTTP/3 virava um falso positivo.
+        if len(payload) >= 14 \
+                and payload[0] in self._c.OPENVPN_RESET_FIRST_BYTES \
+                and dport not in self._c.OPENVPN_PORTS_BENIGN \
+                and sport not in self._c.OPENVPN_PORTS_BENIGN \
+                and dport not in self._c.OPENVPN_QUIC_COLLISION_PORTS \
+                and sport not in self._c.OPENVPN_QUIC_COLLISION_PORTS:
+            opcode = payload[0] >> 3
+            key = (src, dst, dport)
+            rec = self.openvpn_flows.setdefault(key, {
+                'count': 0, 'ts': float(pkt.time),
+                'sport': sport, 'dport': dport, 'opcodes': set(),
+            })
+            rec['count'] += 1
+            rec['opcodes'].add(opcode)
 
     def finalize(self):
         alerts = []

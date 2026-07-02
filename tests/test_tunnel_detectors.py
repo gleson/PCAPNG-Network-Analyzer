@@ -67,6 +67,37 @@ def test_openvpn_hard_reset_on_nonstandard_port_fires(analyze):
     assert 7 in hits[0]["details"]["opcodes"]
 
 
+def test_openvpn_server_reset_first_byte_fires(analyze):
+    # 0x40 = P_CONTROL_HARD_RESET_SERVER_V2 (opcode 8) on a non-web port.
+    payload = b"\x40" + b"\x00" * 23
+    pkt = IP(src=LOCAL_IP, dst=EXTERNAL_IP) / UDP(sport=40000, dport=40001) / Raw(payload)
+    results = analyze([pkt])
+    hits = find_alerts(results, title="OpenVPN", category="tunneling")
+    assert hits
+    assert 8 in hits[0]["details"]["opcodes"]
+
+
+def test_quic_short_header_on_443_is_not_openvpn(analyze):
+    # Regression (2026-07): a QUIC 1-RTT short header starts at 0x40-0x47 —
+    # the same first byte as the OpenVPN server hard-reset — so every HTTP/3
+    # flow on udp/443 raised a false "OpenVPN on Non-Standard UDP Port".
+    for b0 in (0x40, 0x41, 0x45):
+        payload = bytes([b0]) + b"\x00" * 30
+        pkt = (IP(src=LOCAL_IP, dst=EXTERNAL_IP)
+               / UDP(sport=52000, dport=443) / Raw(payload))
+        results = analyze([pkt])
+        assert not has_alert(results, title="OpenVPN"), hex(b0)
+
+
+def test_openvpn_nonzero_key_id_does_not_fire(analyze):
+    # 0x39 has opcode 7 but key_id=1 — hard-resets always carry key_id 0, so
+    # matching the full first byte (not just the top 5 bits) must reject it.
+    payload = b"\x39" + b"\x00" * 23
+    pkt = IP(src=LOCAL_IP, dst=EXTERNAL_IP) / UDP(sport=40000, dport=40002) / Raw(payload)
+    results = analyze([pkt])
+    assert not has_alert(results, title="OpenVPN")
+
+
 # --- IP-layer encapsulation ------------------------------------------------
 
 def test_gre_encapsulation_to_external_fires(analyze):

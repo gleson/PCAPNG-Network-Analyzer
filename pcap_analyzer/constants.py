@@ -404,11 +404,21 @@ WIREGUARD_HANDSHAKE_INIT_LEN = 148
 WIREGUARD_DEFAULT_PORT = 51820
 WIREGUARD_PORTS_BENIGN = {51820}  # qualquer outra porta com WG init = não-padrão
 
-# OpenVPN UDP: opcodes (high 5 bits do primeiro byte). 0x38 = P_CONTROL_HARD_RESET_CLIENT_V2.
+# OpenVPN UDP: primeiro byte = (opcode << 3) | key_id, e key_id é SEMPRE 0
+# em pacotes de hard-reset — então o primeiro byte identifica o reset por
+# inteiro (casar o byte completo, e não só os 5 bits altos, corta o espaço
+# de colisão com payloads aleatórios em 8×):
+#   0x38 = P_CONTROL_HARD_RESET_CLIENT_V2 (opcode 7)
+#   0x40 = P_CONTROL_HARD_RESET_SERVER_V2 (opcode 8)
+#   0x50 = P_CONTROL_HARD_RESET_CLIENT_V3 (opcode 10, tls-crypt-v2)
 # Porta default 1194. Sinalização não-padrão se sair desta porta.
-OPENVPN_RESET_OPCODES = {0x38, 0x40, 0x70}  # client_v2 init, server_v2 init, key
+OPENVPN_RESET_FIRST_BYTES = {0x38, 0x40, 0x50}
 OPENVPN_DEFAULT_PORT = 1194
 OPENVPN_PORTS_BENIGN = {1194}
+# Portas dominadas por QUIC: o short header 1-RTT (RFC 9000 §17.3) começa em
+# 0x40-0x47, colidindo com o reset-server do OpenVPN. Sem esta exclusão, cada
+# fluxo HTTP/3 virava um falso "OpenVPN on non-standard port".
+OPENVPN_QUIC_COLLISION_PORTS = {443, 80}
 
 # IP-layer encapsulation protocol numbers (RFC 791). Alertar quando o destino
 # é externo — uso legítimo (IPv6 transition, MPLS-over-GRE) existe mas é raro

@@ -7,7 +7,7 @@ shape and content of the headline result sections: summary, protocol stats,
 IP↔MAC mapping, asset inventory, and the QUIC/TCP-flow lists.
 """
 
-from scapy.all import IP, TCP, UDP, DNS, DNSQR, Raw, Ether
+from scapy.all import IP, IPv6, TCP, UDP, DNS, DNSQR, Raw, Ether
 
 from conftest import LOCAL_IP, EXTERNAL_IP
 
@@ -68,3 +68,45 @@ def test_flow_list_sections_present(analyze):
     # consumers can rely on their presence.
     assert isinstance(results.get("quic_flows"), list)
     assert isinstance(results.get("traffic_timeline"), list)
+
+
+def test_ipv6_packet_counted_once_in_ip_stats(analyze):
+    # Regression (2026-07): pkt_view dual-keys the IPv6 layer under IP, so the
+    # old separate `if IP` + `if IPv6` blocks BOTH ran and every v6 packet was
+    # counted twice (packets_sent=2, bytes doubled).
+    src6, dst6 = "2001:db8::10", "2001:db8::20"
+    pkt = (Ether(src=MAC_LOCAL, dst=MAC_GW)
+           / IPv6(src=src6, dst=dst6) / TCP(sport=50000, dport=443, flags="S"))
+    wire_len = len(pkt)
+    results = analyze([pkt])
+
+    by_ip = {e["ip"]: e for e in results["ips"]}
+    assert src6 in by_ip and dst6 in by_ip
+    assert by_ip[src6]["packets_sent"] == 1
+    assert by_ip[src6]["bytes_sent"] == wire_len
+    assert by_ip[dst6]["packets_received"] == 1
+    assert by_ip[dst6]["bytes_received"] == wire_len
+    # The transport protocol and the IPv6 tag must both survive the merge.
+    assert {"TCP", "IPv6"} <= set(by_ip[src6]["protocols"])
+    assert 443 in by_ip[src6]["ports"]
+
+
+def test_quic_appears_in_protocol_stats(analyze):
+    # Regression (2026-07): the QUIC branch read `u.payload` off the UDP layer
+    # view (which has no payload attribute), so the AttributeError was
+    # swallowed and QUIC never showed up in results['protocols'].
+    quic_long_header = bytes([0xC3, 0x00, 0x00, 0x00, 0x01]) + b"\x00" * 40
+    pkt = (IP(src=LOCAL_IP, dst=EXTERNAL_IP)
+           / UDP(sport=51000, dport=443) / Raw(quic_long_header))
+    results = analyze([pkt])
+    names = {p["name"] for p in results["protocols"]}
+    assert "QUIC" in names
+
+
+def test_non_quic_udp_443_not_counted_as_quic(analyze):
+    # High bit of byte 0 clear -> not a QUIC long header; must stay UDP-only.
+    pkt = (IP(src=LOCAL_IP, dst=EXTERNAL_IP)
+           / UDP(sport=51001, dport=443) / Raw(b"\x3f" + b"\x00" * 40))
+    results = analyze([pkt])
+    names = {p["name"] for p in results["protocols"]}
+    assert "QUIC" not in names
