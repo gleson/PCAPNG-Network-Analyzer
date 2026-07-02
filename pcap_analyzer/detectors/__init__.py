@@ -384,6 +384,42 @@ class PortScanStreamingDetector(StreamingDetector):
         except Exception:
             pass
 
+    # Severity ladder for the direction-aware modulation below.
+    _SEV_LADDER = ('info', 'low', 'medium', 'high', 'critical')
+
+    def _scan_severity(self, src_ip, primary_dst, nmap_like):
+        """Modulate port-scan severity by direction instead of always-critical.
+
+        The pré-2026-07 code hard-coded 'critical' for every port scan, so a
+        benign internet scanner hitting us, an authorized internal admin
+        running nmap, and a compromised host probing outward all looked
+        identical. Direction is the strongest cheap context:
+
+          external → internal : critical  (someone outside mapping our host)
+          internal → internal : high      (internal recon / lateral)
+          internal → external : medium    (local host scanning the internet —
+                                            often a tool/misconfig, but could
+                                            be a compromised host)
+          external → external : medium    (transit / spoofed, rarely ours)
+
+        An nmap fingerprint means deliberate tooling → bump one notch (capped
+        at critical). GreyNoiseRiotDetector still adds its benign-scanner
+        counter-signal on top.
+        """
+        src_local = self.analyzer._is_local_ip(src_ip)
+        dst_local = (self.analyzer._is_local_ip(primary_dst)
+                     if primary_dst else False)
+        if (not src_local) and dst_local:
+            severity = 'critical'
+        elif src_local and dst_local:
+            severity = 'high'
+        else:
+            severity = 'medium'
+        if nmap_like and severity != 'critical':
+            idx = self._SEV_LADDER.index(severity)
+            severity = self._SEV_LADDER[min(len(self._SEV_LADDER) - 1, idx + 1)]
+        return severity
+
     def _nmap_fingerprint(self, windows, opt_sets):
         """Onda 6 — return (is_nmap_like, label) for a SYN-source profile.
 
@@ -523,8 +559,9 @@ class PortScanStreamingDetector(StreamingDetector):
             )
             if nmap_like:
                 description += f'. TCP profile: {nmap_label}.'
+            severity = self._scan_severity(src_ip, primary_dst, nmap_like)
             alerts.append({
-                'severity': 'critical',
+                'severity': severity,
                 'category': 'scan',
                 'title': title,
                 'description': description,
@@ -533,6 +570,17 @@ class PortScanStreamingDetector(StreamingDetector):
                 'details': {
                     'src_ip': src_ip,
                     'dst_ip': primary_dst,
+                    'direction': (
+                        'inbound'
+                        if (not self.analyzer._is_local_ip(src_ip)
+                            and primary_dst
+                            and self.analyzer._is_local_ip(primary_dst))
+                        else ('internal'
+                              if self.analyzer._is_local_ip(src_ip)
+                              and primary_dst
+                              and self.analyzer._is_local_ip(primary_dst)
+                              else 'outbound')
+                    ),
                     'targets': targets[:10],
                     'targets_count': len(targets),
                     'ports_count': ports_count,
@@ -1796,6 +1844,17 @@ class HorizontalScanStreamingDetector(StreamingDetector):
     def finalize(self):
         from ..constants import ALPN_WEB_OK_PORTS
         alerts = []
+        # One-sided-capture guard: answer_ratio (SYN-ACK confirmation) is only
+        # meaningful when the tap sees the return path. On an egress-only /
+        # asymmetric tap NO SYN-ACK is ever captured, so every record scores
+        # answer_ratio=0 and the old code called EVERYTHING critical —
+        # including a benign monitoring/backup server polling many hosts.
+        # If not a single SYN-ACK was seen across the whole capture, treat the
+        # handshake signal as unavailable and fall back to fan-out magnitude.
+        global_answered = sum(
+            len(d['answered']) for d in self.by_src_port.values()
+        )
+        one_sided = (global_answered == 0)
         for (src, port), data in self.by_src_port.items():
             hosts = data['hosts']
             # Falso-positivo clássico: um cliente interno abrindo conexões
@@ -1824,25 +1883,41 @@ class HorizontalScanStreamingDetector(StreamingDetector):
             # destino devolve SYN-ACK. answer_ratio = fração dos destinos
             # sondados que responderam.
             answered = data['answered'] & effective
-            answer_ratio = len(answered) / len(effective)
-            if answer_ratio >= self.answer_ratio_benign:
-                # Praticamente todo destino respondeu: uso legítimo de
-                # serviços (proxy, monitor, cliente), não varredura.
-                continue
-            if answer_ratio < self.answer_ratio_critical:
-                severity = 'critical'
-            elif answer_ratio < self.answer_ratio_high:
-                severity = 'high'
+            wide_fanout = len(effective) >= self.threshold_hosts * self.slow_multiplier
+            if one_sided:
+                # No return-path visibility: can't confirm via handshake.
+                # Score on fan-out magnitude alone. Only a very wide sweep
+                # (>= slow-scan host count) still rates critical; otherwise
+                # cap at high so a benign server polling many hosts on an
+                # asymmetric tap isn't auto-critical.
+                answer_ratio = None
+                severity = 'critical' if wide_fanout else 'high'
             else:
-                severity = 'medium'
+                answer_ratio = len(answered) / len(effective)
+                if answer_ratio >= self.answer_ratio_benign:
+                    # Praticamente todo destino respondeu: uso legítimo de
+                    # serviços (proxy, monitor, cliente), não varredura.
+                    continue
+                if answer_ratio < self.answer_ratio_critical:
+                    severity = 'critical'
+                elif answer_ratio < self.answer_ratio_high:
+                    severity = 'high'
+                else:
+                    severity = 'medium'
+            if one_sided:
+                handshake_txt = (
+                    'return path not captured (asymmetric/egress-only tap) — '
+                    'handshake confirmation unavailable'
+                )
+            else:
+                handshake_txt = f'{len(answered)} completed the TCP handshake'
             alerts.append({
                 'severity': severity,
                 'category': 'scan',
                 'title': 'Horizontal Port Scan (Host Sweep)',
                 'description': (
                     f'Host {src} probed port {port} on {len(effective)} '
-                    f'distinct hosts in {duration:.1f}s '
-                    f'({len(answered)} completed the TCP handshake)'
+                    f'distinct hosts in {duration:.1f}s ({handshake_txt})'
                 ),
                 'ip': src,
                 'details': {
@@ -1850,17 +1925,25 @@ class HorizontalScanStreamingDetector(StreamingDetector):
                     'port': port,
                     'hosts_count': len(effective),
                     'hosts_answered': len(answered),
-                    'answer_ratio': round(answer_ratio, 3),
+                    'answer_ratio': (round(answer_ratio, 3)
+                                     if answer_ratio is not None else None),
+                    'capture_one_sided': one_sided,
                     'duration_seconds': round(duration, 2),
                     'hosts_sample': sorted(effective)[:10],
                 },
                 'recommendation': (
                     'A single source probing one port across many hosts '
                     'indicates service discovery / host sweep (often pre-'
-                    'attack reconnaissance). A low answer ratio (few '
-                    'completed handshakes) means most probes hit dead or '
-                    'filtered hosts — a strong scan signature. Investigate '
-                    'the source for compromise.'
+                    'attack reconnaissance). '
+                    + ('The return path was not captured, so the TCP '
+                       'handshake could not confirm the scan — a legitimate '
+                       'monitoring/backup server polling many hosts looks the '
+                       'same on an asymmetric tap. Correlate with the host '
+                       'role before escalating.'
+                       if one_sided else
+                       'A low answer ratio (few completed handshakes) means '
+                       'most probes hit dead or filtered hosts — a strong '
+                       'scan signature. Investigate the source for compromise.')
                 ),
             })
         return alerts
