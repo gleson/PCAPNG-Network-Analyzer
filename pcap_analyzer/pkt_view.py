@@ -89,13 +89,29 @@ except Exception:
     TCPerror = None  # type: ignore
     UDPerror = None  # type: ignore
 
+# ICMPv6 echo: scapy uses dedicated classes (type 128 request / 129 reply),
+# not the v4 ICMP layer. We normalise them onto _ICMPLayerView with the v4
+# type codes (8/0) and key the view under ICMP so ping-sweep and
+# ICMP-tunneling detectors see IPv6 echoes without any code change.
+try:
+    from scapy.layers.inet6 import (
+        ICMPv6EchoRequest as _ScapyICMPv6EchoReq,
+        ICMPv6EchoReply as _ScapyICMPv6EchoRep,
+    )
+except Exception:
+    _ScapyICMPv6EchoReq = None  # type: ignore
+    _ScapyICMPv6EchoRep = None  # type: ignore
+
 
 class _IPLayerView:
     __slots__ = ('src', 'dst', 'ttl', 'proto')
 
 
 class _TCPLayerView:
-    __slots__ = ('sport', 'dport', 'flags')
+    # window/opt_names are populated only for pure-SYN packets (scan probes)
+    # — that's all the nmap-fingerprint heuristic needs, and extracting them
+    # per-packet on multi-million-packet captures would waste memory.
+    __slots__ = ('sport', 'dport', 'flags', 'window', 'opt_names')
 
 
 class _UDPLayerView:
@@ -236,6 +252,12 @@ def extract_pkt_view(pkt):
             layer.ttl = int(getattr(v6, 'hlim', 64) or 64)
             layer.proto = int(getattr(v6, 'nh', 0) or 0)
             view._layers[IPv6] = layer
+            # Dual-key under IP as well: every detector gates on `IP in pkt`
+            # and reads pkt[IP].src/dst — keying the v6 view here makes IPv6
+            # traffic visible to all of them (addresses are strings either
+            # way, and _is_local_ip handles v6 via ipaddress). Before this,
+            # IPv6 scans/exfil/beacons were completely invisible.
+            view._layers[IP] = layer
         except Exception:
             pass
 
@@ -246,6 +268,24 @@ def extract_pkt_view(pkt):
             layer.sport = int(t.sport)
             layer.dport = int(t.dport)
             layer.flags = int(t.flags) if t.flags is not None else 0
+            layer.window = None
+            layer.opt_names = None
+            # Pure SYN (scan probe): keep window + option names so the
+            # port-scan detector can fingerprint nmap. The scapy attributes
+            # were lost in the PktView migration, silently killing the
+            # nmap-fingerprint heuristic on real captures.
+            if (layer.flags & 0x02) and not (layer.flags & 0x10):
+                try:
+                    layer.window = int(t.window)
+                except Exception:
+                    pass
+                try:
+                    layer.opt_names = tuple(
+                        (o[0] if isinstance(o, tuple) else str(o))
+                        for o in (t.options or [])
+                    )
+                except Exception:
+                    pass
             view._layers[TCP] = layer
         except Exception:
             pass
@@ -295,6 +335,39 @@ def extract_pkt_view(pkt):
             view._layers[ICMP] = layer
         except Exception:
             pass
+
+    # ICMPv6 echo → normalised onto the v4 ICMP view (type 128→8, 129→0) so
+    # ping-sweep / ICMP-tunneling detectors cover IPv6. The echo data lives in
+    # the layer's `data` field (not Raw); expose it as Raw when Raw is absent
+    # so payload-size checks keep working.
+    if ICMP not in view._layers and _ScapyICMPv6EchoReq is not None:
+        v6_echo = None
+        v6_type = None
+        if _ScapyICMPv6EchoReq in pkt:
+            v6_echo = pkt[_ScapyICMPv6EchoReq]
+            v6_type = 8
+        elif _ScapyICMPv6EchoRep is not None and _ScapyICMPv6EchoRep in pkt:
+            v6_echo = pkt[_ScapyICMPv6EchoRep]
+            v6_type = 0
+        if v6_echo is not None:
+            try:
+                layer = _ICMPLayerView()
+                layer.type = v6_type
+                layer.code = int(getattr(v6_echo, 'code', 0) or 0)
+                layer.inner_proto = None
+                layer.inner_ip_src = None
+                layer.inner_ip_dst = None
+                layer.inner_sport = None
+                layer.inner_dport = None
+                view._layers[ICMP] = layer
+                if Raw not in view._layers:
+                    data = bytes(getattr(v6_echo, 'data', b'') or b'')
+                    if data:
+                        raw_layer = _RawLayerView()
+                        raw_layer.load = data
+                        view._layers[Raw] = raw_layer
+            except Exception:
+                pass
 
     if ARP in pkt:
         try:

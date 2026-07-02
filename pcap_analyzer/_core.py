@@ -625,13 +625,15 @@ class PCAPAnalyzer:
 
     @staticmethod
     def _extract_dns_label(query):
-        """Extrai o label efetivo (segundo nível), tratando ccTLD compostos."""
+        """Extrai o label efetivo (segundo nível), tratando sufixos públicos
+        compostos (co.uk, com.br, ...) via constants.base_zone. O label é o
+        primeiro rótulo da zona registrável — o que o dono do domínio de fato
+        escolheu, e o que o score de DGA deve avaliar."""
         parts = query.split('.')
         if len(parts) < 2:
             return None
-        if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) <= 3:
-            return parts[-3]
-        return parts[-2]
+        zone = _constants.base_zone(parts)
+        return zone.split('.', 1)[0]
 
     @staticmethod
     def _binned_autocorrelation_peak(timestamps, mean_interval):

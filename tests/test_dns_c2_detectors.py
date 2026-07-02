@@ -37,3 +37,49 @@ def test_cobalt_strike_dns_beacon_fires(analyze):
 def test_normal_subdomain_does_not_trigger_cs_beacon(analyze):
     results = analyze([_dns_query("api.cdn.example.com")])
     assert not has_alert(results, title="Cobalt Strike DNS Beacon")
+
+
+# --- base-zone extraction under compound public suffixes --------------------
+
+def test_base_zone_handles_compound_suffixes():
+    from pcap_analyzer.constants import base_zone
+
+    assert base_zone(["x", "evil", "co", "uk"]) == "evil.co.uk"
+    assert base_zone(["a", "b", "evil", "com", "br"]) == "evil.com.br"
+    assert base_zone(["evil", "com"]) == "evil.com"
+    assert base_zone(["sub", "evil", "org"]) == "evil.org"
+    # Generic rule: <functional-label>.<2-letter ccTLD> not in the curated set.
+    assert base_zone(["x", "evil", "gov", "zz"]) == "evil.gov.zz"
+
+
+def test_cs_beacon_parent_zone_is_registrable_domain(analyze):
+    # Under .com.br the parent zone must be evil.com.br, NOT com.br —
+    # otherwise unrelated Brazilian domains aggregate in one bucket and the
+    # sinkhole recommendation points at the whole public suffix.
+    results = analyze([_dns_query(f"post.{_HE_LABEL}.evil.com.br")])
+    hits = find_alerts(results, title="Cobalt Strike DNS Beacon", category="c2")
+    assert hits
+    assert hits[0]["details"]["parent_zone"] == "evil.com.br"
+
+
+def test_cumulative_dns_exfil_groups_by_registrable_zone(analyze):
+    # >=100 distinct subdomains under ONE zone. With last-2-labels grouping,
+    # `<sub>.evil.co.uk` would land in the `co.uk` bucket; the alert must
+    # name evil.co.uk.
+    packets = [
+        _dns_query(f"chunk{i:04d}.evil.co.uk", sport=30000 + i)
+        for i in range(105)
+    ]
+    results = analyze(packets)
+    hits = find_alerts(results, title="Cumulative DNS Exfiltration")
+    assert hits
+    assert hits[0]["details"]["base_domain"] == "evil.co.uk"
+
+
+def test_dga_score_uses_label_left_of_public_suffix(analyze):
+    # The DGA-looking label sits directly above .com.br: the effective label
+    # extracted must be the DGA string, not "com".
+    results = analyze([_dns_query(f"{_DGA_LABEL}.com.br")])
+    hits = find_alerts(results, title="DGA", category="dns")
+    assert hits
+    assert hits[0]["details"]["max_score"] >= 0.7

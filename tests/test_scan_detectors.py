@@ -25,6 +25,47 @@ def test_port_scan_fires(analyze):
     assert hits[0]["details"]["ports_count"] >= 20
 
 
+def test_port_scan_nmap_fingerprint_fires(analyze):
+    # nmap -sS default profile: window=1024, options MSS+SAckOK, never
+    # Timestamp/WScale. Regression: PktView dropped window/options, so the
+    # fingerprint heuristic silently never fired on real captures.
+    packets = []
+    t = 1_000_000.0
+    for port in range(20, 50):
+        pk = IP(src=EXTERNAL_IP, dst=LOCAL_IP) / TCP(
+            sport=44444, dport=port, flags="S", window=1024,
+            options=[("MSS", 1460), ("SAckOK", b"")],
+        )
+        pk.time = t
+        t += 0.01
+        packets.append(pk)
+    results = analyze(packets)
+    hits = find_alerts(results, title="Port Scan", category="scan")
+    assert hits
+    assert hits[0]["details"]["nmap_fingerprint"] is True
+    assert "nmap fingerprint" in hits[0]["title"]
+    assert hits[0]["details"]["syn_window"] == 1024
+
+
+def test_port_scan_real_stack_has_no_nmap_fingerprint(analyze):
+    # A real OS stack sends Timestamp/WScale — must NOT be tagged as nmap.
+    packets = []
+    t = 1_000_000.0
+    for port in range(20, 50):
+        pk = IP(src=EXTERNAL_IP, dst=LOCAL_IP) / TCP(
+            sport=44444, dport=port, flags="S", window=64240,
+            options=[("MSS", 1460), ("SAckOK", b""),
+                     ("Timestamp", (100, 0)), ("WScale", 7)],
+        )
+        pk.time = t
+        t += 0.01
+        packets.append(pk)
+    results = analyze(packets)
+    hits = find_alerts(results, title="Port Scan", category="scan")
+    assert hits
+    assert hits[0]["details"]["nmap_fingerprint"] is False
+
+
 def test_ping_sweep_fires(analyze):
     # Default: ICMP echo (type 8) to >=15 distinct hosts within 60s.
     packets = []

@@ -19,6 +19,10 @@ def _arp_reply(psrc, hwsrc, pdst="10.0.0.1"):
     return Ether(src=hwsrc) / ARP(op=2, psrc=psrc, hwsrc=hwsrc, pdst=pdst)
 
 
+def _arp_request(psrc, hwsrc, pdst):
+    return Ether(src=hwsrc) / ARP(op=1, psrc=psrc, hwsrc=hwsrc, pdst=pdst)
+
+
 # --- ARP spoofing ----------------------------------------------------------
 
 def test_arp_mac_change_is_critical(analyze):
@@ -49,6 +53,41 @@ def test_gratuitous_arp_flood_fires(analyze):
     hits = find_alerts(results, title="Gratuitous ARP Flood", category="arp")
     assert hits
     assert hits[0]["details"]["count"] >= 5
+
+
+def test_gratuitous_arp_flood_via_requests_fires(analyze):
+    # GARP announcements are frequently sent as REQUESTS (op=1, psrc==pdst)
+    # — poisoning tools use both forms. Was invisible when only op=2 counted.
+    packets = [_arp_request("10.0.0.77", MAC_A, pdst="10.0.0.77")
+               for _ in range(5)]
+    results = analyze(packets)
+    hits = find_alerts(results, title="Gratuitous ARP Flood", category="arp")
+    assert hits
+    assert hits[0]["details"]["count"] >= 5
+
+
+def test_arp_mac_change_via_requests_is_detected(analyze):
+    # Ownership claims in requests count too: same IP announced from two
+    # MACs across who-has requests -> MITM signal.
+    packets = [
+        _arp_request("10.0.0.50", MAC_A, pdst="10.0.0.9"),
+        _arp_request("10.0.0.50", MAC_B, pdst="10.0.0.9"),
+    ]
+    results = analyze(packets)
+    assert has_alert(results, title="ARP Spoofing Detected")
+
+
+def test_acd_probe_does_not_poison_mac_state(analyze):
+    # DHCP/ACD probes use psrc 0.0.0.0 with the real MAC — NOT an ownership
+    # claim. Two different MACs probing must not raise ARP spoofing, and a
+    # later legitimate announce must not conflict with probe state.
+    packets = [
+        _arp_request("0.0.0.0", MAC_A, pdst="10.0.0.50"),
+        _arp_request("0.0.0.0", MAC_B, pdst="10.0.0.50"),
+        _arp_reply("10.0.0.50", MAC_A, pdst="10.0.0.9"),
+    ]
+    results = analyze(packets)
+    assert not has_alert(results, title="ARP Spoofing Detected")
 
 
 # --- Password spraying -----------------------------------------------------

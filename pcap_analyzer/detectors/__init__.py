@@ -311,17 +311,23 @@ class PortScanStreamingDetector(StreamingDetector):
         rec['dsts'][pkt[IP].dst] += 1
         rec['syn_count'] += 1
         # Window + TCP option names (kept as a tuple so it's hashable).
+        # PktView pre-extracts them for pure-SYN packets as `window` /
+        # `opt_names`; the scapy attributes remain a fallback for raw packets.
+        tcp = pkt[TCP]
         try:
-            rec['windows'][int(pkt[TCP].window)] += 1
+            win = getattr(tcp, 'window', None)
+            if win is not None:
+                rec['windows'][int(win)] += 1
         except Exception:
             pass
         try:
-            opts = pkt[TCP].options or []
-            opt_names = tuple(
-                (o[0] if isinstance(o, tuple) else str(o))
-                for o in opts
-            )
-            rec['opt_sets'][opt_names] += 1
+            opt_names = getattr(tcp, 'opt_names', None)
+            if opt_names is None:
+                opt_names = tuple(
+                    (o[0] if isinstance(o, tuple) else str(o))
+                    for o in (getattr(tcp, 'options', None) or [])
+                )
+            rec['opt_sets'][tuple(opt_names)] += 1
         except Exception:
             pass
 
@@ -681,10 +687,17 @@ class ArpSpoofingStreamingDetector(StreamingDetector):
         if ARP not in pkt:
             return
         a = pkt[ARP]
-        if a.op != 2:
+        # Requests (op=1) also assert "psrc is at hwsrc" — poisoning via
+        # gratuitous *requests* is just as common as via replies, so both
+        # feed the MAC-change tracker and the gratuitous-flood counter.
+        if a.op not in (1, 2):
             return
         src_ip = a.psrc
         src_mac = a.hwsrc
+        # ACD/DHCP probes announce psrc 0.0.0.0 — not an ownership claim;
+        # letting them into the tracker would poison the IP→MAC state.
+        if not src_ip or src_ip == '0.0.0.0' or not src_mac:
+            return
         if src_ip in self.ip_to_mac and self.ip_to_mac[src_ip] != src_mac:
             self.alerts.append({
                 'severity': 'critical',
@@ -946,10 +959,15 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
             if parts[-1] in ('local', 'arpa', 'localdomain', 'home',
                              'internal', 'lan'):
                 return
-            base = '.'.join(parts[-2:])
+            # base_zone entende sufixos públicos compostos (co.uk, com.br):
+            # `a.b.evil.co.uk` agrega em `evil.co.uk`, não em `co.uk` — o que
+            # misturaria domínios não relacionados na mesma zona.
+            from ..constants import base_zone
+            base = base_zone(parts)
+            n_base = base.count('.') + 1
             # O "sub" é tudo antes da zona-base. Para `a.b.c.evil.com` →
             # subdomínio = 'a.b.c'.
-            sub = '.'.join(parts[:-2])
+            sub = '.'.join(parts[:-n_base])
             if not sub:
                 return
             src_ip = pkt[IP].src
@@ -3506,7 +3524,8 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
 
     @staticmethod
     def _parent_zone(parts):
-        return '.'.join(parts[-2:]) if len(parts) >= 2 else '.'.join(parts)
+        from ..constants import base_zone
+        return base_zone(parts)
 
     def update(self, pkt):
         if DNS not in pkt or IP not in pkt:

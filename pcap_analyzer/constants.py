@@ -587,3 +587,88 @@ COBALT_STRIKE_DNS_LABEL_MIN_LEN = 20
 # Used to downgrade scan alerts to informational when the source IP is a
 # documented benign internet scanner (Shodan, Censys, etc).
 GREYNOISE_BENIGN_CLASSIFICATIONS = {'benign'}
+
+# Lightweight public-suffix handling for base-zone extraction.
+# The DNS exfil/C2 detectors group queries by "registrable zone"; taking the
+# last 2 labels breaks under compound ccTLD suffixes (x.evil.co.uk would
+# aggregate under "co.uk", mixing unrelated domains and hiding the real
+# attacker zone). A full Public Suffix List is a heavyweight dependency for
+# an offline analyzer, so we ship a curated set of the common second-level
+# public suffixes plus a generic rule in base_zone() below.
+SECOND_LEVEL_PUBLIC_SUFFIXES = {
+    # United Kingdom
+    'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'net.uk', 'sch.uk', 'me.uk',
+    'ltd.uk', 'plc.uk', 'nhs.uk',
+    # Brazil
+    'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br', 'mil.br', 'art.br',
+    'adv.br', 'ind.br', 'inf.br', 'srv.br', 'eng.br', 'blog.br', 'eco.br',
+    'emp.br', 'far.br', 'med.br', 'tv.br', 'etc.br', 'jus.br', 'leg.br',
+    'mp.br', 'def.br',
+    # Australia / New Zealand
+    'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au',
+    'co.nz', 'net.nz', 'org.nz', 'govt.nz', 'ac.nz',
+    # Japan / Korea / China / Taiwan / Hong Kong / Singapore / India
+    'co.jp', 'ne.jp', 'or.jp', 'go.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'gr.jp',
+    'co.kr', 'ne.kr', 'or.kr', 'go.kr', 'ac.kr', 're.kr', 'pe.kr',
+    'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+    'com.tw', 'net.tw', 'org.tw', 'gov.tw', 'edu.tw', 'idv.tw',
+    'com.hk', 'net.hk', 'org.hk', 'gov.hk', 'edu.hk', 'idv.hk',
+    'com.sg', 'net.sg', 'org.sg', 'gov.sg', 'edu.sg', 'per.sg',
+    'co.in', 'net.in', 'org.in', 'gov.in', 'ac.in', 'res.in', 'firm.in',
+    'gen.in', 'ind.in', 'nic.in', 'ernet.in',
+    # Latin America
+    'com.mx', 'net.mx', 'org.mx', 'gob.mx', 'edu.mx',
+    'com.ar', 'net.ar', 'org.ar', 'gob.ar', 'edu.ar', 'int.ar', 'mil.ar',
+    'com.co', 'net.co', 'org.co', 'gov.co', 'edu.co', 'mil.co', 'nom.co',
+    'com.pe', 'net.pe', 'org.pe', 'gob.pe', 'edu.pe', 'nom.pe',
+    'com.ve', 'net.ve', 'org.ve', 'gob.ve', 'edu.ve',
+    'com.uy', 'net.uy', 'org.uy', 'gub.uy', 'edu.uy',
+    'com.ec', 'net.ec', 'org.ec', 'gob.ec', 'edu.ec',
+    'com.bo', 'net.bo', 'org.bo', 'gob.bo', 'edu.bo',
+    'com.py', 'net.py', 'org.py', 'gov.py', 'edu.py',
+    'com.do', 'com.gt', 'com.sv', 'com.ni', 'com.hn', 'com.pa', 'com.pr',
+    # Europe (compound-suffix countries)
+    'com.tr', 'net.tr', 'org.tr', 'gov.tr', 'edu.tr', 'gen.tr', 'web.tr',
+    'com.pl', 'net.pl', 'org.pl', 'gov.pl', 'edu.pl', 'waw.pl',
+    'com.pt', 'net.pt', 'org.pt', 'gov.pt', 'edu.pt', 'int.pt',
+    'com.es', 'nom.es', 'org.es', 'gob.es', 'edu.es',
+    'com.gr', 'net.gr', 'org.gr', 'gov.gr', 'edu.gr',
+    'com.ro', 'org.ro', 'nt.ro',
+    'com.ua', 'net.ua', 'org.ua', 'gov.ua', 'edu.ua', 'in.ua', 'kiev.ua',
+    'com.ru', 'net.ru', 'org.ru', 'msk.ru', 'spb.ru',
+    # Africa / Middle East
+    'co.za', 'net.za', 'org.za', 'gov.za', 'ac.za', 'web.za',
+    'com.ng', 'net.ng', 'org.ng', 'gov.ng', 'edu.ng',
+    'com.eg', 'net.eg', 'org.eg', 'gov.eg', 'edu.eg',
+    'co.il', 'net.il', 'org.il', 'gov.il', 'ac.il', 'muni.il',
+    'com.sa', 'net.sa', 'org.sa', 'gov.sa', 'edu.sa', 'med.sa',
+    'co.ke', 'or.ke', 'ne.ke', 'go.ke', 'ac.ke',
+    'co.ma', 'net.ma', 'org.ma', 'gov.ma', 'ac.ma',
+    'com.ae', 'net.ae', 'org.ae', 'gov.ae', 'ac.ae',
+}
+# Generic fallback rule: <short-functional-label>.<2-letter-ccTLD> is almost
+# always a public suffix even when missing from the curated set above
+# (e.g. gov.xx, edu.xx for a ccTLD we didn't enumerate).
+_GENERIC_SLD_LABELS = frozenset({
+    'com', 'net', 'org', 'gov', 'gob', 'gub', 'edu', 'mil',
+    'ac', 'co', 'or', 'ne', 'go', 'sch',
+})
+
+
+def base_zone(parts):
+    """Return the registrable base zone for a lowercased DNS label list.
+
+    ['x', 'evil', 'co', 'uk']  -> 'evil.co.uk'
+    ['x', 'evil', 'com']       -> 'evil.com'
+    ['evil', 'com']            -> 'evil.com'
+    """
+    if len(parts) < 2:
+        return '.'.join(parts)
+    suffix2 = parts[-2] + '.' + parts[-1]
+    is_compound = (
+        suffix2 in SECOND_LEVEL_PUBLIC_SUFFIXES
+        or (len(parts[-1]) == 2 and parts[-2] in _GENERIC_SLD_LABELS)
+    )
+    if is_compound and len(parts) >= 3:
+        return '.'.join(parts[-3:])
+    return suffix2
