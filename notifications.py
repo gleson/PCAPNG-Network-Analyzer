@@ -108,6 +108,95 @@ def _dispatch_thread(webhooks, alerts, context, settings):
             db.mark_webhook_result(hook["id"], error=f"unexpected: {e}")
 
 
+# ============================================================
+#  Security / governance events (out-of-band)
+# ============================================================
+#
+# These announce changes to the detection controls themselves — a suppression
+# rule being created, or a rule hiding high-severity alerts. They are the
+# defence against an intruder who suppresses the alert that would expose them:
+# the act of hiding is broadcast through a channel the intruder on the host
+# does not control. Unlike scan alerts, they BYPASS each channel's
+# severity/category filter — a SOC that muted low-priority scan noise must
+# still hear that its alerting was tampered with.
+
+def dispatch_security_event(title, description, severity='critical',
+                            category='security-audit', context=None):
+    """Fan a single governance event to every enabled webhook (unfiltered).
+
+    Returns immediately; sending runs on a daemon thread.
+    """
+    try:
+        webhooks = db.list_webhooks(enabled_only=True)
+    except Exception as e:
+        print(f"[notifications] failed to load webhooks: {e}")
+        return
+    if not webhooks:
+        return
+    ctx = dict(context or {})
+    alert = {
+        'title': title,
+        'description': description,
+        'severity': severity,
+        'category': category,
+        'ip': ctx.get('ip') or '-',
+    }
+    ctx.setdefault('total_alerts', 1)
+    t = threading.Thread(
+        target=_security_dispatch_thread,
+        args=(webhooks, [alert], ctx, {}),
+        daemon=True,
+    )
+    t.start()
+
+
+def _security_dispatch_thread(webhooks, alerts, context, settings):
+    for hook in webhooks:
+        try:
+            err = _send_to_webhook(hook, alerts, context, settings)
+            db.mark_webhook_result(hook["id"], error=err)
+        except Exception as e:
+            db.mark_webhook_result(hook["id"], error=f"unexpected: {e}")
+
+
+def dispatch_rule_created(rule, actor=None):
+    """Announce that a suppression rule was created (who + what it hides)."""
+    crit = []
+    for field in ('src_ip', 'src_cidr', 'dst_ip', 'dst_cidr', 'category',
+                  'title_pattern'):
+        if rule.get(field):
+            crit.append(f"{field}={rule[field]}")
+    dispatch_security_event(
+        title=f"Suppression rule #{rule.get('id')} created by "
+              f"{actor or 'unknown'}",
+        description="A new alert-suppression rule is now active: "
+                    + (", ".join(crit) or "(no criteria?)")
+                    + f". Reason: {rule.get('reason') or '—'}. "
+                    "Suppressed alerts are still recorded and reviewable.",
+        severity='high',
+        category='suppression-audit',
+    )
+
+
+def dispatch_suppression_events(scan_id, filename, suppressed_high):
+    """Announce that active rules hid one or more high/critical alerts."""
+    if not suppressed_high:
+        return
+    n = len(suppressed_high)
+    titles = sorted({s.get('title') or '?' for s in suppressed_high})[:5]
+    sample_ip = suppressed_high[0].get('ip')
+    dispatch_security_event(
+        title=f"{n} high-severity alert(s) suppressed on scan {scan_id}",
+        description=(f"Active suppression rule(s) hid {n} high/critical alert(s) "
+                     f"in '{filename or scan_id}': {', '.join(titles)}. "
+                     "The alerts remain recorded — review them and the rule if "
+                     "this was not expected."),
+        severity='critical',
+        category='suppression-audit',
+        context={'filename': filename, 'scan_id': scan_id, 'ip': sample_ip},
+    )
+
+
 def _filter_alerts(alerts, hook):
     floor = SEVERITY_RANK.get(hook.get("min_severity", "high"), 2)
     cats_csv = hook.get("categories")

@@ -436,7 +436,7 @@ docker compose logs web | grep -A6 "Bootstrapping default admin"
 | `SESSION_COOKIE_SECURE` | `1` quando servido sob HTTPS | off |
 | `SESSION_LIFETIME_HOURS` | Timeout de inatividade da sessão | `12` |
 | `TRUSTED_PROXY_COUNT` | Nº de proxies reversos confiáveis (habilita `ProxyFix`) | `0` |
-| `MAX_UPLOAD_BYTES` | Tamanho máximo de upload | `10 GiB` |
+| `MAX_UPLOAD_BYTES` | Tamanho máximo de upload (vazio/`0` = sem limite) | sem limite |
 | `DISABLE_SWAGGER` | `1` desabilita a UI Swagger em `/apidocs` | off |
 | `PCAP_ALLOW_PRIVATE_WEBHOOKS` | `1` permite webhooks para IPs privados | off |
 | `ABUSEIPDB_API_KEY` | API key do AbuseIPDB | desabilitado |
@@ -499,6 +499,8 @@ Documentação interativa em **`/apidocs`** (Swagger UI). Todos os endpoints exi
 | GET | `/me` | Usuário atual + CSRF token |
 | GET | `/csrf-token` | Mintar/obter o CSRF token |
 | POST | `/password` | Trocar a própria senha |
+| GET | `/totp/status` | Estado do segundo fator (enrolado/ativo) |
+| POST | `/totp/enroll` · `/confirm` · `/disable` | Cadastrar (gera segredo + URI `otpauth://`), confirmar com código, desativar (exige código). Usado como step-up para regras de supressão |
 
 ### Scans e Resultados
 | Método | Endpoint | Descrição |
@@ -525,7 +527,8 @@ Documentação interativa em **`/apidocs`** (Swagger UI). Todos os endpoints exi
 |--------|----------|-----------|
 | GET | `/api/alerts` | Alertas de um scan com estado de triagem |
 | POST | `/api/alerts/<id>/triage` *(analyst)* | Atualizar triagem (treina o classificador FP) |
-| GET / POST / DELETE | `/api/suppression-rules[...]` | CRUD de regras de supressão |
+| GET | `/api/suppression-rules` | Listar regras de supressão |
+| POST · POST `/<id>/enabled` · DELETE | `/api/suppression-rules[...]` *(admin + step-up TOTP)* | Criar / (re)ativar / remover regra. Filtra por origem/destino (IP ou CIDR) + categoria/título. Supressão **esconde, não apaga**: o alerta continua registrado como "sem risco". Criar/reativar exige código TOTP; reativar e criar disparam notificação fora-de-banda |
 | GET / DELETE | `/api/fp-signatures[...]` | Assinaturas de FP aprendidas |
 | GET / POST / DELETE | `/api/webhooks[...]` · `/test` | CRUD de webhooks + teste de conectividade |
 
@@ -544,6 +547,7 @@ Documentação interativa em **`/apidocs`** (Swagger UI). Todos os endpoints exi
 | POST | `/api/admin/purge` *(admin)* | Purgar scans/partições por retenção |
 | GET | `/api/admin/partitions` *(admin)* | Listar partições de alertas |
 | GET | `/api/audit-log` *(analyst)* | Log de auditoria |
+| GET | `/api/audit-log/verify` *(admin)* | Verificar a cadeia de hash tamper-evident do log (detecta linhas apagadas/editadas) |
 | GET / POST | `/api/settings` | Carregar/salvar configurações |
 | GET / POST / DELETE | `/api/ip-names[...]` · `/export` · `/import` | CRUD de nomes de IP |
 | GET | `/api/ip-evolution/<ip>` | Evolução do IP entre scans |

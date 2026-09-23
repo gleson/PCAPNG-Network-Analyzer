@@ -205,3 +205,115 @@ def auth_change_password():
     audit_event(action='change_own_password', target_type='user',
                 target_id=current_user.user_id)
     return jsonify({"success": True})
+
+
+# ============================================================
+#  TOTP second factor (Google Authenticator etc.)
+# ============================================================
+#
+# Enrollment is two-step so we only enable the factor once the user has
+# proven their app is generating correct codes:
+#   1. POST /totp/enroll  -> mint a secret (pending), return the otpauth URI
+#   2. POST /totp/confirm -> user submits a code; on success we flip enabled
+# Step-up for suppression-rule creation then requires an enabled factor.
+
+@auth_bp.route('/totp/status', methods=['GET'])
+def auth_totp_status():
+    """
+    Report whether the current user has TOTP enrolled/enabled.
+    ---
+    tags: [Auth]
+    """
+    if not current_user.is_authenticated:
+        return jsonify({"success": False, "error": "not authenticated"}), 401
+    rec = db.get_user_totp(current_user.user_id) or {}
+    return jsonify({
+        "success": True,
+        "enabled": bool(rec.get("enabled")),
+        "pending": bool(rec.get("secret") and not rec.get("enabled")),
+    })
+
+
+@auth_bp.route('/totp/enroll', methods=['POST'])
+def auth_totp_enroll():
+    """
+    Begin TOTP enrollment: mint a fresh secret (pending) and return the
+    otpauth:// provisioning URI to render as a QR code. Not active until
+    confirmed. Re-enrolling replaces any pending/active secret.
+    ---
+    tags: [Auth]
+    """
+    if not current_user.is_authenticated:
+        return jsonify({"success": False, "error": "not authenticated"}), 401
+    import totp
+    secret = totp.generate_secret()
+    db.set_user_totp_secret(current_user.user_id, secret)
+    uri = totp.provisioning_uri(secret, current_user.username)
+    audit_event(action='totp_enroll_start', target_type='user',
+                target_id=current_user.user_id)
+    return jsonify({
+        "success": True,
+        "secret": secret,
+        "otpauth_uri": uri,
+    })
+
+
+@auth_bp.route('/totp/confirm', methods=['POST'])
+def auth_totp_confirm():
+    """
+    Confirm TOTP enrollment by submitting a current code. Enables the factor.
+    ---
+    tags: [Auth]
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code: {type: string}
+    """
+    if not current_user.is_authenticated:
+        return jsonify({"success": False, "error": "not authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    rec = db.get_user_totp(current_user.user_id) or {}
+    if not rec.get("secret"):
+        return jsonify({"success": False, "error": "no pending enrollment"}), 400
+    import totp
+    if not totp.verify(rec["secret"], data.get("code")):
+        return jsonify({"success": False, "error": "invalid code"}), 403
+    db.enable_user_totp(current_user.user_id)
+    audit_event(action='totp_enroll_confirm', target_type='user',
+                target_id=current_user.user_id)
+    return jsonify({"success": True})
+
+
+@auth_bp.route('/totp/disable', methods=['POST'])
+def auth_totp_disable():
+    """
+    Disable TOTP. Requires a valid current code (so a hijacked session cannot
+    strip the factor without the device).
+    ---
+    tags: [Auth]
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code: {type: string}
+    """
+    if not current_user.is_authenticated:
+        return jsonify({"success": False, "error": "not authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    rec = db.get_user_totp(current_user.user_id) or {}
+    if not rec.get("enabled") or not rec.get("secret"):
+        return jsonify({"success": False, "error": "totp not enabled"}), 400
+    import totp
+    if not totp.verify(rec["secret"], data.get("code")):
+        return jsonify({"success": False, "error": "invalid code"}), 403
+    db.clear_user_totp(current_user.user_id)
+    audit_event(action='totp_disable', target_type='user',
+                target_id=current_user.user_id)
+    return jsonify({"success": True})

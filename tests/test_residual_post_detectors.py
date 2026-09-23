@@ -89,16 +89,17 @@ def test_ip_literal_sni_is_suspicious(analyze):
     results = analyze([_ch_packet(sni="45.33.32.156")])
     hits = find_alerts(results, title="Suspicious TLS SNI", category="tls")
     assert hits
-    assert hits[0]["severity"] == "high"
+    # A lone IP-literal reason is medium; DGA or stacked reasons go high.
+    assert hits[0]["severity"] == "medium"
     assert hits[0]["details"]["sni"] == "45.33.32.156"
-    assert any("IP literal" in r for r in hits[0]["details"]["reasons"])
+    assert any("literal de IP" in r for r in hits[0]["details"]["reasons"])
 
 
-def test_client_hello_without_sni_to_external_is_medium(analyze):
+def test_client_hello_without_sni_to_external_is_low(analyze):
     results = analyze([_ch_packet(sni=None)])
     hits = find_alerts(results, title="TLS ClientHello Without SNI", category="tls")
     assert hits
-    assert hits[0]["severity"] == "medium"
+    assert hits[0]["severity"] == "low"
     assert hits[0]["details"]["dst"] == EXTERNAL_IP
 
 
@@ -117,7 +118,7 @@ def test_encrypted_client_hello_fires(analyze):
     results = analyze([_ch_packet(sni="cloudflare-ech.com", ech=True)])
     hits = find_alerts(results, title="Encrypted Client Hello", category="tls")
     assert hits
-    assert hits[0]["severity"] == "medium"
+    assert hits[0]["severity"] == "low"
     assert hits[0]["details"]["dst"] == EXTERNAL_IP
 
 

@@ -4,6 +4,7 @@ Manages PostgreSQL database for storing scan history, IP names and geolocation
 """
 
 import calendar
+import hashlib
 import threading
 import psycopg2
 import psycopg2.extras
@@ -12,7 +13,7 @@ import json
 import os
 import shutil
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from contextlib import contextmanager
 import ipaddress
 
@@ -188,6 +189,12 @@ def init_database():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_suppression_enabled ON suppression_rules(enabled)')
+        # Later additions (idempotent) — the base table above predates
+        # destination-side matching and rule attribution. CREATE TABLE IF NOT
+        # EXISTS never adds columns to an existing table, so migrate here.
+        cursor.execute('ALTER TABLE suppression_rules ADD COLUMN IF NOT EXISTS dst_ip TEXT')
+        cursor.execute('ALTER TABLE suppression_rules ADD COLUMN IF NOT EXISTS dst_cidr TEXT')
+        cursor.execute('ALTER TABLE suppression_rules ADD COLUMN IF NOT EXISTS created_by TEXT')
 
         # Learned false-positive signatures. Every time an analyst marks an
         # alert as 'falso_positivo' we record a signature of that alert here.
@@ -234,6 +241,13 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_log_occurred ON audit_log(occurred_at DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id)')
+        # Tamper-evident hash chain (idempotent). Each row commits to the row
+        # before it: row_hash = sha256(prev_hash || canonical(this row)). An
+        # attacker with DB access who deletes or edits the row that recorded
+        # their suppression-rule creation breaks the chain at that point, which
+        # verify_audit_chain() detects. See write_audit / verify_audit_chain.
+        cursor.execute('ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT')
+        cursor.execute('ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS row_hash TEXT')
 
         # Outbound notification endpoints (Slack/Teams webhooks, generic
         # HTTP POST, Syslog CEF, SMTP). One row per channel; we filter
@@ -269,6 +283,12 @@ def init_database():
                 must_change_password BOOLEAN NOT NULL DEFAULT FALSE
             )
         ''')
+        # TOTP second factor (idempotent). totp_secret holds the base32 seed;
+        # totp_enabled flips to TRUE only after the user proves possession by
+        # entering a valid code during enrollment. A pending (secret set,
+        # enabled FALSE) enrollment is never accepted for step-up.
+        cursor.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT')
+        cursor.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE')
 
         # Table for protocol stats per scan
         cursor.execute('''
@@ -630,9 +650,13 @@ def save_scan(results, filename):
         # without N round-trips to the DB.
         suppression_rules = []
         suppression_hits = {}
+        # High-severity alerts that a rule hid this scan — surfaced out-of-band
+        # after commit so silencing an important alert is itself loud.
+        suppressed_high = []
         try:
             cursor.execute('''
-                SELECT id, title_pattern, category, src_ip, src_cidr
+                SELECT id, title_pattern, category, src_ip, src_cidr,
+                       dst_ip, dst_cidr
                 FROM suppression_rules WHERE enabled = TRUE
             ''')
             suppression_rules = [dict(r) for r in cursor.fetchall()]
@@ -666,6 +690,14 @@ def save_scan(results, filename):
                 if matched_rule is not None:
                     triage_status = 'sem_risco'
                     suppression_hits[matched_rule] = suppression_hits.get(matched_rule, 0) + 1
+                    if (alert.get('severity') or '').lower() in ('high', 'critical'):
+                        suppressed_high.append({
+                            'rule_id': matched_rule,
+                            'severity': alert.get('severity'),
+                            'category': alert.get('category'),
+                            'title': alert.get('title'),
+                            'ip': alert.get('ip'),
+                        })
             if triage_status == 'analisar' and fp_signatures:
                 matched_sig = evaluate_fp_signatures(alert, fp_signatures)
                 if matched_sig is not None:
@@ -777,6 +809,19 @@ def save_scan(results, filename):
             increment_suppression_hits(suppression_hits)
     except Exception as e:
         print(f"[database] suppression hit-count update failed: {e}")
+
+    # Out-of-band alarm: a suppression rule just hid one or more high/critical
+    # alerts on this scan. Fanned out to the configured webhooks on a daemon
+    # thread so the act of hiding is announced through a channel an intruder on
+    # the host does not control. Lazy import avoids an import-time cycle
+    # (notifications imports database at module load).
+    try:
+        if suppressed_high:
+            import notifications
+            notifications.dispatch_suppression_events(
+                scan_id, summary.get('filename') or filename, suppressed_high)
+    except Exception as e:
+        print(f"[database] suppression notification failed: {e}")
 
     try:
         if fp_signature_hits:
@@ -1547,6 +1592,62 @@ def update_user_role(user_id, role):
         return cursor.rowcount > 0
 
 
+# ---- TOTP second factor ------------------------------------------------
+
+def get_user_totp(user_id):
+    """Return {'secret': str|None, 'enabled': bool} for the user, or None.
+
+    Kept separate from get_user_by_id so the secret never rides along on the
+    ambient user object that flows into templates / responses.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT totp_secret, totp_enabled FROM users WHERE id = %s',
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {'secret': row['totp_secret'], 'enabled': bool(row['totp_enabled'])}
+
+
+def set_user_totp_secret(user_id, secret):
+    """Store a pending (not-yet-confirmed) TOTP secret; leaves enabled FALSE."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE users SET totp_secret = %s, totp_enabled = FALSE WHERE id = %s',
+            (secret, user_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def enable_user_totp(user_id):
+    """Flip totp_enabled TRUE once the user proved possession of the secret."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE users SET totp_enabled = TRUE WHERE id = %s AND totp_secret IS NOT NULL',
+            (user_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def clear_user_totp(user_id):
+    """Remove the secret and disable TOTP (re-enrollment starts fresh)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE users SET totp_secret = NULL, totp_enabled = FALSE WHERE id = %s',
+            (user_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def update_user_enabled(user_id, enabled):
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -1586,37 +1687,133 @@ def _serialize_user(row):
 #  Audit log
 # ============================================================
 
+# Genesis link for the first hashed row and any row whose predecessor predates
+# the hash chain (legacy NULL row_hash).
+_AUDIT_GENESIS = 'GENESIS'
+# Arbitrary but fixed advisory-lock key so concurrent audit writes serialise
+# on the chain tail instead of both reading the same prev_hash and forking it.
+_AUDIT_LOCK_KEY = 738492
+
+
+def _audit_occurred_iso(value):
+    """Canonical UTC isoformat for an occurred_at value.
+
+    The hash is computed over this exact string on write and recomputed from
+    the DB value on verify, so both sides MUST normalise identically. TIMESTAMPTZ
+    round-trips as a tz-aware datetime whose offset may differ from what we
+    wrote (session tz), so we pin everything to UTC. Naive values (shouldn't
+    happen for a TIMESTAMPTZ column) are assumed UTC.
+    """
+    if hasattr(value, 'astimezone'):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return value
+
+
+def _audit_row_hash(prev_hash, occurred_at_iso, user_id, actor_ip, method,
+                    path, action, target_type, target_id, status_code, extra_json):
+    """Deterministic sha256 over the canonical serialisation of a row + the
+    hash of the row before it. Recomputed byte-for-byte by verify_audit_chain,
+    so field order / formatting here is part of the on-disk contract."""
+    payload = json.dumps([
+        prev_hash, occurred_at_iso, user_id, actor_ip, method, path, action,
+        target_type, target_id, status_code, extra_json,
+    ], ensure_ascii=False, separators=(',', ':'), sort_keys=False)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
 def write_audit(method, path, status_code, action=None, target_type=None,
                 target_id=None, user_id=None, actor_ip=None, extra=None):
     """
-    Insert an audit record. Designed to be called from a Flask after_request
-    hook, so it must not raise: any failure is logged and swallowed.
+    Insert an audit record, linked into the tamper-evident hash chain.
+
+    Designed to be called from a Flask after_request hook, so it must not
+    raise: any failure is logged and swallowed. A transaction-scoped advisory
+    lock serialises concurrent writers so each row links the true chain tail.
     """
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
+            # Serialise chain appends; the lock auto-releases at COMMIT.
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', (_AUDIT_LOCK_KEY,))
+            cursor.execute(
+                'SELECT row_hash FROM audit_log '
+                'WHERE row_hash IS NOT NULL ORDER BY id DESC LIMIT 1'
+            )
+            prev_row = cursor.fetchone()
+            prev_hash = (prev_row['row_hash'] if prev_row else None) or _AUDIT_GENESIS
+
+            occurred_dt = datetime.now(timezone.utc)
+            occurred_at_iso = _audit_occurred_iso(occurred_dt)
+            target_id_str = str(target_id) if target_id is not None else None
+            extra_json = json.dumps(extra) if extra is not None else None
+            row_hash = _audit_row_hash(
+                prev_hash, occurred_at_iso, user_id, actor_ip, method, path,
+                action, target_type, target_id_str, status_code, extra_json,
+            )
+
             cursor.execute(
                 '''
                 INSERT INTO audit_log (
-                    user_id, actor_ip, method, path, action,
-                    target_type, target_id, status_code, extra
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    occurred_at, user_id, actor_ip, method, path, action,
+                    target_type, target_id, status_code, extra,
+                    prev_hash, row_hash
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''',
                 (
-                    user_id,
-                    actor_ip,
-                    method,
-                    path,
-                    action,
-                    target_type,
-                    str(target_id) if target_id is not None else None,
-                    status_code,
-                    json.dumps(extra) if extra is not None else None,
+                    occurred_dt, user_id, actor_ip, method, path, action,
+                    target_type, target_id_str, status_code, extra_json,
+                    prev_hash, row_hash,
                 ),
             )
             conn.commit()
     except Exception as e:
         print(f"[audit] write failed: {e}")
+
+
+def verify_audit_chain(limit=None):
+    """Recompute the hash chain over hashed audit rows and report tampering.
+
+    Only rows with a non-null row_hash participate (rows written before the
+    chain migration are legacy and unverifiable). Returns a dict:
+
+        {ok: bool, checked: int, first_broken_id: int|None, reason: str|None}
+
+    A broken link means a hashed row was deleted, edited, or reordered after
+    the fact — exactly the trace an intruder would try to erase.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        q = ('SELECT id, occurred_at, user_id, actor_ip, method, path, action, '
+             'target_type, target_id, status_code, extra, prev_hash, row_hash '
+             'FROM audit_log WHERE row_hash IS NOT NULL ORDER BY id ASC')
+        if limit:
+            q += f' LIMIT {int(limit)}'
+        cursor.execute(q)
+        rows = cursor.fetchall()
+
+    expected_prev = _AUDIT_GENESIS
+    checked = 0
+    for row in rows:
+        d = dict(row)
+        occurred_iso = _audit_occurred_iso(d.get('occurred_at'))
+        if d.get('prev_hash') != expected_prev:
+            return {'ok': False, 'checked': checked, 'first_broken_id': d['id'],
+                    'reason': 'prev_hash does not match preceding row_hash '
+                              '(row deleted, reordered, or inserted)'}
+        recomputed = _audit_row_hash(
+            d.get('prev_hash'), occurred_iso, d.get('user_id'), d.get('actor_ip'),
+            d.get('method'), d.get('path'), d.get('action'), d.get('target_type'),
+            d.get('target_id'), d.get('status_code'), d.get('extra'),
+        )
+        if recomputed != d.get('row_hash'):
+            return {'ok': False, 'checked': checked, 'first_broken_id': d['id'],
+                    'reason': 'row_hash mismatch (row contents were modified)'}
+        expected_prev = d['row_hash']
+        checked += 1
+
+    return {'ok': True, 'checked': checked, 'first_broken_id': None, 'reason': None}
 
 
 VALID_WEBHOOK_TYPES = {'slack', 'teams', 'generic', 'syslog', 'email'}
@@ -1757,12 +1954,61 @@ def list_audit_log(limit=200, action=None, target_type=None, target_id=None,
 #  Suppression rules
 # ============================================================
 
+# Scope guardrails: reject suppression rules broad enough to hide a whole
+# swathe of traffic (the tool an intruder would reach for). A rule must pin at
+# least one specific endpoint, and any CIDR must be no broader than these
+# prefix lengths — /0-style "match the entire Internet" rules are refused.
+_MIN_SUPPRESSION_PREFIX = {4: 8, 6: 16}
+
+# Curated set of alert categories the detectors emit. Seeds the suppression-rule
+# category picker on a fresh install (before any scan has run); the live
+# get_alert_categories() unions this with the DISTINCT categories actually
+# present so operator/custom categories also appear.
+KNOWN_ALERT_CATEGORIES = (
+    'anomaly', 'arp', 'beaconing', 'behavioral', 'brute_force', 'c2', 'dns',
+    'exfil', 'exfiltration', 'exposure', 'first-seen', 'http', 'ics',
+    'imported-zeek', 'incident', 'lateral', 'mac', 'malware-download', 'port',
+    'protocol', 'scan', 'smb', 'threat-intel', 'tls', 'tunneling', 'user-rule',
+    'yara-match',
+)
+
+
+def get_alert_categories():
+    """Sorted union of curated known categories and those present in the
+    alerts table — used to populate the suppression-rule category picker."""
+    cats = set(KNOWN_ALERT_CATEGORIES)
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT category FROM alerts "
+                "WHERE category IS NOT NULL AND category <> ''"
+            )
+            for row in cursor.fetchall():
+                cats.add(row['category'])
+    except Exception as e:
+        print(f"[database] alert category fetch failed: {e}")
+    return sorted(cats)
+
+
+def _validate_suppression_cidr(cidr):
+    """Parse a CIDR and enforce the breadth floor. Returns the normalised net."""
+    net = ipaddress.ip_network(cidr, strict=False)
+    floor = _MIN_SUPPRESSION_PREFIX[net.version]
+    if net.prefixlen < floor:
+        raise ValueError(
+            f"CIDR {cidr} is too broad to suppress on "
+            f"(minimum /{floor} for IPv{net.version}); scope it to a smaller range")
+    return net
+
+
 def get_active_suppression_rules():
     """Return list of enabled rules. Cheap; called once per save_scan."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, title_pattern, category, src_ip, src_cidr, reason, hit_count
+            SELECT id, title_pattern, category, src_ip, src_cidr,
+                   dst_ip, dst_cidr, reason, hit_count
             FROM suppression_rules
             WHERE enabled = TRUE
         ''')
@@ -1774,7 +2020,8 @@ def list_suppression_rules():
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, title_pattern, category, src_ip, src_cidr, reason,
+            SELECT id, title_pattern, category, src_ip, src_cidr,
+                   dst_ip, dst_cidr, reason, created_by,
                    enabled, hit_count, created_at
             FROM suppression_rules
             ORDER BY created_at DESC
@@ -1789,21 +2036,37 @@ def list_suppression_rules():
 
 
 def create_suppression_rule(title_pattern=None, category=None, src_ip=None,
-                            src_cidr=None, reason=None, enabled=True):
-    """Insert a new rule. At least one of the match fields must be set."""
-    if not any([title_pattern, category, src_ip, src_cidr]):
-        raise ValueError("at least one of title_pattern, category, src_ip, src_cidr must be set")
-    if src_cidr:
-        # Validate CIDR upfront so bad input fails at create time, not match time
-        ipaddress.ip_network(src_cidr, strict=False)
+                            src_cidr=None, dst_ip=None, dst_cidr=None,
+                            reason=None, enabled=True, created_by=None):
+    """Insert a new rule.
+
+    Guardrails (see _MIN_SUPPRESSION_PREFIX): a rule must constrain at least
+    one specific endpoint — a category-only or title-only rule would silence
+    that class network-wide, so it is refused. CIDRs are validated and breadth-
+    capped up front so bad or over-broad input fails at create time.
+    """
+    has_endpoint = any([src_ip, src_cidr, dst_ip, dst_cidr])
+    if not has_endpoint:
+        raise ValueError(
+            "a suppression rule must pin at least one endpoint "
+            "(src_ip, src_cidr, dst_ip or dst_cidr); "
+            "category/title alone would suppress that class network-wide")
+    for scalar in (src_ip, dst_ip):
+        if scalar:
+            ipaddress.ip_address(scalar)  # raises ValueError on garbage
+    for cidr in (src_cidr, dst_cidr):
+        if cidr:
+            _validate_suppression_cidr(cidr)
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO suppression_rules
-                (title_pattern, category, src_ip, src_cidr, reason, enabled)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (title_pattern, category, src_ip, src_cidr, dst_ip, dst_cidr,
+                 reason, enabled, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id, created_at
-        ''', (title_pattern, category, src_ip, src_cidr, reason, bool(enabled)))
+        ''', (title_pattern, category, src_ip, src_cidr, dst_ip, dst_cidr,
+              reason, bool(enabled), created_by))
         row = cursor.fetchone()
         conn.commit()
         d = dict(row)
@@ -1832,36 +2095,76 @@ def set_suppression_rule_enabled(rule_id, enabled):
         return cursor.rowcount > 0
 
 
+def _alert_side_ips(alert, side):
+    """Canonical endpoint IPs for one side of an alert.
+
+    Prefers the top-level src_ips/dst_ips that alert_schema.normalize_alerts
+    populates from every detector field variant. Falls back to legacy keys for
+    alerts that never went through normalization (e.g. re-evaluated old blobs).
+    """
+    key = 'src_ips' if side == 'src' else 'dst_ips'
+    ips = [ip for ip in (alert.get(key) or []) if isinstance(ip, str)]
+    if ips:
+        return ips
+    details = alert.get('details') or {}
+    if side == 'src':
+        fallback = alert.get('ip') or details.get('src') or details.get('src_ip')
+    else:
+        fallback = details.get('dst') or details.get('dst_ip')
+    return [fallback] if isinstance(fallback, str) and fallback else []
+
+
+def _ip_matches(candidate_ips, exact, cidr):
+    """True if any candidate IP satisfies the (exact, cidr) constraint pair.
+
+    Both constraints are ANDed when present. An empty candidate list can never
+    satisfy a set constraint — a rule that pins an endpoint the alert doesn't
+    carry must NOT match (fail closed), so it can't silence unrelated alerts.
+    """
+    if exact:
+        if not any(ip == exact for ip in candidate_ips):
+            return False
+    if cidr:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return False
+        matched = False
+        for ip in candidate_ips:
+            try:
+                if ipaddress.ip_address(ip) in net:
+                    matched = True
+                    break
+            except ValueError:
+                continue
+        if not matched:
+            return False
+    return True
+
+
 def _alert_matches_rule(alert, rule):
     """
     Match an alert against a suppression rule. Non-null rule fields must all
     match (AND); null rule fields are wildcards. Returns bool.
     """
-    title = alert.get('title') or ''
-    category = alert.get('category') or ''
-    ip = alert.get('ip') or (alert.get('details') or {}).get('src')
-
     pat = rule.get('title_pattern')
-    if pat:
+    if pat and pat not in (alert.get('title') or ''):
         # Substring match (case-sensitive). Simple, predictable.
-        if pat not in title:
-            return False
+        return False
     cat = rule.get('category')
-    if cat and cat != category:
+    if cat and cat != (alert.get('category') or ''):
         return False
-    rip = rule.get('src_ip')
-    if rip and rip != ip:
+
+    src_exact, src_cidr = rule.get('src_ip'), rule.get('src_cidr')
+    if (src_exact or src_cidr) and not _ip_matches(
+            _alert_side_ips(alert, 'src'), src_exact, src_cidr):
         return False
-    cidr = rule.get('src_cidr')
-    if cidr and ip:
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-            if ipaddress.ip_address(ip) not in net:
-                return False
-        except ValueError:
-            return False
-    elif cidr and not ip:
+
+    dst_exact, dst_cidr = rule.get('dst_ip'), rule.get('dst_cidr')
+    if (dst_exact or dst_cidr) and not _ip_matches(
+            _alert_side_ips(alert, 'dst'), dst_exact, dst_cidr):
         return False
+
     return True
 
 

@@ -34,6 +34,8 @@ from datetime import datetime
 from scapy.all import PcapReader
 
 from . import constants as _constants
+
+_CGNAT_NET = ipaddress.ip_network('100.64.0.0/10')
 from .pkt_view import (  # noqa: F401
     PktView,
     extract_pkt_view as _extract_pkt_view,
@@ -719,12 +721,26 @@ class PCAPAnalyzer:
 
     @staticmethod
     def _is_local_ip(ip_str):
-        """True if ip_str is a private/RFC1918 address."""
+        """True if ip_str is NOT a public, internet-routable unicast address.
+
+        Besides RFC1918/ULA (`is_private`) this covers multicast (mDNS
+        224.0.0.251, SSDP 239.255.255.250, IPTV), link-local, loopback,
+        unspecified, reserved and CGNAT/shared 100.64/10 (Tailscale, carrier
+        NAT). `is_private` alone classified multicast as *external*, so a
+        host chattering SSDP/mDNS for hours looked like a slow local→internet
+        upload with an infinite out/in ratio (sustained-exfil false positive)
+        and multicast groups were sent to threat-intel lookups."""
         try:
             ip = ipaddress.ip_address(ip_str)
-            return ip.is_private
-        except ValueError:
+        except (ValueError, TypeError):
             return False
+        if ip.is_private or ip.is_multicast or ip.is_link_local \
+                or ip.is_loopback or ip.is_unspecified or ip.is_reserved:
+            return True
+        # CGNAT / shared address space (RFC 6598). `ipaddress` has no public
+        # predicate for it (is_private is False, and there is no is_shared
+        # attribute -- a getattr() fallback silently returned False).
+        return ip.version == 4 and ip in _CGNAT_NET
 
     def _hostname_index(self):
         """Lazy map external_server_ip -> set(hostnames) from TLS SNI and HTTP
@@ -752,6 +768,11 @@ class PCAPAnalyzer:
             dst = req.get('dst')
             if host and dst:
                 idx.setdefault(dst, set()).add(host)
+        # DNS answers (DnsResolutionAggregator) name destinations reached over
+        # QUIC/SMB/raw TCP, where there is no SNI or Host header to read.
+        for ip, names in (getattr(self, '_dns_ip_names', None) or {}).items():
+            if names:
+                idx.setdefault(ip, set()).update(names)
         self._hostname_idx_cache = idx
         return idx
 

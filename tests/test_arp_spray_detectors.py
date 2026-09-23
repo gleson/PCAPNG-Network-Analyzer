@@ -25,18 +25,78 @@ def _arp_request(psrc, hwsrc, pdst):
 
 # --- ARP spoofing ----------------------------------------------------------
 
-def test_arp_mac_change_is_critical(analyze):
-    # Same IP announced first with MAC_A, then MAC_B -> MITM.
+def test_single_arp_mac_change_is_medium_not_spoofing(analyze):
+    # One clean A->B change is what DHCP reassignment / NIC swap look like:
+    # reported, but not as a critical MITM.
     packets = [
         _arp_reply("10.0.0.50", MAC_A),
         _arp_reply("10.0.0.50", MAC_B),
     ]
     results = analyze(packets)
+    assert not has_alert(results, title="ARP Spoofing Detected")
+    hits = find_alerts(results, title="ARP IP-to-MAC Change", category="arp")
+    assert hits
+    assert hits[0]["severity"] == "medium"
+    assert hits[0]["details"]["old_mac"] == MAC_A
+    assert hits[0]["details"]["new_mac"] == MAC_B
+
+
+def test_arp_flip_flop_is_critical(analyze):
+    # Legit owner and attacker keep answering: A -> B -> A -> B.
+    t = 1_000_000.0
+    packets = []
+    for i, mac in enumerate([MAC_A, MAC_B, MAC_A, MAC_B]):
+        pk = _arp_reply("10.0.0.50", mac)
+        pk.time = t + i * 10
+        packets.append(pk)
+    results = analyze(packets)
     hits = find_alerts(results, title="ARP Spoofing Detected", category="arp")
     assert hits
     assert hits[0]["severity"] == "critical"
-    assert hits[0]["details"]["old_mac"] == MAC_A
-    assert hits[0]["details"]["new_mac"] == MAC_B
+    assert hits[0]["details"]["flip_flop"] is True
+
+
+def test_arp_aggressive_reannounce_is_critical(analyze):
+    # arpspoof-style: the new MAC re-claims the IP every 2s after taking it.
+    t = 1_000_000.0
+    first = _arp_reply("10.0.0.1", MAC_A)
+    first.time = t
+    packets = [first]
+    for i in range(6):
+        pk = _arp_reply("10.0.0.1", MAC_B, pdst="10.0.0.9")
+        pk.time = t + 5 + i * 2
+        packets.append(pk)
+    results = analyze(packets)
+    hits = find_alerts(results, title="ARP Spoofing Detected", category="arp")
+    assert hits
+    assert hits[0]["severity"] == "critical"
+    assert hits[0]["details"]["max_claims_in_window"] >= 5
+
+
+def test_arp_new_mac_keeping_its_own_ip_is_critical(analyze):
+    # Attacker MAC_B owns 10.0.0.66 and ALSO starts answering for .50.
+    t = 1_000_000.0
+    seq = [("10.0.0.66", MAC_B), ("10.0.0.50", MAC_A),
+           ("10.0.0.50", MAC_B), ("10.0.0.66", MAC_B)]
+    packets = []
+    for i, (ip, mac) in enumerate(seq):
+        pk = _arp_reply(ip, mac, pdst="10.0.0.9")
+        pk.time = t + i * 20
+        packets.append(pk)
+    results = analyze(packets)
+    hits = find_alerts(results, title="ARP Spoofing Detected", category="arp")
+    assert hits
+    assert "10.0.0.66" in hits[0]["details"]["new_mac_other_ips"]
+
+
+def test_single_gateway_mac_change_is_high(analyze):
+    packets = [
+        _arp_reply("10.0.0.1", MAC_A, pdst="10.0.0.9"),
+        _arp_reply("10.0.0.1", MAC_B, pdst="10.0.0.9"),
+    ]
+    results = analyze(packets)
+    hits = find_alerts(results, title="ARP IP-to-MAC Change", category="arp")
+    assert hits and hits[0]["severity"] == "high"
 
 
 def test_stable_arp_does_not_fire(analyze):
@@ -74,7 +134,7 @@ def test_arp_mac_change_via_requests_is_detected(analyze):
         _arp_request("10.0.0.50", MAC_B, pdst="10.0.0.9"),
     ]
     results = analyze(packets)
-    assert has_alert(results, title="ARP Spoofing Detected")
+    assert has_alert(results, title="ARP IP-to-MAC Change")
 
 
 def test_acd_probe_does_not_poison_mac_state(analyze):
@@ -88,6 +148,20 @@ def test_acd_probe_does_not_poison_mac_state(analyze):
     ]
     results = analyze(packets)
     assert not has_alert(results, title="ARP Spoofing Detected")
+    assert not has_alert(results, title="ARP IP-to-MAC Change")
+
+
+def test_sparse_gratuitous_arps_over_long_capture_do_not_flood(analyze):
+    # A host re-announcing itself once every 10 min (DHCP renew / wake) is
+    # normal; the flood counter is windowed, not lifetime.
+    t = 1_000_000.0
+    packets = []
+    for i in range(8):
+        pk = _arp_reply("10.0.0.77", MAC_A, pdst="10.0.0.77")
+        pk.time = t + i * 600
+        packets.append(pk)
+    results = analyze(packets)
+    assert not has_alert(results, title="Gratuitous ARP Flood")
 
 
 # --- Password spraying -----------------------------------------------------

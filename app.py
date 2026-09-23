@@ -41,12 +41,19 @@ def create_app():
 
     # ---- Config -----------------------------------------------------------
     app.config['UPLOAD_FOLDER'] = common.UPLOAD_FOLDER
-    # Hard cap on any request body. Uploads legitimately need to be large
-    # (multi-GB PCAPs) so the cap is generous; every non-upload endpoint is
-    # held to a much smaller limit by _limit_request_body() below. `None`
-    # (unlimited) would let a single request exhaust the container's memory.
-    app.config['MAX_CONTENT_LENGTH'] = int(
-        os.environ.get('MAX_UPLOAD_BYTES', 10 * 1024 ** 3))  # 10 GiB default
+    # Global request-body cap. Uploads legitimately need to be large — PCAPs of
+    # several GB are routine and some exceed any fixed ceiling — so the default
+    # is UNLIMITED: werkzeug streams multipart file parts to spooled temp files
+    # on disk, so an unbounded upload does not balloon memory. Every *non*-upload
+    # endpoint is still held to SMALL_BODY_LIMIT by _limit_request_body() below,
+    # which does not depend on this value, so removing the cap here does not open
+    # up JSON endpoints to memory-exhaustion. Set MAX_UPLOAD_BYTES to a positive
+    # integer to re-impose a hard ceiling; leave it empty/0 for no limit.
+    _raw_upload_cap = (os.environ.get('MAX_UPLOAD_BYTES') or '').strip()
+    if _raw_upload_cap and _raw_upload_cap not in ('0', 'none', 'unlimited'):
+        app.config['MAX_CONTENT_LENGTH'] = int(_raw_upload_cap)
+    else:
+        app.config['MAX_CONTENT_LENGTH'] = None  # no limit
     app.config['ALLOWED_EXTENSIONS'] = common.ALLOWED_EXTENSIONS
 
     # ---- Auth + RBAC ------------------------------------------------------

@@ -645,6 +645,28 @@ code {
     font-size: 0.8rem;
 }
 
+/* ---- Alertas agrupados em acordeões (por título) ---- */
+.alert-group .accordion-header {
+    /* O cabeçalho é um flex-container: botão de expandir + "Ações do grupo".
+       Sem o wrapper <h2> padrão do Bootstrap, garantimos o alinhamento. */
+    gap: 0.25rem;
+}
+.alert-group .accordion-button {
+    font-weight: 500;
+}
+.alert-group .accordion-button .alert-group-title {
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+/* O chevron do Bootstrap fica à direita; empurramos os badges para antes dele. */
+.alert-group .accordion-button::after {
+    margin-left: 0.5rem;
+}
+/* Dentro do corpo do acordeão o último cartão não precisa de margem extra. */
+.alert-group .accordion-body .alert-item:last-child {
+    margin-bottom: 0;
+}
+
 /* ==================== BUTTONS ==================== */
 
 .btn {

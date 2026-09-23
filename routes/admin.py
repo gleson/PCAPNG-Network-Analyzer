@@ -253,3 +253,24 @@ def get_audit_log():
         return jsonify({"success": True, "entries": rows, "count": len(rows)})
     except Exception as e:
         return server_error(e)
+
+
+@admin_bp.route('/api/audit-log/verify', methods=['GET'])
+@role_required('admin')
+def verify_audit_log_chain():
+    """
+    Verify the tamper-evident hash chain over the audit log. A non-ok result
+    with first_broken_id means a hashed row was deleted, edited, or reordered
+    after it was written — e.g. an attempt to erase the record of a
+    suppression rule being created.
+    ---
+    tags: [Admin]
+    """
+    try:
+        result = db.verify_audit_chain()
+        audit_event(action='verify_audit_chain', target_type='audit_log',
+                    extra={'ok': result.get('ok'),
+                           'checked': result.get('checked')})
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return server_error(e)

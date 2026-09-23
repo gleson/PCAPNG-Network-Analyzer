@@ -176,10 +176,10 @@ def detect_anomalous_flows(packets, settings=None):
             "category": "anomaly",
             "title": "Anomalous Flow (Isolation Forest)",
             "description": (
-                f"Flow {src} -> {dst}:{dport}/{proto} is statistically distinct "
-                f"from the rest of the capture "
-                f"(score {score:.3f}, {pkt_count} pkts, {byte_count} bytes, "
-                f"duration {duration:.1f}s)"
+                f"O fluxo {src} -> {dst}:{dport}/{proto} é estatisticamente "
+                f"distinto do restante da captura "
+                f"(score {score:.3f}, {pkt_count} pacotes, {byte_count} bytes, "
+                f"duração {duration:.1f}s)"
             ),
             "ip": src,
             "details": {
@@ -197,11 +197,12 @@ def detect_anomalous_flows(packets, settings=None):
                 "std_inter_arrival_seconds": round(std_iat, 4),
             },
             "recommendation": (
-                "This flow is an outlier in the unsupervised statistical model. "
-                "Use this as a triage hint, not a verdict — investigate the "
-                "src/dst pair and confirm whether the deviation has a benign "
-                "explanation (large transfer, long-lived session) or signals "
-                "covert activity (low-and-slow exfil, beacon over uncommon port)."
+                "Este fluxo é um outlier no modelo estatístico não "
+                "supervisionado. Use isso como uma dica de triagem, não como "
+                "veredito — investigue o par origem/destino e confirme se o "
+                "desvio tem uma explicação benigna (transferência grande, "
+                "sessão de longa duração) ou sinaliza atividade oculta (exfil "
+                "lenta e discreta, beacon por porta incomum)."
             ),
             "timestamp": now,
         })

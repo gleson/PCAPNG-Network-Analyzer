@@ -32,8 +32,10 @@ except Exception:
     _ScapyLLMNRResp = None  # type: ignore
 try:
     from scapy.layers.netbios import NBNSHeader as _ScapyNBNS
+    from scapy.layers.netbios import NBNSQueryResponse as _ScapyNBNSResp
 except Exception:
     _ScapyNBNS = None  # type: ignore
+    _ScapyNBNSResp = None  # type: ignore
 
 # Kerberos over TCP/88: scapy dissects the 4-byte RFC4120 length prefix into
 # KerberosTCPHeader and (often) the whole ASN.1 message into a Kerberos layer,
@@ -129,7 +131,10 @@ class _TCPLayerView:
     # window/opt_names are populated only for pure-SYN packets (scan probes)
     # — that's all the nmap-fingerprint heuristic needs, and extracting them
     # per-packet on multi-million-packet captures would waste memory.
-    __slots__ = ('sport', 'dport', 'flags', 'window', 'opt_names')
+    # plen = TCP payload length from the IP/TCP headers. Raw is absent when
+    # scapy dissects the payload (SMB2, NetBIOS, ...), so byte accounting
+    # based on Raw silently read 0 for those protocols.
+    __slots__ = ('sport', 'dport', 'flags', 'window', 'opt_names', 'plen')
 
 
 class _UDPLayerView:
@@ -190,7 +195,10 @@ class _NameResponseView:
     ``RESPONSE``/``ANCOUNT``. Both are mapped onto ``qr``/``ancount`` here so
     the detector reads one shape.
     """
-    __slots__ = ('qr', 'ancount')
+    # qname: the name being answered (lowercased str, '' when unknown). A
+    # host answering only for its OWN name is normal; Responder answers for
+    # whatever anyone asks.
+    __slots__ = ('qr', 'ancount', 'qname')
 
 
 class _Smb2CreateView:
@@ -236,6 +244,25 @@ class PktView:
 
     def haslayer(self, layer_cls):
         return layer_cls in self._layers
+
+
+def _tcp_payload_len(pkt, t):
+    """TCP payload bytes from header arithmetic (no payload re-serialising).
+    Falls back to the dissected payload length when the IP length field is
+    unusable (0 on TSO/offloaded captures)."""
+    try:
+        doff = int(t.dataofs or 5) * 4
+        if IP in pkt:
+            ip = pkt[IP]
+            if ip.len:
+                return max(0, int(ip.len) - int(ip.ihl or 5) * 4 - doff)
+        elif IPv6 in pkt:
+            v6 = pkt[IPv6]
+            if v6.plen and v6.nh == 6:
+                return max(0, int(v6.plen) - doff)
+        return len(t.payload)
+    except Exception:
+        return None
 
 
 def extract_pkt_view(pkt):
@@ -300,6 +327,7 @@ def extract_pkt_view(pkt):
             layer.flags = int(t.flags) if t.flags is not None else 0
             layer.window = None
             layer.opt_names = None
+            layer.plen = _tcp_payload_len(pkt, t)
             # Pure SYN (scan probe): keep window + option names so the
             # port-scan detector can fingerprint nmap. The scapy attributes
             # were lost in the PktView migration, silently killing the
@@ -523,6 +551,18 @@ def extract_pkt_view(pkt):
             layer = _NameResponseView()
             layer.qr = int(llmnr.qr) if llmnr.qr is not None else 0
             layer.ancount = int(llmnr.ancount) if llmnr.ancount is not None else 0
+            layer.qname = ''
+            try:
+                qd = llmnr.qd
+                if isinstance(qd, (list, tuple)):
+                    qd = qd[0] if qd else None
+                if qd is not None:
+                    nm = qd.qname
+                    if isinstance(nm, bytes):
+                        nm = nm.decode('utf-8', errors='ignore')
+                    layer.qname = (nm or '').strip().rstrip('.').lower()
+            except Exception:
+                pass
             view._layers[_ScapyLLMNRResp] = layer
         except Exception:
             pass
@@ -533,6 +573,15 @@ def extract_pkt_view(pkt):
             layer = _NameResponseView()
             layer.qr = int(nb.RESPONSE) if nb.RESPONSE is not None else 0
             layer.ancount = int(nb.ANCOUNT) if nb.ANCOUNT is not None else 0
+            layer.qname = ''
+            try:
+                if _ScapyNBNSResp is not None and _ScapyNBNSResp in pkt:
+                    nm = pkt[_ScapyNBNSResp].RR_NAME
+                    if isinstance(nm, bytes):
+                        nm = nm.decode('ascii', errors='ignore')
+                    layer.qname = (nm or '').strip().lower()
+            except Exception:
+                pass
             view._layers[_ScapyNBNS] = layer
         except Exception:
             pass

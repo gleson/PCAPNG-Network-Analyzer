@@ -73,11 +73,46 @@ def test_certificate_cn_sni_mismatch_fires():
     assert hits[0]["details"]["cn"] == "*.msedge.net"
 
 
-def test_valid_external_cert_not_self_signed_alert():
-    # The cert is a real CA-signed leaf -> no self-signed / expired noise.
-    results, _ = _run_file()
+def _restamped_fixture(tmp_path, epoch):
+    """Copy of the fixture with every packet stamped at `epoch` — validity is
+    judged against the capture time, so tests pin it explicitly instead of
+    depending on the wall clock (the old assertion time-bombed on
+    2026-08-31, when the real *.msedge.net leaf expired)."""
+    from scapy.all import wrpcap
+    pkts = rdpcap(FIXTURE)
+    for i, p in enumerate(pkts):
+        p.time = epoch + i * 0.2
+    out = tmp_path / "tls12_restamped.pcap"
+    wrpcap(str(out), pkts)
+    return str(out)
+
+
+def _leaf_validity():
+    from datetime import datetime
+    _, analyzer = _run_file()
+    leaf = analyzer._tls_info["certificates"][0]["chain"][0]
+    nb = datetime.fromisoformat(leaf["not_before"].replace("Z", "+00:00"))
+    na = datetime.fromisoformat(leaf["not_after"].replace("Z", "+00:00"))
+    return nb.timestamp(), na.timestamp()
+
+
+def test_valid_external_cert_not_self_signed_alert(tmp_path):
+    # The cert is a real CA-signed leaf, captured INSIDE its validity window
+    # -> no self-signed / expired noise, whatever today's date is.
+    nb, na = _leaf_validity()
+    path = _restamped_fixture(tmp_path, (nb + na) / 2)
+    results = PCAPAnalyzer(path, {}).analyze()
     assert not has_alert(results, title="Self-Signed")
     assert not has_alert(results, title="Invalid TLS Certificate Validity")
+
+
+def test_cert_expired_at_capture_time_fires(tmp_path):
+    nb, na = _leaf_validity()
+    path = _restamped_fixture(tmp_path, na + 86400 * 30)
+    results = PCAPAnalyzer(path, {}).analyze()
+    hits = find_alerts(results, title="Invalid TLS Certificate Validity")
+    assert hits
+    assert "expirou" in hits[0]["description"]
 
 
 def test_cert_wildcard_matches_exactly_one_label():
@@ -136,6 +171,9 @@ def test_obsolete_tls10_fires(analyze):
     assert hits
     assert "TLS 1.0" in hits[0]["title"]
     assert hits[0]["details"]["version_raw"] == 0x0301
+    # Only the client offered it (no ServerHello in the capture) -> low.
+    assert hits[0]["details"]["server_confirmed"] is False
+    assert hits[0]["severity"] == "low"
 
 
 def test_tls12_handshake_not_flagged_obsolete():

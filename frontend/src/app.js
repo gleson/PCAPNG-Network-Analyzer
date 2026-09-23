@@ -31,8 +31,19 @@ let _carvedFilter = 'all';
 
 // Filtros ativos da aba de Alertas (severidade x categoria de triagem x selo SOC)
 let _alertSeverityFilter = 'all';
-let _alertStatusFilter = 'all';
+// Por padrão a lista mostra só 'analisar': alertas EXCLUÍDOS — suprimidos por
+// regra ou já triados (Sem Risco / Falso Positivo / Resolvido) — ficam OCULTOS
+// e não poluem a visão, coerente com o contador (que também conta só
+// 'analisar'). Não são apagados: o botão "Todas", "Somente excluídos" ou o
+// atalho "Exibir excluídos" os revela de novo, preservando a auditabilidade do
+// modelo "excluir = esconder, nunca apagar".
+// O filtro aceita: 'all', 'analisar', 'falso_positivo', 'resolvido',
+// 'sem_risco' e 'excluidos' (todos os que não estão em 'analisar').
+let _alertStatusFilter = 'analisar';
 let _alertSocFilter = 'all';
+// Atalho dentro da visão 'analisar': quando true, os excluídos também aparecem
+// (equivale a alternar rapidamente para "Todas" sem trocar de categoria).
+let _alertShowExcluded = false;
 
 // Categorias de triagem de alertas. 'analisar' é o padrão — todo alerta chega
 // nessa categoria. 'falso_positivo' é marcado pelo analista e treina o
@@ -111,6 +122,19 @@ $(document).ready(function() {
     $('#clear-analysis-btn').on('click', clearAnalysis);
     $('button[data-bs-target="#settings"]').on('shown.bs.tab', loadSocIps);
 
+    // Event listeners - Supressão + segundo fator (TOTP)
+    $('#add-suppression-btn').on('click', addSuppressionRule);
+    $('#totp-enroll-btn').on('click', totpEnroll);
+    $('#totp-confirm-btn').on('click', totpConfirmEnroll);
+    $('#totp-disable-btn').on('click', totpDisable);
+    $('#totp-stepup-confirm').on('click', _submitTotpStepUp);
+    $('#totp-stepup-code').on('keydown', e => { if (e.key === 'Enter') _submitTotpStepUp(); });
+    $('button[data-bs-target="#settings"]').on('shown.bs.tab', function() {
+        loadSuppressionRules();
+        loadSuppressionCategories();
+        loadTotpStatus();
+    });
+
     // Event listeners - Filtros de alertas (severidade)
     $('[data-filter]').on('click', function() {
         _alertSeverityFilter = $(this).data('filter');
@@ -122,6 +146,9 @@ $(document).ready(function() {
     // Event listeners - Filtros de alertas (categoria de triagem)
     $('[data-status-filter]').on('click', function() {
         _alertStatusFilter = $(this).data('status-filter');
+        // Trocar de categoria zera o atalho "exibir excluídos" — ele só faz
+        // sentido enquanto se está na visão padrão 'analisar'.
+        _alertShowExcluded = false;
         $('[data-status-filter]').removeClass('active');
         $(this).addClass('active');
         applyAlertFilters();
@@ -132,6 +159,13 @@ $(document).ready(function() {
         _alertSocFilter = $(this).data('soc-filter');
         $('[data-soc-filter]').removeClass('active');
         $(this).addClass('active');
+        applyAlertFilters();
+    });
+
+    // Alternar a exibição dos excluídos dentro da visão 'analisar'. Ao
+    // contrário do link antigo (que só revelava), este botão exibe E oculta.
+    $('#alerts-toggle-excluded').on('click', function() {
+        _alertShowExcluded = !_alertShowExcluded;
         applyAlertFilters();
     });
 
@@ -1114,6 +1148,21 @@ function renderIPs(data) {
             `<span class="text-success">${escapeHtml(ip.name)}</span>` :
             '<span class="text-muted">-</span>';
 
+        // MAC(s) de origem observados para este IP. Fica pesquisável na busca
+        // do DataTable, permitindo localizar o IP a partir de um MAC visto em
+        // outro lugar (ex.: num alerta de ARP).
+        const macs = Array.isArray(ip.macs) ? ip.macs : [];
+        let macCell;
+        if (macs.length === 0) {
+            macCell = '<span class="text-muted">-</span>';
+        } else {
+            const first = `<code>${escHtml(macs[0])}</code>`;
+            const extra = macs.length > 1
+                ? ` <span class="badge bg-light text-dark" title="${escHtml(macs.join(', '))}">+${macs.length - 1}</span>`
+                : '';
+            macCell = first + extra;
+        }
+
         const deviceType = ip.device_type || 'Computador';
         const deviceBadge = deviceTypeBadge(deviceType);
 
@@ -1167,6 +1216,7 @@ function renderIPs(data) {
             <tr>
                 <td><code>${ipEsc}</code></td>
                 <td>${nameCell}</td>
+                <td>${macCell}</td>
                 <td>${deviceBadge}</td>
                 <td>${groupCell}</td>
                 <td>${typeLabel}</td>
@@ -1194,7 +1244,7 @@ function renderIPs(data) {
     });
 
     ipsDataTable = $('#ips-table').DataTable({
-        order: [[7, 'desc']],  // Sort by risk score by default
+        order: [[8, 'desc']],  // Sort by risk score by default (col shifted by MAC)
         pageLength: 25,
         language: {
             url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/pt-BR.json'
@@ -1678,6 +1728,121 @@ function renderAlertEndpointsCompact(alert) {
     return `<br><small>${srcText}Destino: ${dstText}</small>`;
 }
 
+// Rank de severidade para escolher a "pior" de um grupo de alertas.
+const _SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+
+function _worstSeverity(alerts) {
+    let worst = 'low';
+    let rank = -1;
+    (alerts || []).forEach(a => {
+        const r = _SEVERITY_RANK[a.severity] ?? 0;
+        if (r > rank) { rank = r; worst = a.severity || 'low'; }
+    });
+    return worst;
+}
+
+// Constrói o HTML do cartão de um alerta individual (corpo do acordeão).
+function _buildAlertCardHtml(alert) {
+    const severityClass = getSeverityClass(alert.severity);
+    const severityIcon = getSeverityIcon(alert.severity);
+    const status = triageStatusOf(alert);
+    const statusMeta = TRIAGE_STATUSES[status] || TRIAGE_STATUSES.analisar;
+
+    const hasId = alert.id !== undefined && alert.id !== null;
+    const dropdownItems = Object.entries(TRIAGE_STATUSES).map(([key, meta]) =>
+        `<li><a class="dropdown-item${key === status ? ' active' : ''}" href="#"
+                onclick="changeAlertTriage(${alert.id}, '${key}', this); return false;">
+            ${escHtml(meta.label)}
+        </a></li>`
+    ).join('');
+    const triageControl = hasId ? `
+        <div class="alert-triage ms-2">
+            <div class="dropdown">
+                <button class="btn btn-sm dropdown-toggle triage-btn ${statusMeta.btn}"
+                        type="button" data-bs-toggle="dropdown" aria-expanded="false"
+                        title="Alterar categoria do alerta">
+                    ${escHtml(statusMeta.label)}
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end shadow-sm">${dropdownItems}</ul>
+            </div>
+        </div>
+    ` : `
+        <div class="alert-triage ms-2">
+            <button class="btn btn-sm triage-btn ${statusMeta.btn}" disabled
+                    title="Salve o scan para classificar">
+                ${escHtml(statusMeta.label)}
+            </button>
+        </div>
+    `;
+
+    // MITRE block: only render if the URL looks like a safe http(s) link.
+    // Defends against `javascript:` / `data:` payloads that would smuggle
+    // XSS through the href attribute even if the rest is escaped.
+    let mitreBlock = '';
+    if (alert.mitre_attack) {
+        const ma = alert.mitre_attack;
+        const safeUrl = /^https?:\/\//i.test(ma.url || '') ? ma.url : '';
+        const hrefAttr = safeUrl ? ` href="${escHtml(safeUrl)}"` : '';
+        mitreBlock = `<p class="mb-1"><strong>MITRE ATT&CK:</strong> ` +
+            `<a${hrefAttr} target="_blank" rel="noopener noreferrer"><code>${escHtml(ma.technique_id || '')}</code></a> ` +
+            `${escHtml(ma.technique_name || '')} ` +
+            `<span class="badge bg-secondary">${escHtml(ma.tactic_name || '')}</span></p>`;
+    }
+
+    const sevTag = String(alert.severity || '').toUpperCase();
+    // ID rastreável do alerta. Permite localizar e referir-se ao mesmo
+    // alerta (ex.: "alerta #1234"). Só existe depois que o scan é salvo.
+    const idBadge = hasId
+        ? `<span class="badge bg-dark alert-id-badge" title="ID do alerta — use para rastrear e se referir a ele">#${escHtml(String(alert.id))}</span>`
+        : '';
+    // SOC badge: anotação puramente informativa. Indica que a origem ou
+    // destino do alerta cai num range cadastrado em Configurações > IPs do SOC.
+    // Não altera severidade nem triagem — o analista decide.
+    let socBadge = '';
+    const socAttr = alert.soc_match ? 'soc' : 'none';
+    if (alert.soc_match) {
+        const sm = alert.soc_match;
+        const sideTxt = sm.side === 'src' ? 'origem'
+                      : sm.side === 'dst' ? 'destino'
+                      : 'origem e destino';
+        const title = `SOC: IP de ${sideTxt} está em ${sm.cidr}` +
+                      (sm.description ? ` (${sm.description})` : '');
+        socBadge = `<span class="badge bg-primary ms-1" title="${escHtml(title)}">SOC</span>`;
+    }
+    const mergedCount = Number(alert.merged_count || 0);
+    const mergedBadge = mergedCount > 1
+        ? `<span class="badge bg-secondary ms-1" title="${escHtml(`${mergedCount} alertas idênticos consolidados`)}">×${mergedCount}</span>`
+        : '';
+    return `
+        <div class="alert-item alert alert-${severityClass}" data-severity="${escHtml(alert.severity || '')}" data-triage="${escHtml(status)}" data-soc="${socAttr}" data-alert-id="${hasId ? escHtml(String(alert.id)) : ''}">
+            <div class="d-flex justify-content-between align-items-start">
+                <div class="flex-grow-1">
+                    <h6>
+                        <i class="${severityIcon}"></i>
+                        ${idBadge}
+                        ${escHtml(alert.title)}
+                        <span class="badge bg-${severityClass}">${escHtml(sevTag)}</span>
+                        ${socBadge}
+                        ${mergedBadge}
+                    </h6>
+                    <p class="mb-1">${escHtml(alert.description)}</p>
+                    ${renderAlertEndpoints(alert)}
+                    <p class="mb-1"><strong>Categoria:</strong> ${escHtml(alert.category || '')}</p>
+                    ${mitreBlock}
+                    ${alert.filename ? `<p class="mb-1"><small class="text-muted">Arquivo: ${escHtml(alert.filename)}</small></p>` : ''}
+                    <p class="mb-2"><em>${escHtml(alert.recommendation || '')}</em></p>
+                    ${renderAlertDetails(alert.details)}
+                </div>
+                ${triageControl}
+            </div>
+        </div>
+    `;
+}
+
+// Renderiza a aba de Alertas como acordeões agrupados por título. Todos os
+// grupos começam FECHADOS; clicar no cabeçalho de um título expande só ele.
+// Cada grupo traz um menu "Ações do grupo" para marcar todos os alertas
+// daquele título de uma vez (Resolvido, Falso Positivo, Sem Risco, Analisar).
 function renderAlerts(data) {
     const alerts = data.alerts || [];
     const container = $('#alerts-list');
@@ -1688,106 +1853,122 @@ function renderAlerts(data) {
         return;
     }
 
-    alerts.forEach((alert, index) => {
-        const severityClass = getSeverityClass(alert.severity);
-        const severityIcon = getSeverityIcon(alert.severity);
-        const status = triageStatusOf(alert);
-        const statusMeta = TRIAGE_STATUSES[status] || TRIAGE_STATUSES.analisar;
-
-        const hasId = alert.id !== undefined && alert.id !== null;
-        const dropdownItems = Object.entries(TRIAGE_STATUSES).map(([key, meta]) =>
-            `<li><a class="dropdown-item${key === status ? ' active' : ''}" href="#"
-                    onclick="changeAlertTriage(${alert.id}, '${key}', this); return false;">
-                ${escHtml(meta.label)}
-            </a></li>`
-        ).join('');
-        const triageControl = hasId ? `
-            <div class="alert-triage ms-2">
-                <div class="dropdown">
-                    <button class="btn btn-sm dropdown-toggle triage-btn ${statusMeta.btn}"
-                            type="button" data-bs-toggle="dropdown" aria-expanded="false"
-                            title="Alterar categoria do alerta">
-                        ${escHtml(statusMeta.label)}
-                    </button>
-                    <ul class="dropdown-menu dropdown-menu-end shadow-sm">${dropdownItems}</ul>
-                </div>
-            </div>
-        ` : `
-            <div class="alert-triage ms-2">
-                <button class="btn btn-sm triage-btn ${statusMeta.btn}" disabled
-                        title="Salve o scan para classificar">
-                    ${escHtml(statusMeta.label)}
-                </button>
-            </div>
-        `;
-
-        // MITRE block: only render if the URL looks like a safe http(s) link.
-        // Defends against `javascript:` / `data:` payloads that would smuggle
-        // XSS through the href attribute even if the rest is escaped.
-        let mitreBlock = '';
-        if (alert.mitre_attack) {
-            const ma = alert.mitre_attack;
-            const safeUrl = /^https?:\/\//i.test(ma.url || '') ? ma.url : '';
-            const hrefAttr = safeUrl ? ` href="${escHtml(safeUrl)}"` : '';
-            mitreBlock = `<p class="mb-1"><strong>MITRE ATT&CK:</strong> ` +
-                `<a${hrefAttr} target="_blank" rel="noopener noreferrer"><code>${escHtml(ma.technique_id || '')}</code></a> ` +
-                `${escHtml(ma.technique_name || '')} ` +
-                `<span class="badge bg-secondary">${escHtml(ma.tactic_name || '')}</span></p>`;
-        }
-
-        const sevTag = String(alert.severity || '').toUpperCase();
-        // ID rastreável do alerta. Permite localizar e referir-se ao mesmo
-        // alerta (ex.: "alerta #1234"). Só existe depois que o scan é salvo.
-        const idBadge = hasId
-            ? `<span class="badge bg-dark alert-id-badge" title="ID do alerta — use para rastrear e se referir a ele">#${escHtml(String(alert.id))}</span>`
-            : '';
-        // SOC badge: anotação puramente informativa. Indica que a origem ou
-        // destino do alerta cai num range cadastrado em Configurações > IPs do SOC.
-        // Não altera severidade nem triagem — o analista decide.
-        let socBadge = '';
-        const socAttr = alert.soc_match ? 'soc' : 'none';
-        if (alert.soc_match) {
-            const sm = alert.soc_match;
-            const sideTxt = sm.side === 'src' ? 'origem'
-                          : sm.side === 'dst' ? 'destino'
-                          : 'origem e destino';
-            const title = `SOC: IP de ${sideTxt} está em ${sm.cidr}` +
-                          (sm.description ? ` (${sm.description})` : '');
-            socBadge = `<span class="badge bg-primary ms-1" title="${escHtml(title)}">SOC</span>`;
-        }
-        const mergedCount = Number(alert.merged_count || 0);
-        const mergedBadge = mergedCount > 1
-            ? `<span class="badge bg-secondary ms-1" title="${escHtml(`${mergedCount} alertas idênticos consolidados`)}">×${mergedCount}</span>`
-            : '';
-        const alertHtml = `
-            <div class="alert-item alert alert-${severityClass}" data-severity="${escHtml(alert.severity || '')}" data-triage="${escHtml(status)}" data-soc="${socAttr}" data-alert-id="${hasId ? escHtml(String(alert.id)) : ''}">
-                <div class="d-flex justify-content-between align-items-start">
-                    <div class="flex-grow-1">
-                        <h6>
-                            <i class="${severityIcon}"></i>
-                            ${idBadge}
-                            ${escHtml(alert.title)}
-                            <span class="badge bg-${severityClass}">${escHtml(sevTag)}</span>
-                            ${socBadge}
-                            ${mergedBadge}
-                        </h6>
-                        <p class="mb-1">${escHtml(alert.description)}</p>
-                        ${renderAlertEndpoints(alert)}
-                        <p class="mb-1"><strong>Categoria:</strong> ${escHtml(alert.category || '')}</p>
-                        ${mitreBlock}
-                        ${alert.filename ? `<p class="mb-1"><small class="text-muted">Arquivo: ${escHtml(alert.filename)}</small></p>` : ''}
-                        <p class="mb-2"><em>${escHtml(alert.recommendation || '')}</em></p>
-                        ${renderAlertDetails(alert.details)}
-                    </div>
-                    ${triageControl}
-                </div>
-            </div>
-        `;
-
-        container.append(alertHtml);
+    // Agrupa por título, preservando a ordem de primeira aparição.
+    const groups = new Map();
+    alerts.forEach(alert => {
+        const key = alert.title || '(sem título)';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(alert);
     });
 
+    const accordion = $('<div class="accordion" id="alerts-accordion"></div>');
+    let gi = 0;
+    groups.forEach((groupAlerts, title) => {
+        gi++;
+        const bodyId = `alert-group-body-${gi}`;
+        const worst = _worstSeverity(groupAlerts);
+        const worstClass = getSeverityClass(worst);
+        const worstIcon = getSeverityIcon(worst);
+        const total = groupAlerts.length;
+
+        const cards = groupAlerts.map(_buildAlertCardHtml).join('');
+
+        // Menu de ação em lote — só faz sentido se algum alerta do grupo já
+        // tem ID persistido (scan salvo).
+        const hasPersisted = groupAlerts.some(a => a.id !== undefined && a.id !== null);
+        const bulkMenu = Object.entries(TRIAGE_STATUSES).map(([key, meta]) =>
+            `<li><a class="dropdown-item" href="#"
+                 onclick="bulkTriageGroup(this, '${key}'); return false;">
+                 Marcar todos como ${escHtml(meta.label)}
+             </a></li>`
+        ).join('');
+        const bulkControl = hasPersisted ? `
+            <div class="dropdown alert-group-actions ms-2 flex-shrink-0">
+                <button class="btn btn-sm btn-outline-secondary dropdown-toggle"
+                        type="button" data-bs-toggle="dropdown" aria-expanded="false"
+                        title="Aplicar uma categoria a todos os alertas deste grupo">
+                    Ações do grupo
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end shadow-sm">${bulkMenu}</ul>
+            </div>` : '';
+
+        const item = `
+            <div class="accordion-item alert-group" data-group-key="${escHtml(title)}">
+                <div class="accordion-header d-flex align-items-center pe-2">
+                    <button class="accordion-button collapsed flex-grow-1" type="button"
+                            data-bs-toggle="collapse" data-bs-target="#${bodyId}"
+                            aria-expanded="false" aria-controls="${bodyId}">
+                        <i class="${worstIcon} text-${worstClass} me-2"></i>
+                        <span class="alert-group-title flex-grow-1">${escHtml(title)}</span>
+                        <span class="badge bg-${worstClass} me-2 alert-group-sev">${escHtml(String(worst).toUpperCase())}</span>
+                        <span class="badge bg-secondary alert-group-count me-2" title="Alertas visíveis neste grupo">${total}</span>
+                    </button>
+                    ${bulkControl}
+                </div>
+                <div id="${bodyId}" class="accordion-collapse collapse">
+                    <div class="accordion-body">${cards}</div>
+                </div>
+            </div>`;
+        accordion.append(item);
+    });
+
+    container.append(accordion);
     applyAlertFilters();
+}
+
+// Marca todos os alertas de um grupo (mesmo título) com uma categoria, via
+// uma única requisição em lote. Chamado pelo menu "Ações do grupo".
+function bulkTriageGroup(el, status) {
+    const $group = $(el).closest('.alert-group');
+    const title = $group.attr('data-group-key') || 'grupo';
+
+    // Fecha o dropdown manualmente (o onclick retorna false / preventDefault).
+    const toggleEl = $group.find('.alert-group-actions .dropdown-toggle').get(0);
+    if (toggleEl && window.bootstrap && bootstrap.Dropdown) {
+        const dd = bootstrap.Dropdown.getInstance(toggleEl) || new bootstrap.Dropdown(toggleEl);
+        dd.hide();
+    }
+
+    const ids = [];
+    $group.find('.alert-item[data-alert-id]').each(function() {
+        const id = $(this).attr('data-alert-id');
+        if (id) ids.push(parseInt(id, 10));
+    });
+    if (!ids.length) {
+        showNotify('Nenhum alerta com ID persistido neste grupo.', 'warning');
+        return;
+    }
+
+    const meta = TRIAGE_STATUSES[status] || TRIAGE_STATUSES.analisar;
+    confirmAction({
+        title: `Marcar grupo como ${meta.label}`,
+        message: `Marcar ${ids.length} alerta(s) do grupo "${title}" como ${meta.label}?`,
+        confirmText: 'Marcar',
+        danger: false,
+    }).then(ok => {
+        if (!ok) return;
+        $.ajax({
+            url: '/api/alerts/triage-bulk',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ alert_ids: ids, status: status }),
+            success: (resp) => {
+                const n = (resp && resp.updated) || 0;
+                showNotify(`Concluído: ${n} alerta(s) marcado(s) como ${meta.label}.`, 'success');
+                // Atualiza o estado local e re-renderiza sem recarregar do servidor.
+                if (currentData && Array.isArray(currentData.alerts)) {
+                    const idset = new Set(ids);
+                    currentData.alerts.forEach(a => { if (idset.has(a.id)) a.triage_status = status; });
+                    refreshAlertBadge(currentData.alerts);
+                    renderAlerts(currentData);
+                }
+            },
+            error: (xhr) => {
+                const err = xhr.responseJSON?.error || 'falha ao marcar em lote';
+                showNotify('Erro: ' + err, 'error');
+            },
+        });
+    });
 }
 
 // Persiste a mudança de categoria de um alerta. Marcar como "Falso Positivo"
@@ -1886,25 +2067,71 @@ function renderAlertDetails(details) {
 // Aplica os três filtros independentes da aba de Alertas: severidade,
 // categoria de triagem e selo SOC. Um alerta só aparece se casar com todos.
 function applyAlertFilters() {
+    // Semântica do filtro de categoria em relação ao estado de triagem:
+    //   all        -> tudo
+    //   excluidos  -> só os excluídos (qualquer coisa fora de 'analisar')
+    //   analisar   -> os de analisar; e, se o atalho estiver ligado, também os
+    //                 excluídos (exibir/ocultar sob demanda)
+    //   <outro>    -> casamento exato da categoria
+    const triageMatch = (t) => {
+        if (_alertStatusFilter === 'all') return true;
+        if (_alertStatusFilter === 'excluidos') return t !== 'analisar';
+        if (_alertStatusFilter === 'analisar') {
+            return t === 'analisar' || (_alertShowExcluded && t !== 'analisar');
+        }
+        return t === _alertStatusFilter;
+    };
+
+    // Usa a classe .d-none (não $.toggle/:visible): dentro de um acordeão
+    // FECHADO os cartões contam como não-visíveis, o que quebraria a contagem
+    // por grupo. A classe reflete o casamento com o filtro, independente do
+    // estado de expansão do acordeão.
     $('.alert-item').each(function() {
         const $el = $(this);
         const matchSeverity = _alertSeverityFilter === 'all' ||
             $el.attr('data-severity') === _alertSeverityFilter;
-        const matchStatus = _alertStatusFilter === 'all' ||
-            $el.attr('data-triage') === _alertStatusFilter;
+        const matchStatus = triageMatch($el.attr('data-triage'));
         const matchSoc = _alertSocFilter === 'all' ||
             $el.attr('data-soc') === _alertSocFilter;
-        $el.toggle(matchSeverity && matchStatus && matchSoc);
+        $el.toggleClass('d-none', !(matchSeverity && matchStatus && matchSoc));
     });
+
+    // Esconde grupos sem nenhum alerta que case com os filtros e atualiza o
+    // contador exibido no cabeçalho do acordeão.
+    $('.alert-group').each(function() {
+        const $g = $(this);
+        const visible = $g.find('.alert-item:not(.d-none)').length;
+        $g.find('.alert-group-count').text(visible);
+        $g.toggleClass('d-none', visible === 0);
+    });
+
     // Mostrar o botão "Marcar filtrados como FP" apenas quando o filtro SOC
     // está ativo — fora dele o risco de marcar um alerta legítimo é alto.
     $('#alerts-bulk-fp-btn').toggleClass('d-none', _alertSocFilter !== 'soc');
+
+    // Atalho "Exibir/Ocultar excluídos": só na visão 'analisar' e só quando há
+    // excluídos para revelar/ocultar. Transparência do modelo "excluir =
+    // esconder, nunca apagar": os excluídos nunca somem silenciosamente.
+    const $toggle = $('#alerts-toggle-excluded');
+    const excludedTotal = $('.alert-item').filter(function() {
+        return $(this).attr('data-triage') !== 'analisar';
+    }).length;
+    if (_alertStatusFilter === 'analisar' && excludedTotal > 0) {
+        $toggle.text(_alertShowExcluded
+                        ? `Ocultar excluídos (${excludedTotal})`
+                        : `Exibir excluídos (${excludedTotal})`)
+               .removeClass('d-none');
+    } else {
+        $toggle.addClass('d-none');
+    }
 }
 
 function bulkMarkFilteredAsFP() {
-    // Coleta IDs persistidos (sem ID = scan não salvo) dos alertas visíveis.
+    // Coleta IDs persistidos (sem ID = scan não salvo) dos alertas que casam
+    // com os filtros atuais. Usa :not(.d-none) em vez de :visible, pois os
+    // cartões ficam dentro de acordeões fechados (que não são "visíveis").
     const ids = [];
-    $('.alert-item:visible').each(function() {
+    $('.alert-item:not(.d-none)').each(function() {
         const id = $(this).attr('data-alert-id');
         if (id) ids.push(parseInt(id, 10));
     });
@@ -2540,6 +2767,298 @@ function saveSocDefaultMode() {
             showNotify(xhr.responseJSON?.error || 'Erro ao salvar modo padrão', 'error');
         },
     });
+}
+
+// ==================== REGRAS DE SUPRESSÃO ====================
+
+function loadSuppressionRules() {
+    $.ajax({
+        url: '/api/suppression-rules',
+        type: 'GET',
+        success: function(resp) {
+            if (!resp.success) return;
+            renderSuppressionRules(resp.rules || []);
+        },
+        error: function() {
+            $('#suppression-rules-list').html(
+                '<p class="text-danger small mb-0">Falha ao carregar regras de supressão.</p>');
+        },
+    });
+}
+
+function loadSuppressionCategories() {
+    $.ajax({
+        url: '/api/alert-categories',
+        type: 'GET',
+        success: function(resp) {
+            if (!resp.success) return;
+            const sel = $('#new-supp-category');
+            const current = sel.val();
+            sel.find('option:not([value=""])').remove();
+            (resp.categories || []).forEach(cat => {
+                sel.append(`<option value="${escHtml(cat)}">${escHtml(cat)}</option>`);
+            });
+            sel.val(current || '');
+        },
+    });
+}
+
+function renderSuppressionRules(rows) {
+    const container = $('#suppression-rules-list');
+    container.empty();
+    if (!rows.length) {
+        container.html('<p class="text-muted small mb-0">Nenhuma regra de supressão cadastrada.</p>');
+        return;
+    }
+    rows.forEach(r => {
+        const crit = [];
+        if (r.src_ip)       crit.push(`orig=<code>${escHtml(r.src_ip)}</code>`);
+        if (r.src_cidr)     crit.push(`orig=<code>${escHtml(r.src_cidr)}</code>`);
+        if (r.dst_ip)       crit.push(`dest=<code>${escHtml(r.dst_ip)}</code>`);
+        if (r.dst_cidr)     crit.push(`dest=<code>${escHtml(r.dst_cidr)}</code>`);
+        if (r.category)     crit.push(`cat=<code>${escHtml(r.category)}</code>`);
+        if (r.title_pattern) crit.push(`título~<code>${escHtml(r.title_pattern)}</code>`);
+        const enabled = !!r.enabled;
+        const stateBadge = enabled
+            ? '<span class="badge bg-success">ativa</span>'
+            : '<span class="badge bg-secondary">inativa</span>';
+        const toggleLabel = enabled ? 'Desativar' : 'Reativar';
+        const toggleClass = enabled ? 'btn-outline-secondary' : 'btn-outline-success';
+        container.append(`
+            <div class="d-flex justify-content-between align-items-center mb-2 p-2 border rounded">
+                <div class="small">
+                    ${crit.join(' &middot; ') || '<em>(sem critério)</em>'} ${stateBadge}
+                    <span class="badge bg-light text-dark ms-1">${r.hit_count || 0} hits</span>
+                    <br>
+                    <span class="text-muted">${escHtml(r.reason || '')}</span>
+                    ${r.created_by ? `<span class="text-muted"> — por ${escHtml(r.created_by)}</span>` : ''}
+                </div>
+                <div class="btn-group btn-group-sm ms-2">
+                    <button class="btn ${toggleClass}" onclick="toggleSuppressionRule(${r.id}, ${!enabled})">
+                        ${toggleLabel}
+                    </button>
+                    <button class="btn btn-outline-danger" onclick="deleteSuppressionRule(${r.id})">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </div>
+        `);
+    });
+}
+
+function addSuppressionRule() {
+    const payload = {
+        src_ip:   ($('#new-supp-src-ip').val()   || '').trim() || null,
+        src_cidr: ($('#new-supp-src-cidr').val()  || '').trim() || null,
+        dst_ip:   ($('#new-supp-dst-ip').val()    || '').trim() || null,
+        dst_cidr: ($('#new-supp-dst-cidr').val()  || '').trim() || null,
+        category: ($('#new-supp-category').val()  || '').trim() || null,
+        reason:   ($('#new-supp-reason').val()    || '').trim() || null,
+    };
+    if (!payload.src_ip && !payload.src_cidr && !payload.dst_ip && !payload.dst_cidr) {
+        showNotify('Informe ao menos um endpoint (origem ou destino).', 'warning');
+        return;
+    }
+    showTotpStepUp('Confirme a criação da regra de supressão com o código do 2FA.',
+        function(code, showErr, closeModal) {
+            $.ajax({
+                url: '/api/suppression-rules',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ ...payload, totp_code: code }),
+                success: function() {
+                    closeModal();
+                    ['#new-supp-src-ip', '#new-supp-src-cidr', '#new-supp-dst-ip',
+                     '#new-supp-dst-cidr', '#new-supp-category', '#new-supp-reason']
+                        .forEach(sel => $(sel).val(''));
+                    loadSuppressionRules();
+                    showNotify('Regra de supressão criada.', 'success');
+                },
+                error: function(xhr) {
+                    _handleStepUpError(xhr, showErr, closeModal);
+                },
+            });
+        });
+}
+
+function toggleSuppressionRule(ruleId, enable) {
+    const doToggle = (code, showErr, closeModal) => {
+        $.ajax({
+            url: `/api/suppression-rules/${ruleId}/enabled`,
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ enabled: enable, totp_code: code }),
+            success: function() {
+                if (closeModal) closeModal();
+                loadSuppressionRules();
+                showNotify(enable ? 'Regra reativada.' : 'Regra desativada.', 'success');
+            },
+            error: function(xhr) {
+                if (showErr) _handleStepUpError(xhr, showErr, closeModal);
+                else showNotify(xhr.responseJSON?.error || 'Erro ao alterar regra', 'error');
+            },
+        });
+    };
+    // Re-activating resumes hiding alerts -> requires step-up. Disabling doesn't.
+    if (enable) {
+        showTotpStepUp('Confirme a reativação da regra com o código do 2FA.', doToggle);
+    } else {
+        doToggle(null, null, null);
+    }
+}
+
+function deleteSuppressionRule(ruleId) {
+    confirmAction({
+        title: 'Remover regra de supressão',
+        message: 'Remover esta regra? Alertas que ela escondia voltarão a aparecer em novas análises.',
+        confirmText: 'Remover',
+        danger: true,
+    }).then(ok => {
+        if (!ok) return;
+        $.ajax({
+            url: `/api/suppression-rules/${ruleId}`,
+            type: 'DELETE',
+            success: function() {
+                loadSuppressionRules();
+                showNotify('Regra removida.', 'success');
+            },
+            error: function(xhr) {
+                showNotify(xhr.responseJSON?.error || 'Erro ao remover regra', 'error');
+            },
+        });
+    });
+}
+
+// ==================== SEGUNDO FATOR (TOTP) ====================
+
+let _totpStepUpModal = null;
+let _totpStepUpHandler = null;
+
+function _handleStepUpError(xhr, showErr, closeModal) {
+    const body = xhr.responseJSON || {};
+    if (body.code === 'invalid_totp_code') {
+        showErr('Código inválido. Tente novamente.');
+    } else if (body.code === 'totp_not_enrolled') {
+        if (closeModal) closeModal();
+        showNotify('Cadastre o segundo fator (TOTP) antes de gerenciar regras.', 'warning');
+        loadTotpStatus();
+    } else {
+        if (closeModal) closeModal();
+        showNotify(body.error || 'Erro na operação', 'error');
+    }
+}
+
+function showTotpStepUp(message, onConfirm) {
+    if (!_totpStepUpModal) {
+        _totpStepUpModal = new bootstrap.Modal(document.getElementById('totpStepUpModal'));
+    }
+    $('#totp-stepup-msg').text(message || 'Digite o código do seu autenticador.');
+    $('#totp-stepup-error').addClass('d-none').text('');
+    $('#totp-stepup-code').val('');
+    _totpStepUpHandler = onConfirm;
+    _totpStepUpModal.show();
+    setTimeout(() => $('#totp-stepup-code').trigger('focus'), 300);
+}
+
+function _submitTotpStepUp() {
+    const code = ($('#totp-stepup-code').val() || '').trim();
+    if (!/^\d{6}$/.test(code)) {
+        $('#totp-stepup-error').removeClass('d-none').text('Digite os 6 dígitos.');
+        return;
+    }
+    const showErr = (msg) => {
+        $('#totp-stepup-error').removeClass('d-none').text(msg);
+        $('#totp-stepup-code').val('').trigger('focus');
+    };
+    const closeModal = () => { if (_totpStepUpModal) _totpStepUpModal.hide(); };
+    if (typeof _totpStepUpHandler === 'function') {
+        _totpStepUpHandler(code, showErr, closeModal);
+    }
+}
+
+function loadTotpStatus() {
+    $.ajax({
+        url: '/api/auth/totp/status',
+        type: 'GET',
+        success: function(resp) {
+            if (!resp.success) return;
+            const status = $('#totp-status');
+            if (resp.enabled) {
+                status.html('<span class="badge bg-success"><i class="fas fa-check"></i> Ativo</span>');
+                $('#totp-enroll-btn').addClass('d-none');
+                $('#totp-disable-btn').removeClass('d-none');
+            } else {
+                status.html('<span class="badge bg-warning text-dark">Não configurado</span>');
+                $('#totp-enroll-btn').removeClass('d-none');
+                $('#totp-disable-btn').addClass('d-none');
+            }
+            $('#totp-enroll-area').addClass('d-none');
+        },
+        error: function() {
+            $('#totp-status').html('<span class="badge bg-secondary">indisponível</span>');
+        },
+    });
+}
+
+function totpEnroll() {
+    $.ajax({
+        url: '/api/auth/totp/enroll',
+        type: 'POST',
+        success: function(resp) {
+            if (!resp.success) return;
+            $('#totp-secret').val(resp.secret || '');
+            $('#totp-uri').val(resp.otpauth_uri || '');
+            $('#totp-confirm-code').val('');
+            $('#totp-enroll-area').removeClass('d-none');
+        },
+        error: function(xhr) {
+            showNotify(xhr.responseJSON?.error || 'Erro ao iniciar cadastro do 2FA', 'error');
+        },
+    });
+}
+
+function totpConfirmEnroll() {
+    const code = ($('#totp-confirm-code').val() || '').trim();
+    if (!/^\d{6}$/.test(code)) {
+        showNotify('Digite os 6 dígitos do app.', 'warning');
+        return;
+    }
+    $.ajax({
+        url: '/api/auth/totp/confirm',
+        type: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ code }),
+        success: function() {
+            showNotify('Segundo fator ativado.', 'success');
+            loadTotpStatus();
+        },
+        error: function(xhr) {
+            showNotify(xhr.responseJSON?.error || 'Código inválido', 'error');
+        },
+    });
+}
+
+function totpDisable() {
+    showTotpStepUp('Digite um código atual para desativar o segundo fator.',
+        function(code, showErr, closeModal) {
+            $.ajax({
+                url: '/api/auth/totp/disable',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ code }),
+                success: function() {
+                    closeModal();
+                    showNotify('Segundo fator desativado.', 'success');
+                    loadTotpStatus();
+                },
+                error: function(xhr) {
+                    const body = xhr.responseJSON || {};
+                    if ((body.error || '').toLowerCase().includes('invalid'))
+                        showErr('Código inválido. Tente novamente.');
+                    else { closeModal(); showNotify(body.error || 'Erro', 'error'); }
+                },
+            });
+        });
 }
 
 function clearAnalysis() {
@@ -4308,5 +4827,7 @@ Object.assign(window, {
     deleteTrustedRange,
     // SOC IPs
     deleteSocIp,
+    // Suppression rules (inline onclick targets in the rule list)
+    toggleSuppressionRule, deleteSuppressionRule,
 });
 

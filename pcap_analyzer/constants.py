@@ -338,8 +338,11 @@ FILE_SHARE_HOSTS = (
     'transfer.sh', 'file.io', 'anonfiles.com', 'gofile.io',
     'mega.nz', 'mega.io', 'mediafire.com', 'wetransfer.com', 'we.tl',
     'bashupload.com', 'sendspace.com', 'zippyshare.com', 'krakenfiles.com',
-    'cdn.discordapp.com', 'discord.com',
-    'send.tresorit.com', 'firefox.com', 'send.firefox.com',
+    # discord.com (chat app) and firefox.com (Firefox Sync/accounts) were
+    # dropped: every desktop running those apps matched. cdn.discordapp.com
+    # stays -- it is the attachment host abused for payload staging.
+    'cdn.discordapp.com',
+    'send.tresorit.com', 'send.firefox.com',
 )
 
 # Portas associadas a movimentação lateral em redes Windows/Linux
@@ -744,8 +747,85 @@ def is_sanctioned_bulk_destination(hostnames):
 KNOWN_MALICIOUS_JA4 = {
     # Placeholder-curated from public C2 fingerprint research; tunable.
     't13d190900_9dc949149365_97f8aa674fd9': 'Cobalt Strike (default JA4)',
-    't13d1715h2_5b57614c22b0_93c746dc1a19': 'Sliver C2 (default JA4)',
+    # REMOVED 2026-09: 't13d1715h2_5b57614c22b0_93c746dc1a19' ("Sliver") —
+    # its a_b parts are Firefox's (t13d1715h2_5b57614c22b0), so any Firefox
+    # build whose extension hash matched would page as "Sliver C2".
 }
 KNOWN_MALICIOUS_JA4S = {
-    't130200_1301_a56c5b993250': 'Cobalt Strike (default JA4S)',
+    # REMOVED 2026-09: 't130200_1301_a56c5b993250' ("Cobalt Strike default
+    # JA4S"). a56c5b993250 = sha256("002b,0033")[:12], i.e. a TLS 1.3
+    # ServerHello with only supported_versions + key_share, no ALPN and
+    # TLS_AES_128_GCM_SHA256 — the JA4S of a large share of ALL TLS 1.3
+    # servers. It flagged ordinary servers as C2. Supply verified intel via
+    # settings['known_malicious_ja4s'].
 }
+
+
+# --- Zones that cannot carry attacker-controlled DNS traffic -----------------
+# DNS exfil/tunneling needs the attacker to run the AUTHORITATIVE server of the
+# queried zone. Queries under these zones are answered by the vendor's own
+# infrastructure, so long/random labels there are by design, not a channel:
+#   * reputation lookups (AV/EDR file-hash, URL and IP reputation over DNS,
+#     DNSBL/URIBL used by mail servers, Team Cymru hash registry);
+#   * large provider zones that never delegate sub-names to customers.
+DNS_REPUTATION_LOOKUP_ZONES = (
+    'sophosxl.net', 'sxl.net', 'mcafee.com', 'avqs.mcafee.com',
+    'avts.mcafee.com', 'gti.mcafee.com', 'e5.sk', 'eset.com', 'eset.net',
+    'trendmicro.com', 'trendmicro.net', 'kaspersky-labs.com', 'kaspersky.com',
+    'bitdefender.net', 'bitdefender.com', 'webroot.com', 'brightcloud.com',
+    'hash.cymru.com', 'cymru.com', 'spamhaus.org', 'spamhaus.net',
+    'spamcop.net', 'sorbs.net', 'barracudacentral.org', 'surbl.org',
+    'uribl.com', 'dnswl.org', 'mailspike.net', 'senderscore.com',
+    'abuseat.org', 'mailpolice.com', 'dnsbl.info', 'zen.spamhaus.org',
+    'opendns.com', 'umbrella.com', 'crowdstrike.com', 'sentinelone.net',
+    'symantec.com', 'norton.com', 'avast.com', 'avcdn.net', 'avg.com',
+    'malwarebytes.com', 'f-secure.com', 'fsapi.com', 'paloaltonetworks.com',
+)
+
+DNS_PROVIDER_OWNED_ZONES = (
+    'microsoft.com', 'windows.com', 'windows.net', 'windowsupdate.com',
+    'azure.com', 'azure.net', 'azureedge.net', 'azurefd.net', 'msedge.net',
+    'office.com', 'office.net', 'office365.com', 'live.com', 'msn.com',
+    'bing.com', 'skype.com', 'microsoftonline.com', 'trafficmanager.net',
+    'apple.com', 'icloud.com', 'apple-dns.net', 'mzstatic.com',
+    'google.com', 'googleapis.com', 'gstatic.com', 'googlevideo.com',
+    'googleusercontent.com', 'gvt1.com', 'gvt2.com', 'ggpht.com',
+    'youtube.com', 'ytimg.com', 'doubleclick.net', '1e100.net',
+    'akamai.net', 'akamaiedge.net', 'akamaihd.net', 'akamaized.net',
+    'edgekey.net', 'edgesuite.net', 'akadns.net', 'cloudfront.net',
+    'amazonaws.com', 'amazon.com', 'fastly.net', 'fastlylb.net',
+    'cloudflare.com', 'cloudflare.net', 'facebook.com', 'fbcdn.net',
+    'whatsapp.net', 'instagram.com', 'cdninstagram.com',
+)
+
+# Destinations whose periodic / QUIC / sizeable traffic is expected from
+# ordinary endpoints (OS services, push, telemetry, collaboration). Used to
+# DOWNGRADE (never suppress) beaconing-style and new-QUIC-destination
+# findings: C2 does hide behind big platforms (domain fronting), so the
+# analyst still sees them, one notch lower and annotated.
+KNOWN_BENIGN_SERVICE_SUFFIXES = tuple(sorted(set(
+    SANCTIONED_BULK_DESTINATIONS + DNS_PROVIDER_OWNED_ZONES + (
+        'push.apple.com', 'events.data.microsoft.com',
+        'teams.microsoft.com', 'slack.com', 'slack-edge.com',
+        'zoom.us', 'webex.com', 'spotify.com', 'dropboxapi.com',
+        'mozilla.org', 'mozilla.com', 'mozilla.net', 'firefox.com',
+        'ubuntu.com', 'canonical.com', 'debian.org', 'redhat.com',
+        'fedoraproject.org', 'github.com', 'githubusercontent.com',
+        'docker.io', 'docker.com', 'npmjs.org', 'pypi.org',
+        'linkedin.com', 'twitter.com', 'x.com', 'netflix.com',
+        'nflxvideo.net',
+    )
+)))
+
+
+def hostname_suffix_match(hostnames, suffixes):
+    """Return the first suffix in `suffixes` that equals or is a dot-suffix
+    of any hostname in `hostnames` (case-insensitive), else None."""
+    for h in hostnames or ():
+        if not h:
+            continue
+        h = str(h).lower().strip().rstrip('.')
+        for suffix in suffixes:
+            if h == suffix or h.endswith('.' + suffix):
+                return suffix
+    return None

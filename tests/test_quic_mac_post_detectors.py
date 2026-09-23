@@ -39,7 +39,7 @@ def test_low_volume_quic_does_not_fire(analyze):
 
 # --- IpMacChanges ----------------------------------------------------------
 
-def test_local_ip_with_two_macs_is_high(analyze):
+def test_local_ip_with_two_device_macs_is_medium(analyze):
     packets = [
         Ether(src="aa:bb:cc:00:00:01") / IP(src=LOCAL_IP, dst=EXTERNAL_IP) / TCP(sport=1, dport=80, flags="S"),
         Ether(src="aa:bb:cc:00:00:02") / IP(src=LOCAL_IP, dst=EXTERNAL_IP) / TCP(sport=2, dport=80, flags="S"),
@@ -47,8 +47,28 @@ def test_local_ip_with_two_macs_is_high(analyze):
     results = analyze(packets)
     hits = find_alerts(results, title="IP with Multiple MAC Addresses", category="mac")
     assert hits
-    assert hits[0]["severity"] == "high"
+    assert hits[0]["severity"] == "medium"
     assert hits[0]["details"]["mac_count"] >= 2
+
+
+def test_extra_mac_that_is_a_router_is_low(analyze):
+    # A routed/multi-VLAN capture: LOCAL_IP shows its own MAC and, after
+    # routing, the gateway MAC — which is also the source MAC of many other
+    # IPs. Not spoofing.
+    gw = "aa:bb:cc:00:00:fe"
+    packets = [
+        Ether(src="aa:bb:cc:00:00:01") / IP(src=LOCAL_IP, dst=EXTERNAL_IP) / TCP(sport=1, dport=80, flags="S"),
+        Ether(src=gw) / IP(src=LOCAL_IP, dst=EXTERNAL_IP) / TCP(sport=2, dport=80, flags="S"),
+    ]
+    for i in range(5):
+        packets.append(Ether(src=gw) / IP(src=f"10.9.0.{i + 1}", dst=EXTERNAL_IP)
+                       / TCP(sport=3 + i, dport=80, flags="S"))
+    results = analyze(packets)
+    hits = [a for a in find_alerts(results, title="IP with Multiple MAC Addresses")
+            if a["ip"] == LOCAL_IP]
+    assert hits
+    assert hits[0]["severity"] == "low"
+    assert gw in hits[0]["details"]["gateway_like_macs"]
 
 
 def test_single_mac_does_not_fire(analyze):

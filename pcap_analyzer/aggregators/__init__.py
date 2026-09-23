@@ -276,8 +276,14 @@ class IpStatsAggregator(StreamingAggregator):
         if IPv6 in pkt:
             s['protocols'].add('IPv6')
         if Ether in pkt:
-            s['macs'].add(pkt[Ether].src)
-            d['macs'].add(pkt[Ether].dst)
+            # Só o MAC de ORIGEM identifica o dono do IP: o MAC de destino do
+            # quadro é o próximo salto L2 (frequentemente o gateway, para
+            # tráfego fora do segmento), então associá-lo ao dst_ip só gera
+            # ruído. Guardamos o MAC próprio de quem transmite.
+            src_mac = (pkt[Ether].src or '').lower()
+            if src_mac and src_mac not in ('ff:ff:ff:ff:ff:ff',
+                                           '00:00:00:00:00:00'):
+                s['macs'].add(src_mac)
 
     def finalize(self, results):
         ips_list = [
@@ -291,7 +297,7 @@ class IpStatsAggregator(StreamingAggregator):
                 'protocols': list(data['protocols']),
                 'ports': sorted(list(data['ports']))[:50],
                 'alert_count': 0,
-                'macs': list(data['macs']),
+                'macs': sorted(data['macs']),
             }
             for ip, data in self.ip_stats.items()
         ]
@@ -1378,10 +1384,10 @@ class FlowAnomalyAggregator(StreamingAggregator):
                 'category': 'anomaly',
                 'title': 'Anomalous Flow (Isolation Forest)',
                 'description': (
-                    f'Flow {src} -> {dst}:{dport}/{proto} is statistically '
-                    f'distinct from the rest of the capture (score '
-                    f'{score:.3f}, {pkt_count} pkts, {byte_count} bytes, '
-                    f'duration {duration:.1f}s)'
+                    f'O fluxo {src} -> {dst}:{dport}/{proto} é estatisticamente '
+                    f'distinto do restante da captura (score '
+                    f'{score:.3f}, {pkt_count} pacotes, {byte_count} bytes, '
+                    f'duração {duration:.1f}s)'
                 ),
                 'ip': src,
                 'details': {
@@ -1397,12 +1403,12 @@ class FlowAnomalyAggregator(StreamingAggregator):
                     'std_inter_arrival_seconds': round(std_iat, 4),
                 },
                 'recommendation': (
-                    'This flow is an outlier in the unsupervised statistical '
-                    'model. Use this as a triage hint, not a verdict — '
-                    'investigate the src/dst pair and confirm whether the '
-                    'deviation has a benign explanation (large transfer, '
-                    'long-lived session) or signals covert activity '
-                    '(low-and-slow exfil, beacon over uncommon port).'
+                    'Este fluxo é um outlier no modelo estatístico não '
+                    'supervisionado. Use isso como uma dica de triagem, não '
+                    'como veredito — investigue o par origem/destino e confirme '
+                    'se o desvio tem uma explicação benigna (transferência '
+                    'grande, sessão de longa duração) ou sinaliza atividade '
+                    'oculta (exfil lenta e discreta, beacon por porta incomum).'
                 ),
                 'timestamp': now,
             })
@@ -1551,8 +1557,73 @@ class UserRulesAggregator(StreamingAggregator):
         self.analyzer._user_rules_alerts = alerts
 
 
+class DnsResolutionAggregator(StreamingAggregator):
+    """Map resolved IP -> hostnames from DNS A/AAAA answers in the capture.
+
+    `_hostname_index` (sanctioned-destination downgrade, beaconing/QUIC
+    context) only knew names from TLS SNI and HTTP Host, so destinations
+    reached over QUIC, SMB, raw TCP or ECH stayed anonymous and could never
+    be recognised as e.g. a Microsoft/Google update CDN. The DNS answer that
+    preceded the connection names it. Both the answer owner name (often a
+    CDN CNAME target such as e123.akamaiedge.net) and the original question
+    name are recorded. Bounded: MAX_IPS addresses x MAX_NAMES names.
+    Exposed as ``analyzer._dns_ip_names`` (finalize runs before detectors).
+    """
+    name = 'dns_resolution'
+
+    MAX_IPS = 200_000
+    MAX_NAMES = 8
+
+    def __init__(self, analyzer):
+        super().__init__(analyzer)
+        self.ip_names = {}
+
+    @staticmethod
+    def _norm(name):
+        if isinstance(name, bytes):
+            name = name.decode('utf-8', errors='ignore')
+        return (name or '').strip().rstrip('.').lower()
+
+    def update(self, pkt):
+        if DNS not in pkt:
+            return
+        d = pkt[DNS]
+        if d.qr != 1 or not d.ancount or not d.an:
+            return
+        qname = ''
+        if DNSQR in pkt:
+            try:
+                qname = self._norm(pkt[DNSQR].qname)
+            except Exception:
+                qname = ''
+        for rr in d.an:
+            try:
+                if int(getattr(rr, 'type', 0)) not in (1, 28):
+                    continue
+                rdata = rr.rdata
+                if isinstance(rdata, bytes):
+                    rdata = rdata.decode('utf-8', errors='ignore')
+                ip = str(rdata or '').strip()
+                if not ip:
+                    continue
+                names = self.ip_names.get(ip)
+                if names is None:
+                    if len(self.ip_names) >= self.MAX_IPS:
+                        continue
+                    names = self.ip_names[ip] = set()
+                for n in (self._norm(rr.rrname), qname):
+                    if n and len(names) < self.MAX_NAMES:
+                        names.add(n)
+            except Exception:
+                continue
+
+    def finalize(self, results):  # noqa: ARG002
+        self.analyzer._dns_ip_names = self.ip_names
+
+
 STREAMING_AGGREGATORS = [
     SummaryAggregator,
+    DnsResolutionAggregator,
     MacIpAggregator,
     IpStatsAggregator,
     ProtocolStatsAggregator,

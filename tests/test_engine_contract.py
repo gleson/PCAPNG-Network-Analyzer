@@ -24,7 +24,7 @@ def test_registry_counts():
     detector should fail here, not in production."""
     assert len(STREAMING_DETECTORS) == 34
     assert len(POST_DETECTORS) == 20
-    assert len(STREAMING_AGGREGATORS) == 14
+    assert len(STREAMING_AGGREGATORS) == 15
 
 
 def test_kev_enricher_is_last_post_detector():

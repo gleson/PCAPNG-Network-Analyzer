@@ -395,6 +395,7 @@
                                     <tr>
                                         <th>IP Address</th>
                                         <th>Nome</th>
+                                        <th title="Endereço MAC de origem observado para este IP">MAC</th>
                                         <th>Dispositivo</th>
                                         <th>Grupo</th>
                                         <th>Tipo</th>
@@ -493,11 +494,15 @@
                             </div>
                             <div class="mt-2 d-flex align-items-center flex-wrap gap-2">
                                 <small class="text-muted me-1"><i class="fas fa-tags"></i> Categoria:</small>
-                                <button class="btn btn-sm btn-outline-secondary active" data-status-filter="all">Todas</button>
-                                <button class="btn btn-sm btn-outline-warning" data-status-filter="analisar">Analisar</button>
+                                <button class="btn btn-sm btn-outline-secondary" data-status-filter="all" title="Inclui todos os alertas, inclusive os excluídos (suprimidos por regra ou já triados)">Todas</button>
+                                <button class="btn btn-sm btn-outline-warning active" data-status-filter="analisar">Analisar</button>
                                 <button class="btn btn-sm btn-outline-info" data-status-filter="falso_positivo">Falso Positivo</button>
                                 <button class="btn btn-sm btn-outline-success" data-status-filter="resolvido">Resolvido</button>
                                 <button class="btn btn-sm btn-outline-secondary" data-status-filter="sem_risco">Sem Risco</button>
+                                <button class="btn btn-sm btn-outline-dark" data-status-filter="excluidos" title="Somente os alertas excluídos: suprimidos por regra ou já triados (Falso Positivo, Resolvido, Sem Risco)">Somente excluídos</button>
+                                <button type="button" id="alerts-toggle-excluded"
+                                        class="btn btn-sm btn-link text-muted p-0 ms-1 d-none"
+                                        title="Exibe ou oculta os alertas excluídos dentro da visão 'Analisar'."></button>
                             </div>
                             <div class="mt-2 d-flex align-items-center flex-wrap gap-2">
                                 <small class="text-muted me-1"><i class="fas fa-user-shield"></i> Selo:</small>
@@ -869,6 +874,103 @@
                         </div>
                     </div>
 
+                    <!-- Suppression rules + second factor -->
+                    <div class="row">
+                        <!-- Regras de supressão -->
+                        <div class="col-md-8 mb-3">
+                            <div class="card shadow-sm">
+                                <div class="card-header">
+                                    <i class="fas fa-filter text-primary"></i> Regras de Supressão de Alertas
+                                </div>
+                                <div class="card-body">
+                                    <p class="text-muted small mb-2">
+                                        Silencie falsos-positivos conhecidos por origem, destino e/ou
+                                        categoria. <strong>A supressão esconde, nunca apaga:</strong> o
+                                        alerta continua registrado (marcado como "sem risco") e revisável —
+                                        um adversário não consegue fazer tráfego sumir, só reclassificar
+                                        ruído. Criar/reativar exige <strong>administrador</strong> +
+                                        código do <strong>segundo fator (TOTP)</strong>.
+                                    </p>
+                                    <div id="suppression-rules-list" class="mb-3">
+                                        <!-- Preenchido dinamicamente -->
+                                    </div>
+                                    <hr>
+                                    <h6>Nova regra <small class="text-muted">(ao menos um endpoint é obrigatório)</small></h6>
+                                    <div class="row g-2 mb-2">
+                                        <div class="col-md-6">
+                                            <input type="text" class="form-control form-control-sm" id="new-supp-src-ip"
+                                                   placeholder="IP de origem (ex: 10.0.0.5)">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <input type="text" class="form-control form-control-sm" id="new-supp-src-cidr"
+                                                   placeholder="CIDR de origem (ex: 10.0.0.0/24)">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <input type="text" class="form-control form-control-sm" id="new-supp-dst-ip"
+                                                   placeholder="IP de destino (ex: 10.0.0.9)">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <input type="text" class="form-control form-control-sm" id="new-supp-dst-cidr"
+                                                   placeholder="CIDR de destino (ex: 10.0.1.0/24)">
+                                        </div>
+                                        <div class="col-md-4">
+                                            <select class="form-select form-select-sm" id="new-supp-category">
+                                                <option value="">Categoria: qualquer</option>
+                                            </select>
+                                        </div>
+                                        <div class="col-md-8">
+                                            <input type="text" class="form-control form-control-sm" id="new-supp-reason"
+                                                   placeholder="Motivo / justificativa (recomendado)">
+                                        </div>
+                                    </div>
+                                    <button class="btn btn-sm btn-success" id="add-suppression-btn">
+                                        <i class="fas fa-plus"></i> Adicionar regra
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Segundo fator TOTP -->
+                        <div class="col-md-4 mb-3">
+                            <div class="card shadow-sm">
+                                <div class="card-header">
+                                    <i class="fas fa-mobile-screen text-primary"></i> Segundo Fator (TOTP)
+                                </div>
+                                <div class="card-body">
+                                    <p class="text-muted small mb-2">
+                                        Exigido para confirmar regras de supressão. Use o Google
+                                        Authenticator, Authy ou 1Password.
+                                    </p>
+                                    <div id="totp-status" class="mb-2">
+                                        <span class="badge bg-secondary">verificando…</span>
+                                    </div>
+                                    <button class="btn btn-sm btn-primary d-none" id="totp-enroll-btn">
+                                        <i class="fas fa-qrcode"></i> Cadastrar
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-danger d-none" id="totp-disable-btn">
+                                        <i class="fas fa-ban"></i> Desativar
+                                    </button>
+                                    <div id="totp-enroll-area" class="d-none mt-3">
+                                        <p class="small mb-1">
+                                            Adicione esta chave no app (entrada manual) ou escaneie o URI:
+                                        </p>
+                                        <div class="input-group input-group-sm mb-1">
+                                            <span class="input-group-text">Chave</span>
+                                            <input type="text" class="form-control font-monospace" id="totp-secret" readonly>
+                                        </div>
+                                        <textarea class="form-control form-control-sm font-monospace mb-2" id="totp-uri"
+                                                  rows="2" readonly></textarea>
+                                        <div class="input-group input-group-sm">
+                                            <input type="text" class="form-control" id="totp-confirm-code"
+                                                   inputmode="numeric" maxlength="6" placeholder="Código de 6 dígitos">
+                                            <button class="btn btn-success" id="totp-confirm-btn">Confirmar</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Clear Analysis -->
                     <div class="row">
                         <div class="col-12">
@@ -1106,6 +1208,29 @@
                             </button>
                         </div>
                     </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Step-up TOTP (confirmar ação sensível) -->
+    <div class="modal fade" id="totpStepUpModal" tabindex="-1">
+        <div class="modal-dialog modal-sm modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-shield-halved me-2 text-primary"></i>Confirmar com 2FA</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="small text-muted mb-2" id="totp-stepup-msg">
+                        Digite o código do seu autenticador para confirmar esta ação.
+                    </p>
+                    <div id="totp-stepup-error" class="alert alert-danger d-none py-1 px-2 small" role="alert"></div>
+                    <input type="text" class="form-control text-center fs-4 font-monospace" id="totp-stepup-code"
+                           inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+                    <div class="d-grid mt-3">
+                        <button type="button" class="btn btn-primary" id="totp-stepup-confirm">Confirmar</button>
+                    </div>
                 </div>
             </div>
         </div>

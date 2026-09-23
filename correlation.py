@@ -77,71 +77,74 @@ TITLE = {
 
 RECOMMENDATION = {
     "mac": (
-        "A device with this MAC has never been seen on this network. "
-        "Confirm it is an authorized asset (provisioning, BYOD, vendor) "
-        "before allowing it to remain. Unknown MACs are often the first "
-        "signal of rogue access points, attacker-staged implants, or "
-        "lateral pivots from VPN."
+        "Um dispositivo com este MAC nunca foi visto nesta rede. "
+        "Confirme que é um ativo autorizado (provisionamento, BYOD, "
+        "fornecedor) antes de deixá-lo permanecer. MACs desconhecidos são "
+        "frequentemente o primeiro sinal de access points não autorizados, "
+        "implantes plantados por atacante ou pivôs laterais via VPN."
     ),
     "ja3": (
-        "JA3 fingerprints client TLS stacks (browsers, libraries, malware "
-        "loaders). A previously-unseen JA3 means a new client tool is "
-        "talking to the network. Validate via threat-intel feeds (SSLBL) "
-        "and correlate with the originating host."
+        "O JA3 faz fingerprint de stacks TLS de cliente (navegadores, "
+        "bibliotecas, loaders de malware). Um JA3 nunca visto significa "
+        "que uma nova ferramenta cliente está falando com a rede. Valide "
+        "via feeds de threat-intel (SSLBL) e correlacione com o host de "
+        "origem."
     ),
     "ja3s": (
-        "JA3S fingerprints the server side of TLS. A new JA3S can mean a "
-        "host is connecting to a service it has never reached before, or "
-        "that an existing service was reconfigured."
+        "O JA3S faz fingerprint do lado servidor do TLS. Um novo JA3S pode "
+        "significar que um host está se conectando a um serviço que nunca "
+        "alcançou antes, ou que um serviço existente foi reconfigurado."
     ),
     "sni": (
-        "First observation of this domain via TLS. Cross-check against "
-        "DNS, threat intel (URLhaus, abuse.ch), and the originating host."
+        "Primeira observação deste domínio via TLS. Cruze com DNS, threat "
+        "intel (URLhaus, abuse.ch) e o host de origem."
     ),
     "http_host": (
-        "First observation of this hostname over plaintext HTTP. Confirm "
-        "the host and path are expected; cleartext HTTP to new domains is "
-        "a frequent staging channel for downloaders."
+        "Primeira observação deste hostname sobre HTTP em texto claro. "
+        "Confirme se o host e o caminho são esperados; HTTP em claro para "
+        "domínios novos é um canal frequente de staging de downloaders."
     ),
     "quic_dest": (
-        "First observation of an external host reached over QUIC/HTTP3. "
-        "QUIC bypasses most TCP-level inspection (no SNI, no JA3 by "
-        "default, encrypted handshake). Correlate with DNS resolutions "
-        "from the same client and verify whether the destination is a "
-        "sanctioned service (Google, Cloudflare, Akamai)."
+        "Primeira observação de um host externo alcançado via QUIC/HTTP3. "
+        "O QUIC contorna a maior parte da inspeção em nível de TCP (sem "
+        "SNI, sem JA3 por padrão, handshake criptografado). Correlacione "
+        "com as resoluções DNS do mesmo cliente e verifique se o destino é "
+        "um serviço sancionado (Google, Cloudflare, Akamai)."
     ),
     "ja4": (
-        "JA4 is the modern successor to JA3 — same family of signal "
-        "(client TLS stack identity), but resistant to ClientHello "
-        "shuffling and granular about TLS version / SNI presence / ALPN. "
-        "A new JA4 means a new client tool just appeared. Cross-reference "
-        "with public JA4 databases (FoxIO) and the originating host's "
-        "expected software stack."
+        "O JA4 é o sucessor moderno do JA3 — mesma família de sinal "
+        "(identidade da stack TLS do cliente), mas resistente ao embaralhar "
+        "do ClientHello e granular quanto a versão do TLS / presença de SNI "
+        "/ ALPN. Um novo JA4 significa que uma nova ferramenta cliente "
+        "apareceu. Cruze com bancos públicos de JA4 (FoxIO) e a stack de "
+        "software esperada do host de origem."
     ),
     "ja4s": (
-        "JA4S fingerprints the server's TLS stack. New JA4S can mean a "
-        "host is connecting to a service it never reached before, the "
-        "service was reconfigured, or — worst case — a legitimate "
-        "service is being impersonated by an attacker-controlled endpoint."
+        "O JA4S faz fingerprint da stack TLS do servidor. Um novo JA4S pode "
+        "significar que um host está se conectando a um serviço que nunca "
+        "alcançou antes, que o serviço foi reconfigurado ou — no pior caso "
+        "— que um serviço legítimo está sendo personificado por um endpoint "
+        "controlado por atacante."
     ),
     "ja4h": (
-        "JA4H fingerprints HTTP clients by request shape (method, "
-        "version, header order, cookies). A new JA4H typically signals a "
-        "new HTTP library, scraper, or custom implant beaconing over "
-        "plaintext HTTP. Correlate with User-Agent and Host."
+        "O JA4H faz fingerprint de clientes HTTP pela forma da requisição "
+        "(método, versão, ordem dos cabeçalhos, cookies). Um novo JA4H "
+        "normalmente sinaliza uma nova biblioteca HTTP, scraper ou implante "
+        "customizado fazendo beacon sobre HTTP em claro. Correlacione com "
+        "o User-Agent e o Host."
     ),
     "hassh": (
-        "HASSH fingerprints SSH clients by their KEXINIT algorithm "
-        "preferences. A new HASSH from a host that already had SSH "
-        "activity points to a swapped SSH client (different OpenSSH "
-        "build, scripted client like libssh/paramiko, or attacker "
-        "tooling)."
+        "O HASSH faz fingerprint de clientes SSH por suas preferências de "
+        "algoritmo no KEXINIT. Um novo HASSH de um host que já tinha "
+        "atividade SSH aponta para um cliente SSH trocado (build de OpenSSH "
+        "diferente, cliente por script como libssh/paramiko ou ferramenta "
+        "de atacante)."
     ),
     "hassh_server": (
-        "HASSH-Server fingerprints SSH daemons. New HASSH-Server on an "
-        "IP that was previously a known SSH server suggests the daemon "
-        "was reconfigured, upgraded, or replaced. On an unexpected host, "
-        "it may indicate a rogue listener."
+        "O HASSH-Server faz fingerprint de daemons SSH. Um novo "
+        "HASSH-Server em um IP que antes era um servidor SSH conhecido "
+        "sugere que o daemon foi reconfigurado, atualizado ou substituído. "
+        "Em um host inesperado, pode indicar um listener não autorizado."
     ),
 }
 
@@ -190,7 +193,7 @@ def detect_new_artifacts(results, settings=None):
         cap = int(thresholds.get(f"first_seen_{typ}_max_alerts", DEFAULT_CAPS[typ]))
         for v in sorted(values)[:cap]:
             description = (
-                f"{TITLE[typ]}: {v} (no record across {history} prior scan(s))"
+                f"{TITLE[typ]}: {v} (sem registro em {history} scan(s) anterior(es))"
             )
             alerts_out.append({
                 "severity": SEVERITY[typ],
@@ -270,9 +273,10 @@ CORRELATION_RULES = [
             ]},
         ],
         "recommendation": (
-            "A single host scanned the network and then attempted exploitation. "
-            "Treat as targeted attack: isolate the source, capture full packets "
-            "for forensics, and audit any successful auth from this IP."
+            "Um único host varreu a rede e em seguida tentou exploração. "
+            "Trate como ataque direcionado: isole a origem, capture os pacotes "
+            "completos para forense e audite qualquer autenticação "
+            "bem-sucedida a partir deste IP."
         ),
     },
     {
@@ -286,9 +290,10 @@ CORRELATION_RULES = [
             {"titles": ["Internal Lateral Movement Suspected"]},
         ],
         "recommendation": (
-            "Possible compromise: an attacker exploited a service and is now "
-            "pivoting laterally. Quarantine the source, rotate credentials in "
-            "the affected segment, and review SMB/RDP/WinRM auth logs."
+            "Possível comprometimento: um atacante explorou um serviço e agora "
+            "está pivoteando lateralmente. Coloque a origem em quarentena, "
+            "troque as credenciais do segmento afetado e revise os logs de "
+            "autenticação SMB/RDP/WinRM."
         ),
     },
     {
@@ -309,9 +314,9 @@ CORRELATION_RULES = [
             ]},
         ],
         "recommendation": (
-            "Beacon-then-exfil is the textbook C2 chain. Snapshot the host, "
-            "block the destinations at the perimeter, and assume the device "
-            "is compromised pending forensic review."
+            "Beacon seguido de exfil é a cadeia de C2 clássica. Faça um "
+            "snapshot do host, bloqueie os destinos no perímetro e assuma que "
+            "o dispositivo está comprometido até a análise forense."
         ),
     },
     {
@@ -330,9 +335,10 @@ CORRELATION_RULES = [
             ]},
         ],
         "recommendation": (
-            "DGA-style domain resolution combined with C2 indicators strongly "
-            "suggests an active malware family. Identify the malware via "
-            "JA3/threat-intel, isolate the host, and pull a memory image."
+            "Resolução de domínios no estilo DGA combinada com indicadores de "
+            "C2 sugere fortemente uma família de malware ativa. Identifique o "
+            "malware via JA3/threat-intel, isole o host e colete uma imagem de "
+            "memória."
         ),
     },
     {
@@ -351,10 +357,10 @@ CORRELATION_RULES = [
             {"titles": ["Internal Lateral Movement Suspected", "External IP Accessing SMB"]},
         ],
         "recommendation": (
-            "The same host both poisoned credential responses (or sniffed "
-            "plaintext) and pivoted internally. Treat as confirmed AitM/"
-            "Responder activity. Disable LLMNR/NetBIOS, rotate any creds "
-            "exposed to the segment, and isolate the source."
+            "O mesmo host envenenou respostas de credencial (ou farejou texto "
+            "claro) e pivoteou internamente. Trate como atividade AitM/"
+            "Responder confirmada. Desative LLMNR/NetBIOS, troque quaisquer "
+            "credenciais expostas ao segmento e isole a origem."
         ),
     },
     {
@@ -378,10 +384,10 @@ CORRELATION_RULES = [
             ]},
         ],
         "recommendation": (
-            "A host deviated from its baseline AND showed a suspicious egress "
-            "pattern. Either signal alone is noisy; the combination is a "
-            "high-priority triage candidate. Validate against business changes "
-            "before assuming compromise."
+            "Um host desviou do seu baseline E apresentou um padrão de saída "
+            "suspeito. Cada sinal isolado é ruidoso; a combinação é um "
+            "candidato de triagem de alta prioridade. Valide contra mudanças "
+            "de negócio antes de assumir comprometimento."
         ),
     },
 ]
@@ -580,22 +586,22 @@ def correlate_intra_scan(results, settings=None):
             if peer_domains:
                 peer_bits.append(_join_capped(peer_domains))
             peers_text = ("; ".join(peer_bits) if peer_bits
-                          else "(no external counterpart resolved from constituents)")
+                          else "(nenhuma contraparte externa resolvida a partir dos constituintes)")
 
             if role == "compromised_host":
-                src_label = (f"Compromised host {src} (internal)"
-                             if src_is_internal else f"Compromised host {src}")
+                src_label = (f"Host comprometido {src} (interno)"
+                             if src_is_internal else f"Host comprometido {src}")
                 description = (
-                    f"{src_label} is the VICTIM of kill-chain "
-                    f"'{rule['name']}' — it is acting under attacker control. "
-                    f"The adversary is the external counterpart: {peers_text}. "
-                    f"Constituent detections: " + "; ".join(constituent_titles)
+                    f"{src_label} é a VÍTIMA da kill-chain "
+                    f"'{rule['name']}' — está agindo sob controle do atacante. "
+                    f"O adversário é a contraparte externa: {peers_text}. "
+                    f"Detecções constituintes: " + "; ".join(constituent_titles)
                 )
             else:
                 description = (
-                    f"Attacker {src} ran the kill-chain '{rule['name']}' "
-                    f"against target(s): {peers_text}. Constituent "
-                    f"detections: " + "; ".join(constituent_titles)
+                    f"O atacante {src} executou a kill-chain '{rule['name']}' "
+                    f"contra o(s) alvo(s): {peers_text}. Detecções "
+                    f"constituintes: " + "; ".join(constituent_titles)
                 )
 
             incident = {

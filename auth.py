@@ -207,6 +207,35 @@ def current_role_at_least(role):
 
 
 # ============================================================
+#  TOTP step-up
+# ============================================================
+#
+# A valid session (or even a leaked password) is not enough to perform an
+# alert-hiding action. verify_totp_step_up re-proves possession of the
+# enrolled device at the moment of the action, so a stolen cookie cannot
+# silently create a suppression rule.
+
+def verify_totp_step_up(code):
+    """Return (ok: bool, error: str|None) for a step-up on the current user.
+
+    error is one of: 'authentication required', 'totp_not_enrolled',
+    'invalid_totp_code'. The caller maps these to HTTP status + message.
+    """
+    if not current_user.is_authenticated:
+        return False, "authentication required"
+    try:
+        rec = db.get_user_totp(current_user.user_id)
+    except Exception:
+        return False, "totp_not_enrolled"
+    if not rec or not rec.get("enabled") or not rec.get("secret"):
+        return False, "totp_not_enrolled"
+    import totp
+    if not totp.verify(rec["secret"], code):
+        return False, "invalid_totp_code"
+    return True, None
+
+
+# ============================================================
 #  before_request gate
 # ============================================================
 
@@ -356,6 +385,7 @@ __all__ = [
     "init_auth",
     "role_required",
     "current_role_at_least",
+    "verify_totp_step_up",
     "authenticate",
     "hash_password",
     "current_user",

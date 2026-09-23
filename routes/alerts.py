@@ -9,7 +9,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify
 
 import database as db
-from auth import role_required
+from auth import role_required, verify_totp_step_up, current_user
 
 from .common import audit_event, load_settings, server_error
 
@@ -141,6 +141,20 @@ def triage_alerts_bulk():
 # Suppression rules
 # ============================================================
 
+@alerts_bp.route('/api/alert-categories', methods=['GET'])
+def list_alert_categories_api():
+    """
+    List the alert categories available for suppression-rule filters (curated
+    known set ∪ categories seen in stored alerts).
+    ---
+    tags: [Alerts]
+    """
+    try:
+        return jsonify({"success": True, "categories": db.get_alert_categories()})
+    except Exception as e:
+        return server_error(e)
+
+
 @alerts_bp.route('/api/suppression-rules', methods=['GET'])
 def list_suppression_rules_api():
     """
@@ -154,11 +168,39 @@ def list_suppression_rules_api():
         return server_error(e)
 
 
+def _totp_step_up_or_error(data):
+    """Enforce the TOTP step-up for a suppression mutation.
+
+    Returns None when it passes, or a (json_response, status) tuple to return.
+    The code is read from the `totp_code` body field or the X-TOTP-Code header.
+    """
+    code = (data or {}).get('totp_code') or request.headers.get('X-TOTP-Code')
+    ok, err = verify_totp_step_up(code)
+    if ok:
+        return None
+    if err == 'totp_not_enrolled':
+        return jsonify({
+            "success": False,
+            "error": "TOTP step-up required. Enroll a second factor "
+                     "(/api/auth/totp/enroll) before managing suppression rules.",
+            "code": "totp_not_enrolled",
+        }), 403
+    return jsonify({
+        "success": False,
+        "error": "invalid or missing TOTP code",
+        "code": "invalid_totp_code",
+    }), 403
+
+
 @alerts_bp.route('/api/suppression-rules', methods=['POST'])
-@role_required('analyst')
+@role_required('admin')
 def create_suppression_rule_api():
     """
-    Create a suppression rule (at least one of title_pattern/category/src_ip/src_cidr).
+    Create a suppression rule. Admin only, and gated by a TOTP step-up: the
+    caller must submit a current code (totp_code body field or X-TOTP-Code
+    header) from their enrolled second factor. A rule must pin at least one
+    endpoint (src_ip/src_cidr/dst_ip/dst_cidr); over-broad CIDRs are refused.
+    Suppressed alerts are still recorded — suppression hides, never deletes.
     ---
     tags: [Alerts]
     requestBody:
@@ -171,31 +213,53 @@ def create_suppression_rule_api():
               category: {type: string}
               src_ip: {type: string}
               src_cidr: {type: string}
+              dst_ip: {type: string}
+              dst_cidr: {type: string}
               reason: {type: string}
               enabled: {type: boolean, default: true}
+              totp_code: {type: string}
     """
     data = request.get_json(silent=True) or {}
+    step_up = _totp_step_up_or_error(data)
+    if step_up is not None:
+        return step_up
+
+    actor = getattr(current_user, 'username', None)
     try:
         rule = db.create_suppression_rule(
             title_pattern=data.get('title_pattern'),
             category=data.get('category'),
             src_ip=data.get('src_ip'),
             src_cidr=data.get('src_cidr'),
+            dst_ip=data.get('dst_ip'),
+            dst_cidr=data.get('dst_cidr'),
             reason=data.get('reason'),
             enabled=bool(data.get('enabled', True)),
+            created_by=actor,
         )
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         return server_error(e)
+
     audit_event(action='create_suppression_rule', target_type='suppression_rule',
-                target_id=rule.get('id'), extra={k: data.get(k) for k in
-                                                 ('title_pattern', 'category', 'src_ip', 'src_cidr')})
+                target_id=rule.get('id'),
+                extra={k: data.get(k) for k in
+                       ('title_pattern', 'category', 'src_ip', 'src_cidr',
+                        'dst_ip', 'dst_cidr')})
+    # Out-of-band alarm: announce the new rule through channels an intruder on
+    # the host does not control. Best-effort; never blocks the response.
+    try:
+        import notifications
+        notifications.dispatch_rule_created({**rule, **data}, actor=actor)
+    except Exception as e:
+        print(f"[alerts] rule-created notification failed: {e}")
+
     return jsonify({"success": True, "rule": rule}), 201
 
 
 @alerts_bp.route('/api/suppression-rules/<int:rule_id>', methods=['DELETE'])
-@role_required('analyst')
+@role_required('admin')
 def delete_suppression_rule_api(rule_id):
     """
     Delete a suppression rule.
@@ -218,10 +282,12 @@ def delete_suppression_rule_api(rule_id):
 
 
 @alerts_bp.route('/api/suppression-rules/<int:rule_id>/enabled', methods=['POST'])
-@role_required('analyst')
+@role_required('admin')
 def set_suppression_rule_enabled_api(rule_id):
     """
-    Enable/disable a suppression rule.
+    Enable/disable a suppression rule. Admin only. Re-enabling a rule (which
+    resumes hiding alerts) requires the same TOTP step-up as creation;
+    disabling does not, since it only un-hides.
     ---
     tags: [Alerts]
     parameters:
@@ -236,10 +302,15 @@ def set_suppression_rule_enabled_api(rule_id):
             type: object
             properties:
               enabled: {type: boolean}
+              totp_code: {type: string}
     """
     data = request.get_json(silent=True) or {}
     if 'enabled' not in data:
         return jsonify({"success": False, "error": "enabled (bool) is required"}), 400
+    if bool(data['enabled']):
+        step_up = _totp_step_up_or_error(data)
+        if step_up is not None:
+            return step_up
     try:
         ok = db.set_suppression_rule_enabled(rule_id, bool(data['enabled']))
     except Exception as e:

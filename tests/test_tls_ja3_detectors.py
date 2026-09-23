@@ -49,15 +49,32 @@ def test_clean_handshake_raises_no_ja3_alert():
     assert not has_alert(results, title="Known Malicious JA3")
 
 
-def test_known_malicious_ja3_fires_critical():
+def test_known_malicious_ja3_alone_is_not_critical():
     # Discover the JA3 the engine computes, then mark it bad and re-run.
+    # JA3 alone collides with common stacks (schannel): high, or low when the
+    # destination is a known platform. Never critical without JA3S.
     _, analyzer = _run()
     ja3 = analyzer._tls_info["client_hellos"][0]["ja3_md5"]
 
     results, _ = _run({"known_malicious_ja3": {ja3: "Test-C2-Framework"}})
     hits = find_alerts(results, title="Known Malicious JA3 Fingerprint", category="tls")
     assert hits
+    expected = "low" if hits[0]["details"].get("known_service") else "high"
+    assert hits[0]["severity"] == expected
+    assert hits[0]["details"]["ja3s_corroborated"] is False
+
+
+def test_known_malicious_ja3_with_bad_ja3s_is_critical():
+    _, analyzer = _run()
+    ja3 = analyzer._tls_info["client_hellos"][0]["ja3_md5"]
+    ja3s = analyzer._tls_info["server_hellos"][0]["ja3s_md5"]
+
+    results, _ = _run({"known_malicious_ja3": {ja3: "Test-C2-Framework"},
+                       "known_malicious_ja3s": {ja3s: "Test-C2-Server"}})
+    hits = find_alerts(results, title="Known Malicious JA3 Fingerprint", category="tls")
+    assert hits
     assert hits[0]["severity"] == "critical"
+    assert hits[0]["details"]["ja3s_corroborated"] is True
     assert hits[0]["details"]["ja3_md5"] == ja3
     assert "Test-C2-Framework" in hits[0]["details"]["matches"]
 

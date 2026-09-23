@@ -91,9 +91,9 @@ def lookup_carved_file_hashes(scan_id, results, settings):
                 'category': 'malware-download',
                 'title': f"Malicious file downloaded ({labels})",
                 'description': (
-                    f"File {f.get('filename') or sha256[:12]} "
-                    f"({f.get('size_bytes', 0)} bytes) carved from HTTP flow "
-                    f"matches known-malicious hash on {sources}."
+                    f"O arquivo {f.get('filename') or sha256[:12]} "
+                    f"({f.get('size_bytes', 0)} bytes) extraído de um fluxo HTTP "
+                    f"corresponde a um hash sabidamente malicioso em {sources}."
                 ),
                 'ip': f.get('dst_ip') or f.get('src_ip'),
                 'details': {
@@ -106,8 +106,8 @@ def lookup_carved_file_hashes(scan_id, results, settings):
                     'sources': verdict.get('sources'),
                 },
                 'recommendation': (
-                    "Isolate the recipient host, collect the file from "
-                    "data/artifacts/, and pivot on the source URL/host."
+                    "Isole o host que recebeu o arquivo, colete-o em "
+                    "data/artifacts/ e pivote pela URL/host de origem."
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1105',

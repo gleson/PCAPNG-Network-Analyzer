@@ -36,46 +36,90 @@ class PostDetector:
 
 
 class IpMacChangesDetector(PostDetector):
-    """Detect MAC changes for a single IP (possible spoofing or DHCP churn)."""
+    """IP seen with several source MACs (possible spoofing or DHCP churn).
+
+    Two very common benign shapes are separated from the interesting one:
+
+      * **Routed / gateway MACs.** On a SPAN of several VLANs (or any capture
+        that sees routed traffic) a host's packets appear once with its own
+        MAC and again, after routing, with the ROUTER's MAC. A router MAC is
+        the source MAC of many IPs at once. When every extra MAC of an IP is
+        such a multi-IP ("gateway-like") MAC, the alert drops to low.
+      * **External IPs** always arrive via a gateway; several MACs mean
+        several routers/HSRP/load-balanced egress -> low, informational.
+
+    What remains (two device MACs for one local IP) is medium: DHCP
+    reassignment and NIC swaps still produce it, and active poisoning is
+    judged by the ARP/NDP spoofing detectors with stronger evidence.
+    """
     name = 'ip_mac_changes'
+
+    # A MAC used as source by at least this many IPs behaves like a router.
+    GATEWAY_MAC_MIN_IPS = 4
 
     def run(self):
         alerts = []
         analyzer = self.analyzer
         ip_mac_history = analyzer.results.get('ip_mac_mapping') or {}
+        mac_ips = defaultdict(set)
+        for ip, macs in ip_mac_history.items():
+            for m in macs or ():
+                if m:
+                    mac_ips[str(m).lower()].add(ip)
+        gateway_macs = {m for m, ips in mac_ips.items()
+                        if len(ips) >= self.GATEWAY_MAC_MIN_IPS}
         for ip, macs in ip_mac_history.items():
             if len(macs) <= 1:
                 continue
             is_local = analyzer._is_local_ip(ip)
+            lowered = [str(m).lower() for m in macs if m]
+            device_macs = [m for m in lowered if m not in gateway_macs]
+            gw_seen = [m for m in lowered if m in gateway_macs]
             if is_local:
+                if len(device_macs) >= 2:
+                    severity = 'medium'
+                    note = (
+                        'Mais de um MAC de dispositivo para o mesmo IP: '
+                        'reatribuição DHCP, troca de placa/equipamento ou '
+                        'spoofing de IP. Correlacione com alertas de ARP.'
+                    )
+                else:
+                    severity = 'low'
+                    note = (
+                        'Os MACs extras são de roteador/gateway (cada um '
+                        'aparece como origem de vários IPs) — típico de '
+                        'captura com tráfego roteado ou SPAN de várias VLANs.'
+                    )
                 alerts.append({
-                    'severity': 'high',
+                    'severity': severity,
                     'category': 'mac',
                     'title': 'IP with Multiple MAC Addresses',
                     'description': (
-                        f'Local IP {ip} was seen with {len(macs)} different '
-                        'MAC addresses'
+                        f'O IP local {ip} foi visto com {len(macs)} endereços '
+                        f'MAC diferentes. {note}'
                     ),
                     'ip': ip,
                     'details': {
                         'mac_addresses': macs,
                         'mac_count': len(macs),
+                        'device_macs': device_macs,
+                        'gateway_like_macs': gw_seen,
                         'ip_type': 'local',
                     },
                     'recommendation': (
-                        'This may indicate MAC spoofing, ARP poisoning, or a '
-                        'device being replaced. Verify the legitimacy of all '
-                        'MAC addresses.'
+                        'Isto pode indicar spoofing de MAC, envenenamento ARP '
+                        'ou a substituição de um dispositivo. Verifique a '
+                        'legitimidade de todos os endereços MAC.'
                     ),
                 })
             else:
                 alerts.append({
-                    'severity': 'medium',
+                    'severity': 'low',
                     'category': 'mac',
                     'title': 'External IP with Multiple MAC Addresses',
                     'description': (
-                        f'External IP {ip} was seen with {len(macs)} different '
-                        'MAC addresses (may be normal routing)'
+                        f'O IP externo {ip} foi visto com {len(macs)} endereços '
+                        'MAC diferentes (pode ser roteamento normal)'
                     ),
                     'ip': ip,
                     'details': {
@@ -84,8 +128,9 @@ class IpMacChangesDetector(PostDetector):
                         'ip_type': 'external',
                     },
                     'recommendation': (
-                        'This is often normal for external IPs due to routing '
-                        'changes. Monitor if the behavior is unexpected.'
+                        'Isto costuma ser normal para IPs externos devido a '
+                        'mudanças de roteamento. Monitore se o comportamento '
+                        'for inesperado.'
                     ),
                 })
         return alerts
@@ -114,25 +159,39 @@ class OldTlsVersionDetector(PostDetector):
         alerts = []
         for (src, dst, version), snis in seen.items():
             version_name = analyzer.TLS_VERSIONS.get(version, f'0x{version:04x}')
-            severity = 'critical' if version == 0x0300 else 'high'
+            # A ClientHello capped at an old version only proves the client
+            # is willing; the risk is real once the server AGREES. Legacy
+            # clients offering 1.0 to a modern server that refuses (or picks
+            # a newer version seen under another key) are hygiene, not
+            # exposure.
+            server_confirmed = '(server-confirmed)' in snis
+            if server_confirmed:
+                severity = 'high' if version == 0x0300 else 'medium'
+            else:
+                severity = 'low'
             alerts.append({
                 'severity': severity,
                 'category': 'tls',
                 'title': f'Obsolete TLS Version: {version_name}',
                 'description': (
-                    f'TLS connection {src} -> {dst} negotiated {version_name}'
+                    f'Conexão TLS {src} -> {dst} negociou {version_name}'
+                    if server_confirmed else
+                    f'O cliente {src} ofereceu {version_name} a {dst} '
+                    '(o servidor não confirmou a versão na captura)'
                 ),
                 'ip': src,
                 'details': {
                     'src': src, 'dst': dst,
                     'version': version_name,
                     'version_raw': version,
-                    'snis': sorted([s for s in snis if s])[:5],
+                    'server_confirmed': server_confirmed,
+                    'snis': sorted([s for s in snis
+                                    if s and s != '(server-confirmed)'])[:5],
                 },
                 'recommendation': (
-                    f'{version_name} is deprecated and has known cryptographic '
-                    'weaknesses (POODLE, BEAST, downgrade attacks). Disable on '
-                    'both ends; require TLS 1.2+.'
+                    f'{version_name} está obsoleto e tem fraquezas '
+                    'criptográficas conhecidas (POODLE, BEAST, ataques de '
+                    'downgrade). Desative em ambos os lados; exija TLS 1.2+.'
                 ),
             })
         return alerts
@@ -172,30 +231,43 @@ class SuspiciousSniDetector(PostDetector):
             reasons = []
             try:
                 ipaddress.ip_address(sni)
-                reasons.append('SNI is an IP literal')
+                reasons.append('SNI é um literal de IP')
             except ValueError:
                 pass
 
             if len(sni) > 100:
-                reasons.append(f'unusually long SNI ({len(sni)} chars)')
+                reasons.append(f'SNI excessivamente longo ({len(sni)} caracteres)')
 
             label = analyzer._extract_dns_label(sni.lower())
             if label and len(label) >= 7:
                 score = analyzer._dga_score(label)
                 if score >= 0.7:
-                    reasons.append(f'DGA-like SNI label (score {score:.2f})')
+                    reasons.append(f'label de SNI parecido com DGA (score {score:.2f})')
 
             parts = sni.lower().split('.')
             if len(parts) >= 2 and parts[-1] in analyzer.SUSPICIOUS_TLDS:
-                reasons.append(f'suspicious TLD .{parts[-1]}')
+                reasons.append(f'TLD suspeito .{parts[-1]}')
 
             if reasons:
+                # A lone cheap-TLD or IP-literal SNI is common in legit
+                # traffic (IoT, self-hosted services, .xyz/.top startups);
+                # DGA-shaped labels or several stacked reasons are the C2
+                # signal.
+                is_dga = any(r.startswith('label de SNI parecido com DGA')
+                             for r in reasons)
+                is_ip = 'SNI é um literal de IP' in reasons
+                if is_dga or len(reasons) >= 2:
+                    sev = 'high'
+                elif is_ip or reasons[0].startswith('SNI excessivamente'):
+                    sev = 'medium'
+                else:
+                    sev = 'low'
                 alerts.append({
-                    'severity': 'high',
+                    'severity': sev,
                     'category': 'tls',
                     'title': 'Suspicious TLS SNI',
                     'description': (
-                        f'TLS connection {src} -> {dst} with suspicious SNI: '
+                        f'Conexão TLS {src} -> {dst} com SNI suspeito: '
                         f'{sni}'
                     ),
                     'ip': src,
@@ -206,26 +278,29 @@ class SuspiciousSniDetector(PostDetector):
                         'ja3_md5': ch.get('ja3_md5'),
                     },
                     'recommendation': (
-                        'IP-literal, DGA-like, or unusually long SNIs are '
-                        'common in malware C2. Investigate this TLS connection '
-                        'and check the JA3 fingerprint.'
+                        'SNIs que são literais de IP, parecidos com DGA ou '
+                        'excessivamente longos são comuns em C2 de malware. '
+                        'Investigue esta conexão TLS e verifique o fingerprint '
+                        'JA3.'
                     ),
                 })
 
         for src, dst, dport in no_sni_external:
+            # Many legit non-browser clients (VPN agents, update services,
+            # IP-configured apps) omit SNI; keep it as a pivot, not a finding.
             alerts.append({
-                'severity': 'medium',
+                'severity': 'low',
                 'category': 'tls',
                 'title': 'TLS ClientHello Without SNI',
                 'description': (
-                    f'External TLS {src} -> {dst}:{dport} sent no SNI extension'
+                    f'TLS externo {src} -> {dst}:{dport} não enviou extensão SNI'
                 ),
                 'ip': src,
                 'details': {'src': src, 'dst': dst, 'dport': dport},
                 'recommendation': (
-                    'Modern legitimate clients almost always send SNI. '
-                    'Absence may indicate older malware, custom/non-browser '
-                    'client, or direct-IP C2 connection.'
+                    'Clientes legítimos modernos quase sempre enviam SNI. A '
+                    'ausência pode indicar malware antigo, cliente '
+                    'customizado/não-navegador ou conexão de C2 direto por IP.'
                 ),
             })
         return alerts
@@ -254,6 +329,23 @@ class KnownBadJa3Detector(PostDetector):
         except Exception as e:
             print(f"[pcap_analyzer] SSLBL JA3 feed unavailable: {e}")
 
+        # Server-side corroboration: a ServerHello whose JA3S is itself on the
+        # bad list. Several JA3 values attributed to CS/TrickBot are simply
+        # the Windows schannel defaults, so a lone JA3 match is a strong
+        # pivot but not proof; the (client JA3 + server JA3S) pair is.
+        from ..constants import KNOWN_MALICIOUS_JA3S
+        bad_s = dict(KNOWN_MALICIOUS_JA3S)
+        user_bad_s = analyzer.settings.get('known_malicious_ja3s') or {}
+        if isinstance(user_bad_s, dict):
+            bad_s.update(user_bad_s)
+        bad_ja3s_pairs = set()
+        for sh in tls.get('server_hellos') or []:
+            if sh.get('ja3s_md5') in bad_s:
+                # ServerHello: src=server, dst=client.
+                bad_ja3s_pairs.add((sh.get('dst'), sh.get('src')))
+
+        from . import _apply_known_service_downgrade
+
         alerts = []
         seen = set()
         for ch in tls.get('client_hellos') or []:
@@ -265,26 +357,43 @@ class KnownBadJa3Detector(PostDetector):
                 continue
             seen.add(key)
             label = bad[h]
+            details = {
+                'ja3_md5': h,
+                'matches': label,
+                'src': ch['src'],
+                'dst': ch['dst'],
+                'dport': ch.get('dport'),
+                'sni': ch.get('sni'),
+            }
+            corroborated = (ch['src'], ch['dst']) in bad_ja3s_pairs
+            details['ja3s_corroborated'] = corroborated
+            if corroborated:
+                severity = 'critical'
+            else:
+                severity = _apply_known_service_downgrade(
+                    analyzer, ch['dst'], 'high', details)
+                if details.get('known_service'):
+                    # A mainstream platform answering a schannel-default JA3
+                    # is the textbook collision, not C2.
+                    severity = 'low'
             alerts.append({
-                'severity': 'critical',
+                'severity': severity,
                 'category': 'tls',
                 'title': 'Known Malicious JA3 Fingerprint',
                 'description': (
-                    f'Host {ch["src"]} TLS handshake matches JA3 of {label}'
+                    f'O handshake TLS do host {ch["src"]} corresponde ao JA3 de {label}'
                 ),
                 'ip': ch['src'],
-                'details': {
-                    'ja3_md5': h,
-                    'matches': label,
-                    'src': ch['src'],
-                    'dst': ch['dst'],
-                    'dport': ch.get('dport'),
-                    'sni': ch.get('sni'),
-                },
+                'details': details,
                 'recommendation': (
-                    f'JA3 {h} is associated with {label}. Isolate the host '
-                    'immediately, preserve memory and disk for forensics, and '
-                    'block the destination IP.'
+                    f'O JA3 {h} está associado a {label}. Isole o host '
+                    'imediatamente, preserve memória e disco para forense e '
+                    'bloqueie o IP de destino.'
+                    if corroborated else
+                    f'O JA3 {h} está associado a {label}, mas JA3 sozinho '
+                    'colide com stacks TLS comuns (ex.: schannel do Windows). '
+                    'Confirme pelo destino (reputação, JA3S/JARM, SNI) e pelo '
+                    'processo de origem antes de isolar o host.'
                 ),
             })
         return alerts
@@ -334,8 +443,8 @@ class KnownBadJa3sDetector(PostDetector):
                 'category': 'tls',
                 'title': 'Known Malicious JA3S Fingerprint',
                 'description': (
-                    f'Server {server_ip}:{sport} TLS handshake matches JA3S '
-                    f'of {label} (md5 {h}).'
+                    f'O handshake TLS do servidor {server_ip}:{sport} '
+                    f'corresponde ao JA3S de {label} (md5 {h}).'
                 ),
                 'ip': client_ip or server_ip,
                 'details': {
@@ -347,9 +456,9 @@ class KnownBadJa3sDetector(PostDetector):
                     'ja4s': sh.get('ja4s'),
                 },
                 'recommendation': (
-                    f'JA3S {h} ({label}) suggests the server is a C2 framework '
-                    'with default TLS stack. Combine with destination '
-                    'reputation and any JA3-side hits before blocking.'
+                    f'O JA3S {h} ({label}) sugere que o servidor é um framework '
+                    'de C2 com stack TLS padrão. Combine com a reputação do '
+                    'destino e quaisquer hits do lado JA3 antes de bloquear.'
                 ),
             })
         return alerts
@@ -398,8 +507,8 @@ class KnownBadJa4Detector(PostDetector):
                 'category': 'tls',
                 'title': 'Known Malicious JA4 Fingerprint',
                 'description': (
-                    f'Host {ch.get("src")} TLS ClientHello matches JA4 of '
-                    f'{label} (JA4 {h}).'
+                    f'O ClientHello TLS do host {ch.get("src")} corresponde ao '
+                    f'JA4 de {label} (JA4 {h}).'
                 ),
                 'ip': ch.get('src'),
                 'details': {
@@ -412,10 +521,10 @@ class KnownBadJa4Detector(PostDetector):
                     'ja3_md5': ch.get('ja3_md5'),
                 },
                 'recommendation': (
-                    f'JA4 {h} is associated with {label}. Isolate the host, '
-                    'preserve memory/disk for forensics, and block the '
-                    'destination. JA4 is more stable than JA3, so this match '
-                    'is higher-confidence than a JA3 hit alone.'
+                    f'O JA4 {h} está associado a {label}. Isole o host, '
+                    'preserve memória/disco para forense e bloqueie o '
+                    'destino. O JA4 é mais estável que o JA3, então este '
+                    'casamento tem maior confiança do que um hit de JA3 sozinho.'
                 ),
             })
 
@@ -435,8 +544,8 @@ class KnownBadJa4Detector(PostDetector):
                 'category': 'tls',
                 'title': 'Known Malicious JA4S Fingerprint',
                 'description': (
-                    f'Server {server_ip}:{sh.get("sport")} TLS ServerHello '
-                    f'matches JA4S of {label} (JA4S {h}).'
+                    f'O ServerHello TLS do servidor {server_ip}:{sh.get("sport")} '
+                    f'corresponde ao JA4S de {label} (JA4S {h}).'
                 ),
                 'ip': client_ip or server_ip,
                 'details': {
@@ -448,10 +557,10 @@ class KnownBadJa4Detector(PostDetector):
                     'ja3s_md5': sh.get('ja3s_md5'),
                 },
                 'recommendation': (
-                    f'JA4S {h} ({label}) suggests the server runs a C2 '
-                    'framework with a default TLS stack. Combine with '
-                    'destination reputation and any client-side JA4 hits '
-                    'before blocking.'
+                    f'O JA4S {h} ({label}) sugere que o servidor roda um '
+                    'framework de C2 com stack TLS padrão. Combine com a '
+                    'reputação do destino e quaisquer hits de JA4 do lado '
+                    'cliente antes de bloquear.'
                 ),
             })
         return alerts
@@ -519,9 +628,9 @@ class AlpnPortInconsistencyDetector(PostDetector):
                 'category': 'tls',
                 'title': 'ALPN/Port Inconsistency',
                 'description': (
-                    f'TLS {ch["src"]} -> {ch["dst"]}:{dport} negotiated ALPN '
-                    f'{sorted(hits)} on a non-web port. Possible protocol '
-                    'tunneling or C2-over-TLS.'
+                    f'TLS {ch["src"]} -> {ch["dst"]}:{dport} negociou ALPN '
+                    f'{sorted(hits)} em uma porta não-web. Possível tunelamento '
+                    'de protocolo ou C2 sobre TLS.'
                 ),
                 'ip': ch['src'],
                 'details': {
@@ -532,9 +641,10 @@ class AlpnPortInconsistencyDetector(PostDetector):
                     'ja3_md5': ch.get('ja3_md5'),
                 },
                 'recommendation': (
-                    'h2/h3 over a non-web service port is highly unusual. '
-                    'Inspect the destination, decode payload if possible, '
-                    'and block at egress if not justified by a known app.'
+                    'h2/h3 sobre uma porta de serviço não-web é altamente '
+                    'incomum. Inspecione o destino, decodifique o payload se '
+                    'possível e bloqueie na saída se não for justificado por '
+                    'uma aplicação conhecida.'
                 ),
             })
         return alerts
@@ -543,6 +653,30 @@ class AlpnPortInconsistencyDetector(PostDetector):
 class ScannerUserAgentDetector(PostDetector):
     """Detect HTTP User-Agents of known scanners / offensive tools."""
     name = 'scanner_ua'
+
+    # Exploitation / credential-attack tools.
+    EXPLOIT_SIGS = frozenset({
+        'sqlmap', 'havij', 'sqlninja', 'hydra', 'metasploit', 'wpscan',
+        'nuclei',
+    })
+    # Vulnerability scanners and content brute-forcers.
+    VULN_SIGS = frozenset({
+        'nikto', 'nessus', 'acunetix', 'arachni', 'w3af', 'xspider',
+        'paros', 'gobuster', 'dirb', 'dirbuster', 'wfuzz', 'feroxbuster',
+    })
+    # Fingerprinting / port-level recon.
+    RECON_SIGS = frozenset({'nmap', 'masscan', 'zgrab', 'whatweb'})
+
+    @classmethod
+    def _tier(cls, sig):
+        if sig in cls.EXPLOIT_SIGS:
+            return 'exploit'
+        if sig in cls.VULN_SIGS:
+            return 'vuln'
+        if sig in cls.RECON_SIGS:
+            return 'recon'
+        # Crawlers (mj12bot) and unknown/user-added signatures.
+        return 'crawler' if sig.endswith('bot') else 'vuln'
 
     def run(self):
         analyzer = self.analyzer
@@ -575,24 +709,38 @@ class ScannerUserAgentDetector(PostDetector):
         for src, hits in by_src.items():
             sigs = sorted({h[0] for h in hits})
             sample_uas = sorted({h[1] for h in hits})[:5]
+            # A UA string is a claim, not an exploit: the tool class and the
+            # direction decide how loud it is. Internet-wide recon (zgrab,
+            # masscan) hits every public IP daily; the same tool from an
+            # internal host is internal reconnaissance.
+            src_local = analyzer._is_local_ip(src)
+            tiers = {self._tier(sig) for sig in sigs}
+            if tiers & {'exploit', 'vuln'}:
+                severity = 'high'
+            elif 'recon' in tiers:
+                severity = 'high' if src_local else 'medium'
+            else:
+                severity = 'low'
             alerts.append({
-                'severity': 'critical',
+                'severity': severity,
                 'category': 'http',
                 'title': 'Security Scanner User-Agent',
                 'description': (
-                    f'Host {src} sent HTTP requests with scanner UA(s): '
-                    f'{", ".join(sigs)}'
+                    f'O host {src} enviou requisições HTTP com UA(s) de '
+                    f'scanner: {", ".join(sigs)}'
                 ),
                 'ip': src,
                 'details': {
                     'src': src,
                     'matched_signatures': sigs,
+                    'tool_classes': sorted(tiers),
+                    'src_local': src_local,
                     'sample_user_agents': sample_uas,
                 },
                 'recommendation': (
-                    'Vulnerability scanner detected. If unauthorized: block '
-                    'source and review logs for successful exploitation. If '
-                    'sanctioned (pentest), confirm scope.'
+                    'Scanner de vulnerabilidades detectado. Se não autorizado: '
+                    'bloqueie a origem e revise os logs em busca de exploração '
+                    'bem-sucedida. Se sancionado (pentest), confirme o escopo.'
                 ),
             })
 
@@ -603,8 +751,8 @@ class ScannerUserAgentDetector(PostDetector):
                 'category': 'http',
                 'title': 'HTTP Request Without User-Agent',
                 'description': (
-                    f'Host {src} sent HTTP request(s) to external destination '
-                    'without User-Agent header'
+                    f'O host {src} enviou requisição(ões) HTTP para destino '
+                    'externo sem cabeçalho User-Agent'
                 ),
                 'ip': src,
                 'details': {
@@ -616,9 +764,9 @@ class ScannerUserAgentDetector(PostDetector):
                     ],
                 },
                 'recommendation': (
-                    'Most legitimate clients send a User-Agent. Absence often '
-                    'indicates custom-coded malware, manual probing, or '
-                    'scripted attacks.'
+                    'A maioria dos clientes legítimos envia um User-Agent. A '
+                    'ausência frequentemente indica malware codificado sob '
+                    'medida, sondagem manual ou ataques por script.'
                 ),
             })
         return alerts
@@ -628,30 +776,69 @@ class ExploitPathsDetector(PostDetector):
     """Detect requests to sensitive paths or known exploit URLs."""
     name = 'exploit_paths'
 
+    # Generic file names that SPAs / apps legitimately serve from asset
+    # folders (/assets/config.json). Only the ROOT copy is the classic
+    # secrets-leak probe.
+    ROOT_ONLY = frozenset({'/config.json', '/config.yaml'})
+    # File names that must end at a path boundary so '/web.config' does not
+    # match '/web.configuration/'. A following '.', '~' or '%' is kept: those
+    # are the backup-copy probes (wp-config.php.bak, wp-config.php~).
+    _BOUNDARY_OK = frozenset('/?#;.~%')
+
+    @classmethod
+    def _path_hit(cls, ep, path_lower):
+        if ep in cls.ROOT_ONLY:
+            path_only = path_lower.split('?', 1)[0].split('#', 1)[0]
+            return path_only == ep or (
+                path_only.startswith(ep)
+                and path_only[len(ep)] in cls._BOUNDARY_OK)
+        start = path_lower.find(ep)
+        if start < 0:
+            return False
+        # Directory / prefix probes (/.git/, /swagger, /jenkins) keep plain
+        # substring semantics; only FILE names need a boundary.
+        if ep.endswith('/') or '.' not in ep.rsplit('/', 1)[-1]:
+            return True
+        # Check every occurrence for a boundary after the match.
+        while start >= 0:
+            end = start + len(ep)
+            if end == len(path_lower) or path_lower[end] in cls._BOUNDARY_OK:
+                return True
+            start = path_lower.find(ep, start + 1)
+        return False
+
     def run(self):
         analyzer = self.analyzer
         http = analyzer._http_info
         if not http:
             return []
 
-        by_src = defaultdict(lambda: {'high': set(), 'medium': set()})
+        by_src = defaultdict(
+            lambda: {'high': set(), 'medium': set(), 'low': set()})
         for req in http.get('requests') or []:
             path = req.get('path', '')
             path_lower = path.lower()
             host = req.get('host', '')
             method = req.get('method', '')
+            src = req['src']
 
             matched = False
             for ep in analyzer.EXPLOIT_PATHS_HIGH:
-                if ep in path_lower:
-                    by_src[req['src']]['high'].add((path[:200], host, method))
+                if self._path_hit(ep, path_lower):
+                    by_src[src]['high'].add((path[:200], host, method))
                     matched = True
                     break
             if matched:
                 continue
             for ep in analyzer.EXPLOIT_PATHS_MEDIUM:
-                if ep in path_lower:
-                    by_src[req['src']]['medium'].add((path[:200], host, method))
+                if self._path_hit(ep, path_lower):
+                    # An internal user opening /wp-admin/ or /phpmyadmin on
+                    # an EXTERNAL site is most often administering their own
+                    # hosted site, not attacking it.
+                    outbound = (analyzer._is_local_ip(src)
+                                and not analyzer._is_local_ip(req.get('dst')))
+                    bucket = 'low' if outbound else 'medium'
+                    by_src[src][bucket].add((path[:200], host, method))
                     break
 
         alerts = []
@@ -665,8 +852,8 @@ class ExploitPathsDetector(PostDetector):
                     'category': 'http',
                     'title': 'HTTP Request to Sensitive/Exploit Path',
                     'description': (
-                        f'Host {src} requested {len(hits)} sensitive/exploit '
-                        'path(s)'
+                        f'O host {src} requisitou {len(hits)} caminho(s) '
+                        'sensível(is)/de exploração'
                     ),
                     'ip': src,
                     'details': {
@@ -679,10 +866,11 @@ class ExploitPathsDetector(PostDetector):
                         ],
                     },
                     'recommendation': (
-                        'These paths target known vulnerabilities or '
-                        'sensitive resources (.env, .git, web shells, admin '
-                        'panels). Verify if authorized testing or block '
-                        'source and review server logs for successful access.'
+                        'Esses caminhos miram vulnerabilidades conhecidas ou '
+                        'recursos sensíveis (.env, .git, web shells, painéis de '
+                        'admin). Verifique se é teste autorizado ou bloqueie a '
+                        'origem e revise os logs do servidor por acesso '
+                        'bem-sucedido.'
                     ),
                 })
         return alerts
@@ -712,22 +900,23 @@ class UnusualHttpMethodDetector(PostDetector):
         for (src, method), paths in by.items():
             if method in ('TRACE', 'TRACK'):
                 severity = 'high'
-                tip = ('Used in Cross-Site Tracing (XST) attacks. Disable on '
-                       'web servers.')
+                tip = ('Usado em ataques de Cross-Site Tracing (XST). Desative '
+                       'nos servidores web.')
             elif method == 'CONNECT':
                 severity = 'high'
-                tip = ('May indicate proxy abuse / open-relay attempt or '
-                       'tunneling.')
+                tip = ('Pode indicar abuso de proxy / tentativa de open-relay '
+                       'ou tunelamento.')
             else:
                 severity = 'medium'
-                tip = ('WebDAV methods are often exploited (CVE-2017-7269 '
-                       'etc.). Disable if not required.')
+                tip = ('Métodos WebDAV são frequentemente explorados '
+                       '(CVE-2017-7269 etc.). Desative se não forem necessários.')
             alerts.append({
                 'severity': severity,
                 'category': 'http',
                 'title': f'Unusual HTTP Method: {method}',
                 'description': (
-                    f'Host {src} used {method} method ({len(paths)} request(s))'
+                    f'O host {src} usou o método {method} '
+                    f'({len(paths)} requisição(ões))'
                 ),
                 'ip': src,
                 'details': {
@@ -752,24 +941,41 @@ class HttpInjectionDetector(PostDetector):
         if not http:
             return []
 
+        from . import _SEV_LADDER
+
         hits = defaultdict(lambda: defaultdict(set))
         for req in http.get('requests') or []:
             path = req.get('path', '') or ''
             headers = req.get('headers_sample', '') or ''
             body = req.get('body_sample', '') or ''
-            full = path + ' \n ' + headers + ' \n ' + body
+            head = path + ' \n ' + headers
+            full = head + ' \n ' + body
             full_lower = full.lower()
+            head_len = len(head)
+            # Client -> external site: the internal host is the would-be
+            # ATTACKER only if it is compromised or a pentest box; far more
+            # often it is a browser/app sending odd-looking but benign data.
+            outbound = (analyzer._is_local_ip(req['src'])
+                        and not analyzer._is_local_ip(req.get('dst')))
 
             for pat, sev, label in analyzer.INJECTION_PATTERNS:
-                idx = full_lower.find(pat)
+                # Markup in a request BODY is ordinary (CMS editors, webmail,
+                # form posts with HTML); reflected XSS lives in the URL or
+                # headers, so XSS patterns only count there.
+                haystack = (full_lower[:head_len] if label == 'XSS'
+                            else full_lower)
+                idx = haystack.find(pat)
                 if idx < 0:
                     continue
                 excerpt = full[max(0, idx - 30):idx + len(pat) + 60]
                 excerpt = excerpt.replace('\r', ' ').replace('\n', ' ')
-                hits[(label, sev)][req['src']].add(excerpt[:200])
+                hits[(label, sev, outbound)][req['src']].add(excerpt[:200])
 
         alerts = []
-        for (label, sev), src_map in hits.items():
+        for (label, base_sev, outbound), src_map in hits.items():
+            sev = base_sev
+            if outbound and sev != 'critical' and sev in _SEV_LADDER:
+                sev = _SEV_LADDER[max(1, _SEV_LADDER.index(sev) - 1)]
             for src, excerpts in src_map.items():
                 sample = list(excerpts)[:3]
                 alerts.append({
@@ -777,21 +983,23 @@ class HttpInjectionDetector(PostDetector):
                     'category': 'http',
                     'title': f'HTTP Attack Pattern: {label}',
                     'description': (
-                        f'Host {src} sent {len(excerpts)} HTTP request(s) '
-                        f'matching {label}'
+                        f'O host {src} enviou {len(excerpts)} requisição(ões) '
+                        f'HTTP correspondendo a {label}'
                     ),
                     'ip': src,
                     'details': {
                         'src': src,
                         'pattern_class': label,
+                        'outbound': outbound,
+                        'severity_original': base_sev,
                         'occurrences': len(excerpts),
                         'samples': sample,
                     },
                     'recommendation': (
-                        f'Investigate {src} immediately. {label} indicates '
-                        'exploitation attempt; preserve server logs, check '
-                        'for successful response (2xx/5xx) and block source '
-                        'if external.'
+                        f'Investigue {src} imediatamente. {label} indica '
+                        'tentativa de exploração; preserve os logs do servidor, '
+                        'verifique se houve resposta bem-sucedida (2xx/5xx) e '
+                        'bloqueie a origem se for externa.'
                     ),
                 })
         return alerts
@@ -831,27 +1039,32 @@ class FileShareUploadDetector(PostDetector):
         alerts = []
         for src, hits in by_src.items():
             sample = sorted(hits)[:5]
+            # Visible upload verbs make it an exfil candidate; a bare TLS
+            # connection (or a GET) is just someone opening a shared link.
+            uploads = any(m.upper() in ('POST', 'PUT') for _h, _v, m in hits)
             alerts.append({
-                'severity': 'medium',
+                'severity': 'medium' if uploads else 'low',
                 'category': 'exfil',
                 'title': 'Connection to File-Share / Paste Service',
                 'description': (
-                    f'Host {src} connected to {len(hits)} file-share/paste '
-                    'service(s)'
+                    f'O host {src} conectou-se a {len(hits)} serviço(s) de '
+                    'compartilhamento/paste de arquivos'
                 ),
                 'ip': src,
                 'details': {
                     'src': src,
                     'count': len(hits),
+                    'upload_seen': uploads,
                     'samples': [
                         {'host': h, 'via': v, 'method': m}
                         for h, v, m in sample
                     ],
                 },
                 'recommendation': (
-                    'File-share / paste services are common exfiltration '
-                    'channels. Verify if the upload was authorized and '
-                    'consider blocking these domains via DNS/proxy.'
+                    'Serviços de compartilhamento/paste de arquivos são canais '
+                    'comuns de exfiltração. Verifique se o upload foi '
+                    'autorizado e considere bloquear esses domínios via '
+                    'DNS/proxy.'
                 ),
             })
         return alerts
@@ -880,6 +1093,24 @@ def _cert_matches_sni(cert, sni):
             sni_parts = sni.split('.', 1)
             if len(sni_parts) == 2 and sni_parts[0] and sni_parts[1] == n[2:]:
                 return True
+    return False
+
+
+def _cert_same_zone(cert, sni):
+    """True if the SNI and some CN/SAN of the cert share the registrable
+    zone (www.example.com vs api.example.com). That shape is almost always a
+    virtual-host / cert-rotation misconfiguration of the SAME operator, not
+    interception or fronting."""
+    from ..constants import base_zone
+    if not sni or not cert:
+        return False
+    sni_zone = base_zone(sni.lower().strip().rstrip('.').split('.'))
+    for name in [cert.get('cn', '')] + list(cert.get('sans') or []):
+        n = (name or '').lower().strip().rstrip('.')
+        if n.startswith('*.'):
+            n = n[2:]
+        if n and base_zone(n.split('.')) == sni_zone:
+            return True
     return False
 
 
@@ -957,14 +1188,18 @@ class TlsCertificateDetector(PostDetector):
                 key = (server_ip, leaf.get('fingerprint_sha256'))
                 if key not in seen_self_signed:
                     seen_self_signed.add(key)
+                    # Self-signed external certs are also routine on
+                    # appliances, VPN concentrators and dev endpoints; the
+                    # stronger C2 shapes (IP-only SAN, DGA SNI, bad JA3S) are
+                    # judged by their own rules.
                     alerts.append({
-                        'severity': 'high',
+                        'severity': 'medium',
                         'category': 'tls',
                         'title': 'Self-Signed TLS Certificate (external)',
                         'description': (
-                            f'External TLS server {server_ip}'
+                            f'O servidor TLS externo {server_ip}'
                             f'{(":" + str(entry.get("sport"))) if entry.get("sport") else ""} '
-                            f'presented a self-signed certificate '
+                            f'apresentou um certificado autoassinado '
                             f'(CN={leaf.get("cn") or "?"})'
                         ),
                         'ip': client_ip or server_ip,
@@ -981,11 +1216,12 @@ class TlsCertificateDetector(PostDetector):
                             'fingerprint_sha256': leaf.get('fingerprint_sha256'),
                         },
                         'recommendation': (
-                            'Public-facing services rarely present self-signed '
-                            'certificates. Common causes: malware C2 with '
-                            'throwaway certs, phishing kits, or misconfigured '
-                            'admin panels. Verify the destination and block '
-                            'if untrusted.'
+                            'Serviços expostos publicamente raramente '
+                            'apresentam certificados autoassinados. Causas '
+                            'comuns: C2 de malware com certificados '
+                            'descartáveis, kits de phishing ou painéis de admin '
+                            'mal configurados. Verifique o destino e bloqueie '
+                            'se não for confiável.'
                         ),
                     })
 
@@ -995,16 +1231,17 @@ class TlsCertificateDetector(PostDetector):
                     key = (server_ip, sni, leaf.get('fingerprint_sha256'))
                     if key not in seen_mismatch:
                         seen_mismatch.add(key)
+                        same_zone = _cert_same_zone(leaf, sni)
                         alerts.append({
-                            'severity': 'high',
+                            'severity': 'medium' if same_zone else 'high',
                             'category': 'tls',
                             'title': 'TLS Certificate / SNI Mismatch',
                             'description': (
-                                f'Client requested SNI "{sni}" but server '
-                                f'{server_ip} presented a certificate for '
+                                f'O cliente pediu o SNI "{sni}" mas o servidor '
+                                f'{server_ip} apresentou um certificado para '
                                 f'CN={leaf.get("cn") or "?"} '
                                 f'(SANs: '
-                                f'{", ".join((leaf.get("sans") or [])[:3]) or "none"})'
+                                f'{", ".join((leaf.get("sans") or [])[:3]) or "nenhum"})'
                             ),
                             'ip': client_ip or server_ip,
                             'details': {
@@ -1013,26 +1250,40 @@ class TlsCertificateDetector(PostDetector):
                                 'sni': sni,
                                 'cn': leaf.get('cn'),
                                 'sans': leaf.get('sans')[:10] if leaf.get('sans') else [],
+                                'same_registrable_zone': same_zone,
                                 'fingerprint_sha256': leaf.get('fingerprint_sha256'),
                             },
                             'recommendation': (
-                                'A SNI/cert mismatch can indicate domain '
-                                'fronting, an interception proxy, or a '
-                                'misconfigured CDN. Validate the destination; '
-                                'unexpected mismatches with external services '
-                                'warrant investigation.'
+                                'Uma divergência entre SNI e certificado pode '
+                                'indicar domain fronting, um proxy de '
+                                'interceptação ou uma CDN mal configurada. '
+                                'Valide o destino; divergências inesperadas com '
+                                'serviços externos merecem investigação.'
                             ),
                         })
 
             # --- 3) Expired or not-yet-valid -------------------------------
+            # Validity is judged against the moment the certificate was SEEN
+            # on the wire (packet timestamp), not the wall clock of the
+            # analysis: re-analysing an old capture must not turn a cert that
+            # was valid back then into an "expired" finding. Wall clock is only
+            # the fallback when the entry carries no plausible timestamp
+            # (devices without RTC write 1970-era stamps).
+            seen_at = now
+            try:
+                ts = float(entry.get('ts') or 0)
+                if ts >= 946684800:  # 2000-01-01
+                    seen_at = datetime.fromtimestamp(ts, timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
             nb = _parse_iso(leaf.get('not_before'))
             na = _parse_iso(leaf.get('not_after'))
             expired_reason = None
-            if na and na < now:
-                expired_reason = f'expired on {leaf.get("not_after")}'
-            elif nb and nb > now:
+            if na and na < seen_at:
+                expired_reason = f'expirou em {leaf.get("not_after")}'
+            elif nb and nb > seen_at:
                 expired_reason = (
-                    f'not yet valid (starts {leaf.get("not_before")})'
+                    f'ainda não é válido (começa em {leaf.get("not_before")})'
                 )
             if expired_reason:
                 key = (server_ip, leaf.get('fingerprint_sha256'))
@@ -1043,9 +1294,8 @@ class TlsCertificateDetector(PostDetector):
                         'category': 'tls',
                         'title': 'Invalid TLS Certificate Validity Period',
                         'description': (
-                            f'Server {server_ip} presented a certificate '
-                            f'(CN={leaf.get("cn") or "?"}) that is '
-                            f'{expired_reason}'
+                            f'O servidor {server_ip} apresentou um certificado '
+                            f'(CN={leaf.get("cn") or "?"}) que {expired_reason}'
                         ),
                         'ip': client_ip or server_ip,
                         'details': {
@@ -1058,10 +1308,10 @@ class TlsCertificateDetector(PostDetector):
                             'fingerprint_sha256': leaf.get('fingerprint_sha256'),
                         },
                         'recommendation': (
-                            'Out-of-window certificates frequently appear on '
-                            'abandoned C2 infrastructure or on hosts with '
-                            'broken clock/PKI maintenance. Investigate and '
-                            'do not whitelist.'
+                            'Certificados fora da janela de validade aparecem '
+                            'frequentemente em infraestrutura de C2 abandonada '
+                            'ou em hosts com relógio/PKI quebrados. Investigue '
+                            'e não coloque em whitelist.'
                         ),
                     })
 
@@ -1085,14 +1335,14 @@ class TlsCertificateDetector(PostDetector):
                         'category': 'tls',
                         'title': 'TLS Cert with IP-only SAN, no Intermediates',
                         'description': (
-                            f'External server {server_ip} presented a '
-                            f'single-cert chain (depth=1) whose only SAN '
-                            f'entries are IP literals '
+                            f'O servidor externo {server_ip} apresentou uma '
+                            f'cadeia de certificado única (depth=1) cujas '
+                            f'únicas entradas de SAN são literais de IP '
                             f'({", ".join(leaf.get("ip_sans") or [])[:120]}). '
-                            'Real public PKI rarely ships leaves without '
-                            'intermediates; IP-only SANs are typical of C2 '
-                            'framework defaults (Sliver, Metasploit, raw '
-                            'openssl req).'
+                            'A PKI pública real raramente entrega folhas sem '
+                            'intermediários; SANs só com IP são típicos de '
+                            'defaults de frameworks de C2 (Sliver, Metasploit, '
+                            'openssl req cru).'
                         ),
                         'ip': client_ip or server_ip,
                         'details': {
@@ -1107,10 +1357,10 @@ class TlsCertificateDetector(PostDetector):
                                 leaf.get('fingerprint_sha256'),
                         },
                         'recommendation': (
-                            'Investigate the destination IP for C2 framework '
-                            'fingerprints (JARM/JA3S, default banners) and '
-                            'cross-check against your asset inventory. '
-                            'Block at egress if untrusted.'
+                            'Investigue o IP de destino em busca de '
+                            'fingerprints de framework de C2 (JARM/JA3S, '
+                            'banners padrão) e cruze com o seu inventário de '
+                            'ativos. Bloqueie na saída se não for confiável.'
                         ),
                     })
 
@@ -1128,10 +1378,10 @@ class TlsCertificateDetector(PostDetector):
                                 'category': 'tls',
                                 'title': "Let's Encrypt Certificate on DGA-like Domain",
                                 'description': (
-                                    f'Server {server_ip} is using a free '
-                                    f'Let\'s Encrypt certificate for an '
-                                    f'algorithmically-generated-looking SNI '
-                                    f'"{sni}" (DGA score {score:.2f})'
+                                    f'O servidor {server_ip} está usando um '
+                                    f'certificado gratuito Let\'s Encrypt para '
+                                    f'um SNI com aparência de gerado por '
+                                    f'algoritmo "{sni}" (score DGA {score:.2f})'
                                 ),
                                 'ip': client_ip or server_ip,
                                 'details': {
@@ -1144,11 +1394,12 @@ class TlsCertificateDetector(PostDetector):
                                     'fingerprint_sha256': leaf.get('fingerprint_sha256'),
                                 },
                                 'recommendation': (
-                                    "Free, short-lived CAs like Let's "
-                                    'Encrypt are routinely abused by malware '
-                                    'operators on DGA / disposable domains. '
-                                    'Combine with reputation data on the '
-                                    'destination IP before whitelisting.'
+                                    "CAs gratuitas e de curta duração como a "
+                                    "Let's Encrypt são rotineiramente abusadas "
+                                    'por operadores de malware em domínios DGA '
+                                    '/ descartáveis. Combine com dados de '
+                                    'reputação do IP de destino antes de '
+                                    'colocar em whitelist.'
                                 ),
                             })
 
@@ -1227,39 +1478,47 @@ class HighVolumeQuicNewDestDetector(PostDetector):
                 continue
             candidates.append((dst, rec))
 
+        from . import _apply_known_service_downgrade
+
         candidates.sort(key=lambda kv: kv[1]['bytes'], reverse=True)
         alerts = []
         for dst, rec in candidates[:max_alerts]:
             sources = sorted(rec['sources'])
             primary_src = sources[0] if sources else None
+            details = {
+                'destination': dst,
+                'bytes': rec['bytes'],
+                'packets': rec['packets'],
+                'sources': sources,
+                'versions': sorted(rec['versions']),
+                'threshold_bytes': min_bytes,
+                'threshold_packets': min_packets,
+            }
+            # YouTube/Google/Meta/Cloudflare-fronted HTTP/3 is the bulk of
+            # QUIC volume; a destination named (via DNS/SNI) as a known
+            # platform drops to low, annotated, instead of vanishing.
+            severity = _apply_known_service_downgrade(
+                analyzer, dst, 'medium', details)
             alerts.append({
-                'severity': 'medium',
+                'severity': severity,
                 'category': 'quic_high_volume_new_dest',
                 'title': 'High-volume QUIC to new destination',
                 'description': (
-                    f"{rec['bytes']:,} bytes ({rec['packets']:,} packets) of "
-                    f"QUIC/HTTP3 traffic to previously-unseen server {dst} "
-                    f"from {len(sources)} local host(s). QUIC is opaque to "
-                    f"most flow inspection — volume to a brand-new dest is "
-                    f"worth a closer look."
+                    f"{rec['bytes']:,} bytes ({rec['packets']:,} pacotes) de "
+                    f"tráfego QUIC/HTTP3 para o servidor {dst}, nunca visto "
+                    f"antes, de {len(sources)} host(s) local(is). O QUIC é "
+                    f"opaco para a maioria da inspeção de fluxo — volume para "
+                    f"um destino novo merece um olhar mais atento."
                 ),
                 'ip': primary_src or dst,
-                'details': {
-                    'destination': dst,
-                    'bytes': rec['bytes'],
-                    'packets': rec['packets'],
-                    'sources': sources,
-                    'versions': sorted(rec['versions']),
-                    'threshold_bytes': min_bytes,
-                    'threshold_packets': min_packets,
-                },
+                'details': details,
                 'recommendation': (
-                    "Identify the resolving domain (correlate with DNS / "
-                    "SNI from cohabiting TCP flows), confirm whether the "
-                    "destination is an approved service (Cloudflare, "
-                    "Google, Akamai, Microsoft 365), and consider a "
-                    "policy that downgrades unsanctioned QUIC to TCP/443 "
-                    "so inspection still works."
+                    "Identifique o domínio resolvido (correlacione com DNS / "
+                    "SNI de fluxos TCP concomitantes), confirme se o "
+                    "destino é um serviço aprovado (Cloudflare, "
+                    "Google, Akamai, Microsoft 365) e considere uma "
+                    "política que rebaixe QUIC não sancionado para TCP/443 "
+                    "para que a inspeção continue funcionando."
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1071.001',
@@ -1373,23 +1632,27 @@ class DohDetector(PostDetector):
                 continue
             seen.add(key)
 
+            # Browsers and Windows 11 ship DoH to the big resolvers by
+            # default: an SNI hit is a policy/visibility finding (low). A
+            # provider IP reached WITHOUT SNI is not a browser shape (medium);
+            # an operator-listed DoH JA3 is explicit intel (high).
             if method == 'sni':
-                severity = 'medium'
+                severity = 'low'
                 desc = (
-                    f'TLS ClientHello from {src} to {dst}:{dport} with SNI '
-                    f'"{sni}" matches DoH provider "{evidence}"'
+                    f'ClientHello TLS de {src} para {dst}:{dport} com SNI '
+                    f'"{sni}" corresponde ao provedor DoH "{evidence}"'
                 )
             elif method == 'ja3':
                 severity = 'high'
                 desc = (
-                    f'TLS ClientHello from {src} to {dst}:{dport} matches '
-                    f'known DoH client JA3 ({evidence})'
+                    f'ClientHello TLS de {src} para {dst}:{dport} corresponde '
+                    f'ao JA3 de cliente DoH conhecido ({evidence})'
                 )
             else:  # ip_no_sni
-                severity = 'high'
+                severity = 'medium'
                 desc = (
-                    f'TLS ClientHello from {src} to {dst}:{dport} without '
-                    f'SNI, destination IP is a known DoH provider '
+                    f'ClientHello TLS de {src} para {dst}:{dport} sem '
+                    f'SNI; o IP de destino é um provedor DoH conhecido '
                     f'({evidence})'
                 )
 
@@ -1408,14 +1671,15 @@ class DohDetector(PostDetector):
                     'provider_host': matched_host,
                 },
                 'recommendation': (
-                    'DoH bypasses corporate DNS visibility — DGA, NXDOMAIN '
-                    'spike, fast-flux and tunneling detectors are blind to '
-                    'resolution that happens inside this TLS flow. If the '
-                    'DoH usage is not explicitly approved, block egress to '
-                    'public DoH endpoints on 443 (by SNI or IP) and force '
-                    'clients through the corporate resolver. Browsers '
-                    '(Firefox / Chrome / Edge) and OS-level DoH (Windows 11) '
-                    'all support fall-back to system DNS.'
+                    'O DoH contorna a visibilidade de DNS corporativo — os '
+                    'detectores de DGA, pico de NXDOMAIN, fast-flux e '
+                    'tunelamento ficam cegos à resolução que acontece dentro '
+                    'deste fluxo TLS. Se o uso de DoH não for explicitamente '
+                    'aprovado, bloqueie a saída para endpoints DoH públicos na '
+                    '443 (por SNI ou IP) e force os clientes pelo resolver '
+                    'corporativo. Navegadores (Firefox / Chrome / Edge) e o '
+                    'DoH em nível de SO (Windows 11) suportam fallback para o '
+                    'DNS do sistema.'
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1071.004',
@@ -1448,8 +1712,9 @@ class DohDetector(PostDetector):
                 'category': 'dns',
                 'title': 'DNS-over-HTTPS (DoH) Connection',
                 'description': (
-                    f'Host {src} sent a plaintext HTTP {req.get("method", "GET")} '
-                    f'to DoH endpoint {host}{req.get("path", "")[:80]}'
+                    f'O host {src} enviou um HTTP {req.get("method", "GET")} em '
+                    f'texto claro para o endpoint DoH '
+                    f'{host}{req.get("path", "")[:80]}'
                 ),
                 'ip': src,
                 'details': {
@@ -1460,10 +1725,10 @@ class DohDetector(PostDetector):
                     'matched': matched_host,
                 },
                 'recommendation': (
-                    'Plaintext DoH (HTTP, not HTTPS) is unusual — it is '
-                    'either a misconfigured client or a deliberate proxy. '
-                    'Inspect the requesting host and force DNS through the '
-                    'corporate resolver.'
+                    'DoH em texto claro (HTTP, não HTTPS) é incomum — é ou um '
+                    'cliente mal configurado ou um proxy deliberado. Inspecione '
+                    'o host solicitante e force o DNS pelo resolver '
+                    'corporativo.'
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1071.004',
@@ -1668,16 +1933,16 @@ class CobaltStrikeDetector(PostDetector):
             evidence_parts = []
             if rec['checksum_hits']:
                 evidence_parts.append(
-                    f'{len(rec["checksum_hits"])} checksum8 stager URI(s)'
+                    f'{len(rec["checksum_hits"])} URI(s) de stager checksum8'
                 )
             if rec['uri_hits']:
                 evidence_parts.append(
-                    f'{len(rec["uri_hits"])} default-profile URI(s)'
+                    f'{len(rec["uri_hits"])} URI(s) de perfil padrão'
                 )
             if rec['ua_hits']:
-                evidence_parts.append('default User-Agent')
+                evidence_parts.append('User-Agent padrão')
             if rec['cookie_hits']:
-                evidence_parts.append('default Cookie pattern')
+                evidence_parts.append('padrão de Cookie padrão')
             if ja3_hits:
                 evidence_parts.append(f'CS JA3 ({ja3_hits[0][1]})')
 
@@ -1686,10 +1951,10 @@ class CobaltStrikeDetector(PostDetector):
                 'category': 'c2',
                 'title': 'Cobalt Strike Malleable C2 Profile',
                 'description': (
-                    f'Host {src} → {dst}: '
+                    f'O host {src} → {dst}: '
                     + ', '.join(evidence_parts)
-                    + '. Consistent with Cobalt Strike default/leaked '
-                    'malleable C2 profile.'
+                    + '. Consistente com o perfil de C2 malleable '
+                    'padrão/vazado do Cobalt Strike.'
                 ),
                 'ip': src,
                 'details': {
@@ -1719,13 +1984,14 @@ class CobaltStrikeDetector(PostDetector):
                     ],
                 },
                 'recommendation': (
-                    'Cobalt Strike is the de facto post-exploitation framework '
-                    'in modern intrusions. Isolate the source host, preserve '
-                    'memory and disk for forensics, block the destination at '
-                    'firewall/proxy, hunt for lateral movement (SMB/WinRM/RPC) '
-                    'and inspect concurrent beaconing alerts for the same '
-                    'host. If the team is running an authorized red-team '
-                    'exercise, confirm scope before remediating.'
+                    'O Cobalt Strike é o framework de pós-exploração de fato '
+                    'nas intrusões modernas. Isole o host de origem, preserve '
+                    'memória e disco para forense, bloqueie o destino no '
+                    'firewall/proxy, procure por movimento lateral '
+                    '(SMB/WinRM/RPC) e inspecione alertas de beaconing '
+                    'simultâneos para o mesmo host. Se a equipe estiver '
+                    'rodando um exercício de red-team autorizado, confirme o '
+                    'escopo antes de remediar.'
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1071.001',
@@ -1745,6 +2011,14 @@ class CobaltStrikeDetector(PostDetector):
 import re as _re
 
 # Compiled once at import for the ExploitPayloadDetector.
+# Cloud metadata endpoints. A request whose OWN destination is one of these
+# is the VM talking to its hypervisor (normal); SSRF is the address showing up
+# inside a request aimed at some other server.
+_METADATA_HOSTS = frozenset({
+    '169.254.169.254', '169.254.170.2', '100.100.100.200',
+    'metadata.google.internal', 'metadata.aliyuncs.com',
+})
+
 # Each entry: (name, severity, MITRE technique-id, MITRE technique-name, compiled regex)
 # Patterns são intencionalmente largos para cobrir variantes ofuscadas — o
 # evaluator de Log4Shell normaliza ${lower:j}, ${::-j}, ${env:VAR:-j} etc.
@@ -1779,8 +2053,13 @@ _EXPLOIT_PATTERNS = [
         'T1190',
         'Exploit Public-Facing Application',
         _re.compile(
-            r'/autodiscover/autodiscover\.json|/ecp/[^?\s]+\?'
-            r'.*(?:Email|schema)=[^&\s]*autodiscover',
+            # Plain /autodiscover/autodiscover.json is every Outlook client
+            # looking up its mailbox; the exploit is the SSRF shape with an
+            # '@' right after the query mark, or autodiscover smuggled in the
+            # Email=/schema= parameter.
+            r'/autodiscover/autodiscover\.json\?[^\s&]*@'
+            r'|(?:Email|schema)=[^&\s]*autodiscover(?:/|%2f)autodiscover'
+            r'|/ecp/[^?\s]+\?.*(?:Email|schema)=[^&\s]*autodiscover',
             _re.IGNORECASE,
         ),
     ),
@@ -1845,6 +2124,11 @@ _EXPLOIT_PATTERNS = [
 ]
 
 
+_SSRF_IMDS_IDX = next(
+    i for i, p in enumerate(_EXPLOIT_PATTERNS)
+    if p[0] == 'SSRF probe to cloud metadata endpoint')
+
+
 class ExploitPayloadDetector(PostDetector):
     """Detect known-exploit payload patterns in HTTP requests.
 
@@ -1880,11 +2164,18 @@ class ExploitPayloadDetector(PostDetector):
             # patterns olham trechos próprios. Varrer uma única vez evita
             # custo de N matches por request.
             blob = '\n'.join((path, host, headers, body))
+            host_only = host.lower().split(':', 1)[0].strip().rstrip('.')
+            direct_metadata = (req.get('dst') in _METADATA_HOSTS
+                               or host_only in _METADATA_HOSTS)
+            outbound = (self.analyzer._is_local_ip(src)
+                        and not self.analyzer._is_local_ip(req.get('dst')))
             for idx, (_name, _sev, _tid, _tname, regex) in enumerate(
                 _EXPLOIT_PATTERNS,
             ):
+                if idx == _SSRF_IMDS_IDX and direct_metadata:
+                    continue
                 if regex.search(blob):
-                    key = (src, idx)
+                    key = (src, idx, outbound)
                     if len(hits[key]) < self.MAX_SAMPLES:
                         hits[key].append({
                             'method': req.get('method', ''),
@@ -1892,21 +2183,30 @@ class ExploitPayloadDetector(PostDetector):
                             'path': path[:200],
                         })
         alerts = []
-        for (src, idx), samples in hits.items():
-            name, severity, tid, tname, _regex = _EXPLOIT_PATTERNS[idx]
+        from . import _SEV_LADDER
+        for (src, idx, outbound), samples in hits.items():
+            name, base_sev, tid, tname, _regex = _EXPLOIT_PATTERNS[idx]
+            severity = base_sev
+            # Local client -> external server: our host is the sender, which
+            # is far more often an app with odd query strings than an
+            # attacker. Critical (Log4Shell & co.) stays critical.
+            if outbound and severity != 'critical':
+                severity = _SEV_LADDER[max(1, _SEV_LADDER.index(severity) - 1)]
             alerts.append({
                 'severity': severity,
                 'category': 'http',
                 'title': f'Exploit Payload Detected: {name}',
                 'description': (
-                    f'Host {src} sent HTTP requests matching the '
-                    f'{name} pattern. Payload-level signature — pode ser '
+                    f'O host {src} enviou requisições HTTP correspondendo ao '
+                    f'padrão {name}. Assinatura em nível de payload — pode ser '
                     f'tentativa real de exploração ou scan automatizado.'
                 ),
                 'ip': src,
                 'details': {
                     'src': src,
                     'pattern': name,
+                    'outbound': outbound,
+                    'severity_original': base_sev,
                     'match_count': len(samples),
                     'samples': samples,
                 },
@@ -1956,13 +2256,15 @@ class EncryptedClientHelloDetector(PostDetector):
                 continue
             seen.add(key)
             sni = ch.get('sni') or '(none)'
+            # Default-on in Chrome/Firefox against Cloudflare-fronted sites:
+            # a visibility note for the defender, not an indicator.
             alerts.append({
-                'severity': 'medium',
+                'severity': 'low',
                 'category': 'tls',
                 'title': 'TLS Encrypted Client Hello (ECH)',
                 'description': (
-                    f'TLS handshake {src} -> {dst}:{dport} contains the '
-                    f'encrypted_client_hello extension (0xfe0d). Outer SNI={sni}.'
+                    f'O handshake TLS {src} -> {dst}:{dport} contém a '
+                    f'extensão encrypted_client_hello (0xfe0d). SNI externo={sni}.'
                 ),
                 'ip': src,
                 'details': {
@@ -2031,11 +2333,11 @@ class GreyNoiseRiotDetector(PostDetector):
                 'category': 'scan',
                 'title': 'Scanner classified BENIGN by GreyNoise',
                 'description': (
-                    f'IP {src_ip} (which triggered a port-scan alert) is '
-                    f'tagged by GreyNoise as {label} '
-                    f'(riot={is_riot}, classification={classification or "—"}). '
-                    'This is typically an internet-wide scanner (Shodan, '
-                    'Censys, Project Sonar) — informational only.'
+                    f'O IP {src_ip} (que disparou um alerta de port-scan) é '
+                    f'marcado pela GreyNoise como {label} '
+                    f'(riot={is_riot}, classificação={classification or "—"}). '
+                    'Isto normalmente é um scanner de escala mundial (Shodan, '
+                    'Censys, Project Sonar) — apenas informativo.'
                 ),
                 'ip': src_ip,
                 'details': {
@@ -2048,9 +2350,10 @@ class GreyNoiseRiotDetector(PostDetector):
                     'nmap_fingerprint': scan_info.get('nmap_like'),
                 },
                 'recommendation': (
-                    'If the policy allows benign internet scanners, you can '
-                    'safely down-prioritize the related Port Scan alert. '
-                    'Otherwise block at perimeter as usual.'
+                    'Se a política permitir scanners benignos da internet, '
+                    'você pode despriorizar com segurança o alerta de Port '
+                    'Scan relacionado. Caso contrário, bloqueie no perímetro '
+                    'como de costume.'
                 ),
             })
         return alerts
@@ -2149,8 +2452,8 @@ class KevEnricherDetector(PostDetector):
             if (ransomware_match and alert.get('severity') != 'critical'):
                 details['severity_original'] = alert.get('severity')
                 details['severity_reason'] = (
-                    'Promoted to critical: matches a CISA KEV entry with '
-                    'known ransomware-campaign use.'
+                    'Promovido a critical: corresponde a uma entrada do CISA '
+                    'KEV com uso conhecido em campanhas de ransomware.'
                 )
                 alert['severity'] = 'critical'
             alert['details'] = details
@@ -2171,8 +2474,9 @@ class KevEnricherDetector(PostDetector):
                         f"({hit['vendor']} {hit['product']})".strip()
                     ),
                     'description': (
-                        f"An alert referencing {hit['cve']} matches the CISA "
-                        f"Known Exploited Vulnerabilities catalog. "
+                        f"Um alerta referenciando {hit['cve']} corresponde ao "
+                        f"catálogo CISA de Vulnerabilidades Exploradas "
+                        f"Conhecidas (KEV). "
                         f"{hit['name'] or hit['short_description']}"
                     ),
                     'ip': ip_for_summary,
@@ -2188,8 +2492,9 @@ class KevEnricherDetector(PostDetector):
                     },
                     'recommendation': (
                         hit['required_action']
-                        or 'Patch immediately; this CVE is actively exploited '
-                           'per CISA. Hunt for post-exploitation activity.'
+                        or 'Aplique o patch imediatamente; este CVE está sendo '
+                           'ativamente explorado segundo a CISA. Procure por '
+                           'atividade de pós-exploração.'
                     ),
                     'mitre_attack': {
                         'technique_id':   'T1190',

@@ -108,8 +108,8 @@ def analyze_behavioral_baseline(results, settings=None):
             'category': 'behavioral',
             'title': 'First-Seen External Destination',
             'description': (
-                f'External IP {ip} appears for the first time in this network '
-                f'(no record across {history_count} prior scan(s))'
+                f'O IP externo {ip} aparece pela primeira vez nesta rede '
+                f'(sem registro em {history_count} scan(s) anterior(es))'
             ),
             'ip': ip,
             'details': {
@@ -119,8 +119,9 @@ def analyze_behavioral_baseline(results, settings=None):
                 'historical_scans_checked': history_count,
             },
             'recommendation': (
-                'Validate that this destination is expected for this host or business unit. '
-                'First-seen external IPs are a leading indicator of new C2 channels.'
+                'Valide se este destino é esperado para este host ou unidade '
+                'de negócio. IPs externos vistos pela primeira vez são um '
+                'indicador importante de novos canais de C2.'
             ),
         })
 
@@ -143,8 +144,8 @@ def analyze_behavioral_baseline(results, settings=None):
             'category': 'behavioral',
             'title': 'New Protocol on Known Host',
             'description': (
-                f'Host {ip} is using protocol(s) {sorted(new_protos)} '
-                f'never previously observed on it'
+                f'O host {ip} está usando o(s) protocolo(s) {sorted(new_protos)} '
+                f'nunca antes observado(s) nele'
             ),
             'ip': ip,
             'details': {
@@ -153,9 +154,10 @@ def analyze_behavioral_baseline(results, settings=None):
                 'historical_protocols': sorted(history_protos),
             },
             'recommendation': (
-                'Confirm this protocol change is expected (new app deployed, OS update, '
-                'remote-admin tool installed). Sudden protocol shifts often indicate '
-                'malware staging or pivoting.'
+                'Confirme se esta mudança de protocolo é esperada (novo app '
+                'implantado, atualização de SO, ferramenta de admin remoto '
+                'instalada). Mudanças bruscas de protocolo frequentemente '
+                'indicam preparação de malware ou pivoteamento.'
             ),
         })
 
@@ -179,8 +181,8 @@ def analyze_behavioral_baseline(results, settings=None):
                 'category': 'behavioral',
                 'title': 'Outbound Volume Surge vs Baseline',
                 'description': (
-                    f'Host {ip} sent {cur_sent / 1_000_000:.1f} MB '
-                    f'(>= {multiplier:.0f}x historical median {med_sent / 1_000_000:.1f} MB)'
+                    f'O host {ip} enviou {cur_sent / 1_000_000:.1f} MB '
+                    f'(>= {multiplier:.0f}x a mediana histórica de {med_sent / 1_000_000:.1f} MB)'
                 ),
                 'ip': ip,
                 'details': {
@@ -191,8 +193,10 @@ def analyze_behavioral_baseline(results, settings=None):
                     'history_window_scans': len(history),
                 },
                 'recommendation': (
-                    'Sudden outbound volume spikes are a top indicator of data exfiltration. '
-                    'Check destination IPs and correlate with file-share or HTTP exfil alerts.'
+                    'Picos repentinos de volume de saída são um dos principais '
+                    'indicadores de exfiltração de dados. Verifique os IPs de '
+                    'destino e correlacione com alertas de compartilhamento de '
+                    'arquivos ou exfil HTTP.'
                 ),
             })
 
@@ -202,8 +206,8 @@ def analyze_behavioral_baseline(results, settings=None):
                 'category': 'behavioral',
                 'title': 'Inbound Volume Surge vs Baseline',
                 'description': (
-                    f'Host {ip} received {cur_recv / 1_000_000:.1f} MB '
-                    f'(>= {multiplier:.0f}x historical median {med_recv / 1_000_000:.1f} MB)'
+                    f'O host {ip} recebeu {cur_recv / 1_000_000:.1f} MB '
+                    f'(>= {multiplier:.0f}x a mediana histórica de {med_recv / 1_000_000:.1f} MB)'
                 ),
                 'ip': ip,
                 'details': {
@@ -214,8 +218,9 @@ def analyze_behavioral_baseline(results, settings=None):
                     'history_window_scans': len(history),
                 },
                 'recommendation': (
-                    'Inbound spikes can indicate large downloads, malware payload delivery, '
-                    'or unusual server load. Review the source IPs.'
+                    'Picos de entrada podem indicar downloads grandes, entrega '
+                    'de payload de malware ou carga incomum no servidor. Revise '
+                    'os IPs de origem.'
                 ),
             })
 
@@ -263,16 +268,16 @@ def analyze_behavioral_baseline(results, settings=None):
         seasonality_candidates.sort(key=lambda x: len(x[1]), reverse=True)
         for r, historical in seasonality_candidates[:max_seasonality_alerts]:
             ip = r['ip']
-            day_name = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][current_how // 24]
+            day_name = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'][current_how // 24]
             hour = current_how % 24
             alerts_out.append({
                 'severity': 'medium',
                 'category': 'behavioral',
                 'title': 'Activity in Unusual Time Window',
                 'description': (
-                    f'Host {ip} is active at {day_name} {hour:02d}:00, a window where '
-                    f'it has never been observed across {len(historical)} distinct '
-                    f'historical hour-of-week buckets'
+                    f'O host {ip} está ativo em {day_name} {hour:02d}:00, uma '
+                    f'janela em que nunca foi observado nos {len(historical)} '
+                    f'buckets distintos de hora-da-semana do histórico'
                 ),
                 'ip': ip,
                 'details': {
@@ -284,10 +289,11 @@ def analyze_behavioral_baseline(results, settings=None):
                     'sample_historical_hours': sorted(historical)[:24],
                 },
                 'recommendation': (
-                    'Off-schedule activity is a leading indicator of compromise '
-                    '(scheduled tasks dropped by malware, attacker-controlled '
-                    'sessions, after-hours data staging). Validate that a human '
-                    'or business process explains the activity.'
+                    'Atividade fora do horário é um indicador importante de '
+                    'comprometimento (tarefas agendadas soltas por malware, '
+                    'sessões controladas por atacante, preparação de dados fora '
+                    'do expediente). Valide que um humano ou processo de '
+                    'negócio explica a atividade.'
                 ),
             })
 
@@ -310,7 +316,7 @@ def analyze_behavioral_baseline(results, settings=None):
                 'severity': 'low',
                 'category': 'behavioral',
                 'title': 'New Internal Host Active on Network',
-                'description': f'Internal host {ip} is observed for the first time',
+                'description': f'O host interno {ip} é observado pela primeira vez',
                 'ip': ip,
                 'details': {
                     'ip': ip,
@@ -318,8 +324,9 @@ def analyze_behavioral_baseline(results, settings=None):
                     'protocols': r.get('protocols', []),
                 },
                 'recommendation': (
-                    'Verify this is an authorized device. Unknown internal hosts can be '
-                    'rogue devices, BYOD, or attacker-deployed implants.'
+                    'Verifique se este é um dispositivo autorizado. Hosts '
+                    'internos desconhecidos podem ser dispositivos não '
+                    'autorizados, BYOD ou implantes plantados por atacante.'
                 ),
             })
 

@@ -89,21 +89,69 @@ def _apply_sanctioned_downgrade(analyzer, dst_ip, severity, details,
     details['dest_hostnames'] = sorted(hostnames)[:5]
     details['severity_original'] = severity
     details['severity_reason'] = (
-        f'Downgraded: destination resolves to sanctioned bulk-transfer '
-        f'service ({match}). Verify the upload is expected before dismissing.'
+        f'Rebaixado: o destino resolve para um serviço sancionado de '
+        f'transferência em massa ({match}). Confirme se o upload é esperado '
+        f'antes de descartar.'
     )
     description += (
-        f' Destination matches a sanctioned bulk service ({match}) — '
-        'likely legitimate cloud/backup/update traffic, but confirm.'
+        f' O destino corresponde a um serviço sancionado de transferência em '
+        f'massa ({match}) — provavelmente tráfego legítimo de '
+        'cloud/backup/atualização, mas confirme.'
     )
     recommendation = (
-        f'The destination ({match}) is a known cloud/backup/update/'
-        'conferencing service that legitimately moves large volumes '
-        'outbound. Confirm the owning application and that the upload is '
-        'expected; note that these services are also abused for exfil, so '
-        'do not dismiss without checking what was transferred. ' + recommendation
+        f'O destino ({match}) é um serviço conhecido de '
+        'cloud/backup/atualização/conferência que legitimamente move grandes '
+        'volumes para fora. Confirme a aplicação dona e que o upload é '
+        'esperado; note que esses serviços também são abusados para exfil, '
+        'então não descarte sem verificar o que foi transferido. ' + recommendation
     )
     return new_severity, description, recommendation
+
+
+def _apply_known_service_downgrade(analyzer, dst_ip, severity, details):
+    """Lower `severity` one notch when `dst_ip` resolves (SNI / HTTP Host /
+    DNS answer seen in the capture) to a large, well-known platform
+    (OS vendors, push/telemetry, CDN, collaboration SaaS) — the usual
+    source of periodic check-ins and opaque QUIC volume.
+
+    Never suppresses: C2 does hide behind these platforms (domain fronting,
+    cloud functions), so the alert stays visible, annotated in `details`.
+    Returns the (possibly lowered) severity.
+    """
+    from ..constants import KNOWN_BENIGN_SERVICE_SUFFIXES, hostname_suffix_match
+    try:
+        hostnames = analyzer._hostname_index().get(dst_ip) or set()
+    except Exception:
+        hostnames = set()
+    if not hostnames:
+        return severity
+    details.setdefault('dest_hostnames', sorted(hostnames)[:5])
+    match = hostname_suffix_match(hostnames, KNOWN_BENIGN_SERVICE_SUFFIXES)
+    if not match:
+        return severity
+    try:
+        idx = _SEV_LADDER.index(severity)
+    except ValueError:
+        idx = 2
+    new_severity = _SEV_LADDER[max(1, idx - 1)]
+    if new_severity != severity:
+        details['severity_original'] = severity
+    details['known_service'] = match
+    details['severity_reason'] = (
+        f'Rebaixado: o destino resolve para um serviço conhecido ({match}), '
+        'fonte comum de tráfego periódico legítimo (telemetria, push, '
+        'atualização). Confirme a aplicação antes de descartar.'
+    )
+    return new_severity
+
+
+def _cap_severity(severity, cap):
+    """min(severity, cap) on the info..critical ladder."""
+    try:
+        return _SEV_LADDER[min(_SEV_LADDER.index(severity),
+                               _SEV_LADDER.index(cap))]
+    except ValueError:
+        return severity
 
 
 class TcpFlowTracker:
@@ -199,14 +247,18 @@ class TcpFlowTracker:
                 rec['syn_ack_seen'] = True
 
         try:
-            if Raw in pkt:
-                n = len(bytes(pkt[Raw].load))
-                if n > 0:
-                    rec['data_seen'] = True
-                    if sender_is_client:
-                        rec['bytes_c2s'] += n
-                    else:
-                        rec['bytes_s2c'] += n
+            # Header-derived payload length first: Raw is missing whenever
+            # scapy dissects the payload (SMB2/NetBIOS), which made SMB
+            # sessions look data-less ("not established", 0 bytes).
+            n = getattr(pkt[TCP], 'plen', None)
+            if n is None:
+                n = len(bytes(pkt[Raw].load)) if Raw in pkt else 0
+            if n > 0:
+                rec['data_seen'] = True
+                if sender_is_client:
+                    rec['bytes_c2s'] += n
+                else:
+                    rec['bytes_s2c'] += n
         except Exception:
             pass
 
@@ -338,11 +390,16 @@ class PortScanStreamingDetector(StreamingDetector):
         self.threshold_ports = self.thresholds.get('port_scan_min_ports', 20)
         self.threshold_time = self.thresholds.get('port_scan_time_window', 30)
         self.slow_multiplier = self.thresholds.get('port_scan_slow_multiplier', 5)
+        # Probes are grouped per (source, TARGET): a vertical port scan is
+        # many ports on ONE host. The pre-2026-09 code pooled every SYN of a
+        # source regardless of destination, so a P2P/BitTorrent/VoIP client
+        # or a NAT gateway opening connections to 20+ different peers, each
+        # on its own random port, looked exactly like a port scan. Many
+        # targets x one port each is the horizontal-scan detector's job.
         self.syn_by_src = defaultdict(
             lambda: {
-                'ports': [], 'timestamps': [],
+                'per_dst': defaultdict(lambda: {'ports': [], 'timestamps': []}),
                 'windows': Counter(), 'opt_sets': Counter(),
-                'dsts': Counter(),
                 'syn_count': 0,
             }
         )
@@ -359,9 +416,9 @@ class PortScanStreamingDetector(StreamingDetector):
         if not (flags & 0x02) or (flags & 0x10):
             return
         rec = self.syn_by_src[pkt[IP].src]
-        rec['ports'].append(int(pkt[TCP].dport))
-        rec['timestamps'].append(float(pkt.time))
-        rec['dsts'][pkt[IP].dst] += 1
+        dst_rec = rec['per_dst'][pkt[IP].dst]
+        dst_rec['ports'].append(int(pkt[TCP].dport))
+        dst_rec['timestamps'].append(float(pkt.time))
         rec['syn_count'] += 1
         # Window + TCP option names (kept as a tuple so it's hashable).
         # PktView pre-extracts them for pure-SYN packets as `window` /
@@ -445,6 +502,55 @@ class PortScanStreamingDetector(StreamingDetector):
             return True, 'nmap -sS default SYN scan (window=1024, no TS/WS)'
         return False, ''
 
+    def _evaluate_target(self, ports_seq, ts_seq):
+        """Scan verdict for the SYNs one source sent to ONE target.
+
+        Returns None when below threshold, else (scan_type, ports_count,
+        duration, ports_sample, total_unique, first_ts, last_ts). 'fast' =
+        >= threshold distinct ports inside the sliding window; 'slow' =
+        >= threshold*slow_multiplier distinct ports over the whole capture.
+        """
+        if not ts_seq:
+            return None
+        total_unique = len(set(ports_seq))
+        if total_unique < self.threshold_ports:
+            return None
+        order = sorted(range(len(ts_seq)), key=lambda i: ts_seq[i])
+        sorted_ts = [ts_seq[i] for i in order]
+        sorted_ports = [ports_seq[i] for i in order]
+        window = self.threshold_time
+        best_ports = 0
+        best_duration = 0.0
+        best_sample = []
+        counts = Counter()
+        distinct = 0
+        j = 0
+        n = len(sorted_ts)
+        for i in range(n):
+            while j < n and sorted_ts[j] - sorted_ts[i] <= window:
+                p = sorted_ports[j]
+                if counts[p] == 0:
+                    distinct += 1
+                counts[p] += 1
+                j += 1
+            if distinct > best_ports:
+                best_ports = distinct
+                best_duration = sorted_ts[j - 1] - sorted_ts[i] if j > i else 0
+                best_sample = sorted(set(sorted_ports[i:j]))[:20]
+            p = sorted_ports[i]
+            counts[p] -= 1
+            if counts[p] == 0:
+                distinct -= 1
+                del counts[p]
+        if best_ports >= self.threshold_ports:
+            return ('fast', best_ports, best_duration, best_sample,
+                    total_unique, sorted_ts[0], sorted_ts[-1])
+        if total_unique >= self.threshold_ports * self.slow_multiplier:
+            return ('slow', total_unique, sorted_ts[-1] - sorted_ts[0],
+                    sorted(set(sorted_ports))[:20], total_unique,
+                    sorted_ts[0], sorted_ts[-1])
+        return None
+
     def finalize(self):
         from ..constants import (
             SCAN_DURATION_BAND_ULTRA_SLOW_SEC,
@@ -454,60 +560,23 @@ class PortScanStreamingDetector(StreamingDetector):
         # Expose scan sources for downstream GreyNoise RIOT enrichment.
         scan_sources = {}
         for src_ip, data in self.syn_by_src.items():
-            ports_seq = data['ports']
-            ts_seq = data['timestamps']
-            if not ts_seq:
+            # Evaluate each target separately; keep the targets that were
+            # actually port-scanned and report the strongest one.
+            qualifying = []  # (rank, dst, scan_type, ports_count, duration, sample, total_unique, first, last)
+            for dst_ip, drec in data['per_dst'].items():
+                res = self._evaluate_target(drec['ports'], drec['timestamps'])
+                if res is None:
+                    continue
+                scan_type_d, ports_d, dur_d, sample_d, uniq_d, first_d, last_d = res
+                rank = (1 if scan_type_d == 'fast' else 0, ports_d)
+                qualifying.append((rank, dst_ip, scan_type_d, ports_d, dur_d,
+                                   sample_d, uniq_d, first_d, last_d))
+            if not qualifying:
                 continue
-            total_unique = len(set(ports_seq))
-            if total_unique < self.threshold_ports:
-                continue
-            # Ordena por timestamp para janela deslizante
-            order = sorted(range(len(ts_seq)), key=lambda i: ts_seq[i])
-            sorted_ts = [ts_seq[i] for i in order]
-            sorted_ports = [ports_seq[i] for i in order]
+            qualifying.sort(key=lambda q: q[0], reverse=True)
+            (_rank, primary_dst, scan_type, ports_count, duration,
+             ports_sample, total_unique, first_ts, last_ts) = qualifying[0]
             window = self.threshold_time
-            # Janela deslizante via two-pointer + frequência de portas
-            best_window_ports = 0
-            best_window_duration = 0.0
-            best_window_sample = []
-            counts = Counter()
-            distinct = 0
-            j = 0
-            n = len(sorted_ts)
-            for i in range(n):
-                while j < n and sorted_ts[j] - sorted_ts[i] <= window:
-                    p = sorted_ports[j]
-                    if counts[p] == 0:
-                        distinct += 1
-                    counts[p] += 1
-                    j += 1
-                if distinct > best_window_ports:
-                    best_window_ports = distinct
-                    best_window_duration = sorted_ts[j-1] - sorted_ts[i] if j > i else 0
-                    best_window_sample = sorted(set(sorted_ports[i:j]))[:20]
-                # remove i de counts antes da próxima iteração
-                p = sorted_ports[i]
-                counts[p] -= 1
-                if counts[p] == 0:
-                    distinct -= 1
-                    del counts[p]
-            scan_type = None
-            ports_count = 0
-            duration = 0.0
-            ports_sample = []
-            if best_window_ports >= self.threshold_ports:
-                scan_type = 'fast'
-                ports_count = best_window_ports
-                duration = best_window_duration
-                ports_sample = best_window_sample
-            elif total_unique >= self.threshold_ports * self.slow_multiplier:
-                # Slow scan: limiar mais alto, sem exigência de janela
-                scan_type = 'slow'
-                ports_count = total_unique
-                duration = sorted_ts[-1] - sorted_ts[0]
-                ports_sample = sorted(set(sorted_ports))[:20]
-            else:
-                continue
 
             # Onda 6 — duration band labelling for slow scans.
             if scan_type == 'slow':
@@ -543,9 +612,8 @@ class PortScanStreamingDetector(StreamingDetector):
                 'nmap_label': nmap_label,
             }
 
-            # Alvo(s) do scan — host(s) de destino dos SYNs deste src.
-            targets = [ip for ip, _ in data['dsts'].most_common()]
-            primary_dst = targets[0] if targets else None
+            # Alvo(s) do scan — só hosts que de fato tiveram portas varridas.
+            targets = [q[1] for q in qualifying]
             if not primary_dst:
                 target_str = 'an unknown host'
             elif len(targets) == 1:
@@ -554,11 +622,11 @@ class PortScanStreamingDetector(StreamingDetector):
                 target_str = f'{len(targets)} hosts (e.g. {primary_dst})'
 
             description = (
-                f'IP {src_ip} scanned {ports_count} ports on {target_str} in '
-                f'{duration:.2f} seconds ({duration_band})'
+                f'O IP {src_ip} varreu {ports_count} portas em {target_str} em '
+                f'{duration:.2f} segundos ({duration_band})'
             )
             if nmap_like:
-                description += f'. TCP profile: {nmap_label}.'
+                description += f'. Perfil TCP: {nmap_label}.'
             severity = self._scan_severity(src_ip, primary_dst, nmap_like)
             alerts.append({
                 'severity': severity,
@@ -589,16 +657,16 @@ class PortScanStreamingDetector(StreamingDetector):
                     'ports': ports_sample,
                     'scan_type': scan_type,
                     'total_unique_ports': total_unique,
-                    'first_ts': sorted_ts[0] if sorted_ts else 0.0,
-                    'last_ts': sorted_ts[-1] if sorted_ts else 0.0,
+                    'first_ts': first_ts,
+                    'last_ts': last_ts,
                     'nmap_fingerprint': nmap_like,
                     'nmap_label': nmap_label,
                     'syn_window': top_win,
                     'syn_options': top_opts,
                 },
                 'recommendation': (
-                    'Investigate host activity for possible compromise. '
-                    'Block if unauthorized scan.'
+                    'Investigue a atividade do host em busca de possível '
+                    'comprometimento. Bloqueie se for uma varredura não autorizada.'
                 ),
             })
         # Hand-off to RIOT enrichment post-detector (analyzer attr).
@@ -627,8 +695,23 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
 
     def __init__(self, analyzer):
         super().__init__(analyzer)
+        from ..constants import ALPN_WEB_OK_PORTS
         self.suspicious = analyzer.SUSPICIOUS_PORTS
         self.tracker = TcpFlowTracker()
+        self._web_ports = ALPN_WEB_OK_PORTS
+        # Who really LISTENS on the suspicious port? Ports like 4444, 1337,
+        # 1080, 5555, 6666 or 65000 are also perfectly ordinary EPHEMERAL
+        # source ports (Windows 49152-65535, NAT/PAT 1024-65535, legacy
+        # 1025-5000). Matching the port on either side turned every client
+        # that happened to draw sport=65000 for an HTTPS request into a
+        # "critical backdoor on port 65000" with an established connection.
+        # Keys are the tracker's (holder, peer, port).
+        self._listening = set()   # SYN sent TO the port / SYN-ACK FROM it
+        self._ephemeral = set()   # SYN sent FROM the port / SYN-ACK TO it
+        self._peer_is_service = set()  # peer side is a well-known service
+
+    def _is_known_service_port(self, port):
+        return port < 1024 or port in self._web_ports
 
     def update(self, pkt):
         if IP not in pkt:
@@ -644,13 +727,29 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
                 server = pkt[IP].dst
                 client = pkt[IP].src
                 sender_is_client = True
+                peer_port = sport
             elif sport in self.suspicious:
                 port = sport
                 server = pkt[IP].src
                 client = pkt[IP].dst
                 sender_is_client = False
+                peer_port = dport
             else:
                 return
+            key = (server, client, port)
+            flags = int(pkt[TCP].flags)
+            is_syn = bool(flags & 0x02)
+            is_ack = bool(flags & 0x10)
+            if is_syn and not is_ack:
+                # The SYN's destination is the listener.
+                (self._listening if sender_is_client
+                 else self._ephemeral).add(key)
+            elif is_syn and is_ack:
+                # The SYN-ACK's source is the listener.
+                (self._ephemeral if sender_is_client
+                 else self._listening).add(key)
+            if self._is_known_service_port(peer_port):
+                self._peer_is_service.add(key)
             self.tracker.observe_tcp(
                 server, client, port, pkt, sender_is_client,
             )
@@ -687,6 +786,17 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
         for (server, client, port), rec in self.tracker.flows.items():
             if port not in self.suspicious:
                 continue
+            key = (server, client, port)
+            if key not in self._listening:
+                # Handshake proves the suspicious port was the initiator's
+                # ephemeral port -> not a service on that port.
+                if key in self._ephemeral:
+                    continue
+                # Mid-stream capture (no SYN/SYN-ACK seen): if the other side
+                # is a well-known service (443, 22, 53...), the suspicious
+                # number is just the client's ephemeral port.
+                if key in self._peer_is_service:
+                    continue
             status = TcpFlowTracker.status_for(rec)
             bucket = per_host[(port, server)]
             bucket['clients'].add(client)
@@ -707,6 +817,7 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
         alerts = []
         for (port, server), bucket in per_host.items():
             name, severity = self.suspicious[port]
+            base_severity = severity
             clients_sorted = sorted(bucket['clients'])
             established_sorted = sorted(bucket['established'])
 
@@ -726,6 +837,13 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
                 conn_status = 'scan_no_response'
                 primary_client = clients_sorted[0] if clients_sorted else None
 
+            # Severity follows the evidence: nothing answered on the port
+            # (RST / silence / ICMP unreachable) means no service is there —
+            # a probe, which the scan detectors already cover. A SYN-ACK or
+            # an established session means something IS listening.
+            if conn_status in ('scan_rejected', 'scan_no_response',
+                               'icmp_unreachable'):
+                severity = 'low'
             conn_text = CONNECTION_STATUS_TEXT.get(conn_status, '')
             description = (
                 f'Porta {port} ({name}) no host {server} '
@@ -750,6 +868,9 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
                     'peer_role': 'client',
                     'connection_established': bool(established_sorted),
                     'connection_status': conn_status,
+                    'severity_original': (base_severity
+                                          if severity != base_severity
+                                          else None),
                     'bytes_exchanged': bucket['bytes_total'],
                     'established_clients': established_sorted[:10],
                     'open_clients': sorted(bucket['open'])[:10],
@@ -762,27 +883,68 @@ class SuspiciousPortsStreamingDetector(StreamingDetector):
                     'last_ts': bucket['last_ts'],
                 },
                 'recommendation': (
-                    f'Investigate traffic on port {port}. This port is '
-                    'commonly associated with malicious activity.'
-                    + (' Connection was established — likely real C2/backdoor traffic.'
+                    f'Investigue o tráfego na porta {port}. Essa porta é '
+                    'comumente associada a atividade maliciosa.'
+                    + (' A conexão foi estabelecida — provavelmente tráfego real de C2/backdoor.'
                        if established_sorted else
-                       ' No successful connection observed — likely reconnaissance scan.')
+                       ' Nenhuma conexão bem-sucedida observada — provavelmente varredura de reconhecimento.')
                 ),
             })
         return alerts
 
 
 class ArpSpoofingStreamingDetector(StreamingDetector):
-    """Streaming de _detect_arp_spoofing. Alertas emitidos no momento da
-    detecção (não no finalize) para preservar semântica do código legado."""
+    """ARP-based MITM detection.
+
+    An IP whose MAC changes is only *sometimes* an attack: DHCP handing a
+    freed address to another device, a NIC/laptop swap or a VM migration all
+    produce exactly one clean change. Poisoning has a different shape, so the
+    verdict is taken in finalize() over the whole capture:
+
+      * **flip-flop** — the IP bounces back to a MAC it already had (the
+        legitimate owner keeps answering while the attacker re-poisons);
+      * **aggressive re-announcement** — the new MAC re-claims the IP
+        >= ``arp_gratuitous_max`` times inside ``arp_claim_window`` seconds
+        (arpspoof/ettercap/bettercap refresh every 1-2 s);
+      * **dual identity** — the new MAC keeps claiming ANOTHER IP after it
+        took this one (a DHCP reassignment moves a device, it does not make
+        it answer for two addresses at once).
+
+    Any of those -> critical ``ARP Spoofing Detected``. A single change with
+    none of them -> medium ``ARP IP-to-MAC Change`` (high when the IP looks
+    like a gateway), so the analyst still sees it without a critical page.
+    The gratuitous-ARP flood counter is windowed for the same reason: every
+    host sends a few GARPs per link-up/DHCP renew, and over a day-long
+    capture a lifetime counter crossed 5 for ordinary machines.
+    """
     name = 'arp_spoofing'
+
+    MAX_TRANSITIONS_PER_IP = 50
+    MAX_CLAIMS_TRACKED = 500
 
     def __init__(self, analyzer):
         super().__init__(analyzer)
         self.threshold = self.thresholds.get('arp_gratuitous_max', 5)
+        self.claim_window = float(self.thresholds.get('arp_claim_window', 60))
+        self.device_types = (self.settings.get('device_types') or {})
         self.ip_to_mac = {}
-        self.gratuitous_count = defaultdict(int)
+        # ip -> [(ts, old_mac, new_mac)]
+        self.transitions = defaultdict(list)
+        # ip -> sequence of owning MACs (consecutive duplicates collapsed)
+        self.ip_mac_history = defaultdict(list)
+        # (mac, ip) -> last claim ts / bounded claim timestamps
+        self.claim_last = {}
+        self.claim_ts = defaultdict(list)
+        # gratuitous flood: mac -> timestamps inside the sliding window
+        self.garp_ts = defaultdict(list)
+        self.garp_total = defaultdict(int)
+        self.flood_alerted = set()
         self.alerts = []
+
+    def _is_gateway(self, ip):
+        if self.device_types.get(ip) == 'Roteador':
+            return True
+        return str(ip).rsplit('.', 1)[-1] in ('1', '254')
 
     def update(self, pkt):
         if ARP not in pkt:
@@ -796,53 +958,156 @@ class ArpSpoofingStreamingDetector(StreamingDetector):
         src_ip = a.psrc
         src_mac = a.hwsrc
         # ACD/DHCP probes announce psrc 0.0.0.0 — not an ownership claim;
-        # letting them into the tracker would poison the IP→MAC state.
+        # letting them into the tracker would poison the IP->MAC state.
         if not src_ip or src_ip == '0.0.0.0' or not src_mac:
             return
-        if src_ip in self.ip_to_mac and self.ip_to_mac[src_ip] != src_mac:
-            self.alerts.append({
-                'severity': 'critical',
-                'category': 'arp',
-                'title': 'ARP Spoofing Detected',
-                'description': (
-                    f'IP {src_ip} changed MAC from {self.ip_to_mac[src_ip]} '
-                    f'to {src_mac}'
-                ),
-                'ip': src_ip,
-                'details': {
-                    'old_mac': self.ip_to_mac[src_ip],
-                    'new_mac': src_mac,
-                },
-                'recommendation': (
-                    'Possible ARP spoofing attack. Verify network integrity '
-                    'and check for man-in-the-middle attacks.'
-                ),
-            })
+        src_mac = str(src_mac).lower()
+        try:
+            ts = float(pkt.time)
+        except Exception:
+            ts = 0.0
+        old = self.ip_to_mac.get(src_ip)
+        if old is not None and old != src_mac:
+            tr = self.transitions[src_ip]
+            if len(tr) < self.MAX_TRANSITIONS_PER_IP:
+                tr.append((ts, old, src_mac))
         self.ip_to_mac[src_ip] = src_mac
+        hist = self.ip_mac_history[src_ip]
+        if not hist or hist[-1] != src_mac:
+            if len(hist) < self.MAX_TRANSITIONS_PER_IP:
+                hist.append(src_mac)
+        self.claim_last[(src_mac, src_ip)] = ts
+        cts = self.claim_ts[(src_mac, src_ip)]
+        if len(cts) < self.MAX_CLAIMS_TRACKED:
+            cts.append(ts)
+
         if a.pdst == a.psrc:
-            self.gratuitous_count[src_mac] += 1
-            if self.gratuitous_count[src_mac] == self.threshold:
+            dq = self.garp_ts[src_mac]
+            dq.append(ts)
+            while dq and ts - dq[0] > self.claim_window:
+                dq.pop(0)
+            self.garp_total[src_mac] += 1
+            if len(dq) >= self.threshold and src_mac not in self.flood_alerted:
+                self.flood_alerted.add(src_mac)
                 self.alerts.append({
                     'severity': 'high',
                     'category': 'arp',
                     'title': 'Gratuitous ARP Flood',
                     'description': (
-                        f'MAC {src_mac} sent {self.gratuitous_count[src_mac]} '
-                        f'gratuitous ARP packets'
+                        f'O MAC {src_mac} enviou {len(dq)} pacotes ARP '
+                        f'gratuitos em {self.claim_window:.0f}s'
                     ),
                     'ip': src_ip,
                     'details': {
                         'mac': src_mac,
-                        'count': self.gratuitous_count[src_mac],
+                        'count': len(dq),
+                        'window_seconds': self.claim_window,
+                        'first_ts': dq[0],
                     },
                     'recommendation': (
-                        'Possible ARP poisoning attempt. Monitor this MAC '
-                        'address for suspicious activity.'
+                        'Possível tentativa de envenenamento ARP. Monitore '
+                        'este endereço MAC em busca de atividade suspeita.'
                     ),
                 })
 
+    def _max_claims_in_window(self, stamps, since):
+        pts = sorted(t for t in stamps if t >= since)
+        best = 0
+        j = 0
+        for i in range(len(pts)):
+            while j < len(pts) and pts[j] - pts[i] <= self.claim_window:
+                j += 1
+            best = max(best, j - i)
+        return best
+
     def finalize(self):
-        return self.alerts
+        alerts = list(self.alerts)
+        for a in alerts:
+            if a['title'] == 'Gratuitous ARP Flood':
+                a['details']['total_count'] = self.garp_total.get(
+                    a['details']['mac'], a['details']['count'])
+        mac_ips = defaultdict(set)
+        for (mac, ip) in self.claim_last:
+            mac_ips[mac].add(ip)
+        for ip, trs in self.transitions.items():
+            first_ts, old_mac, new_mac = trs[0]
+            history = self.ip_mac_history[ip]
+            flip_flop = len(set(history)) < len(history)
+            reasons = []
+            if flip_flop:
+                reasons.append(
+                    'o IP alternou de volta para um MAC anterior (flip-flop)')
+            max_burst = 0
+            dual_ips = set()
+            for ts, _old, nm in trs:
+                burst = self._max_claims_in_window(
+                    self.claim_ts.get((nm, ip), []), ts)
+                max_burst = max(max_burst, burst)
+                for other in mac_ips.get(nm, ()):
+                    if other != ip and self.claim_last.get((nm, other), 0) >= ts:
+                        dual_ips.add(other)
+            if max_burst >= self.threshold:
+                reasons.append(
+                    f'o novo MAC reanunciou o IP {max_burst}x em '
+                    f'{self.claim_window:.0f}s')
+            dual_ips = sorted(dual_ips)
+            if dual_ips:
+                reasons.append(
+                    'o novo MAC continuou respondendo também por '
+                    + ', '.join(dual_ips[:3]))
+            details = {
+                'src_ip': ip,
+                'old_mac': old_mac,
+                'new_mac': new_mac,
+                'mac_history': history[:10],
+                'transitions': len(trs),
+                'flip_flop': flip_flop,
+                'max_claims_in_window': max_burst,
+                'new_mac_other_ips': dual_ips[:10],
+                'first_ts': first_ts,
+                'last_ts': trs[-1][0],
+            }
+            if reasons:
+                details['evidence'] = reasons
+                alerts.append({
+                    'severity': 'critical',
+                    'category': 'arp',
+                    'title': 'ARP Spoofing Detected',
+                    'description': (
+                        f'O IP {ip} trocou o MAC de {old_mac} para {new_mac} '
+                        'com padrão de envenenamento: ' + '; '.join(reasons)
+                    ),
+                    'ip': ip,
+                    'details': details,
+                    'recommendation': (
+                        'Padrão característico de ARP spoofing / MITM. Isole o '
+                        'MAC atacante na porta do switch, ative Dynamic ARP '
+                        'Inspection e verifique as sessões que passaram por ele.'
+                    ),
+                })
+            else:
+                gateway = self._is_gateway(ip)
+                details['likely_gateway'] = gateway
+                alerts.append({
+                    'severity': 'high' if gateway else 'medium',
+                    'category': 'arp',
+                    'title': 'ARP IP-to-MAC Change',
+                    'description': (
+                        f'O IP {ip} trocou o MAC de {old_mac} para {new_mac} '
+                        'uma única vez, sem flip-flop nem reanúncios agressivos'
+                        + (' — o IP parece ser um gateway' if gateway else '')
+                        + '. Compatível com reatribuição DHCP ou troca de '
+                        'equipamento.'
+                    ),
+                    'ip': ip,
+                    'details': details,
+                    'recommendation': (
+                        'Confirme se houve troca de dispositivo/placa ou '
+                        'reatribuição DHCP. Se o IP for do gateway ou de um '
+                        'servidor com MAC fixo, trate como possível MITM.'
+                    ),
+                })
+        return alerts
 
 
 class ArpHostDiscoveryStreamingDetector(StreamingDetector):
@@ -899,7 +1164,7 @@ class ArpHostDiscoveryStreamingDetector(StreamingDetector):
             return
         rec = self.by_src[src_ip]
         rec['targets'].add(dst_ip)
-        rec['ts'].append(pkt.time)
+        rec['ts'].append((float(pkt.time), dst_ip))
 
     def finalize(self):
         alerts = []
@@ -907,28 +1172,44 @@ class ArpHostDiscoveryStreamingDetector(StreamingDetector):
             targets = data['targets']
             if len(targets) < self.threshold_targets:
                 continue
-            ts = sorted(data['ts'])
-            # Janela deslizante: maior contagem em qualquer janela de N segundos
+            events = sorted(data['ts'])
+            # Janela deslizante sobre ALVOS DISTINTOS. A versão anterior
+            # contava requests — um host repetindo who-has para o mesmo IP
+            # morto 10x em 60s "enchia" a janela e, somado a 10 vizinhos ao
+            # longo do dia, virava varredura.
             window = self.threshold_window
             best = 1
+            counts = Counter()
+            distinct = 0
             j = 0
-            for i in range(len(ts)):
-                while j < len(ts) and ts[j] - ts[i] <= window:
+            n = len(events)
+            for i in range(n):
+                while j < n and events[j][0] - events[i][0] <= window:
+                    if counts[events[j][1]] == 0:
+                        distinct += 1
+                    counts[events[j][1]] += 1
                     j += 1
-                if (j - i) > best:
-                    best = j - i
-            if window > 0 and best < self.threshold_targets:
-                # caiu fora da janela apertada — ainda assim, se total absoluto
-                # é alto, mantemos como sinal de varredura prolongada
-                if len(targets) < self.threshold_targets * 2:
+                best = max(best, distinct)
+                tgt = events[i][1]
+                counts[tgt] -= 1
+                if counts[tgt] == 0:
+                    distinct -= 1
+            fast = best >= self.threshold_targets
+            if window > 0 and not fast:
+                # Fora da janela apertada: um servidor que conversa com muitos
+                # clientes ao longo do dia também faz ARP para todos eles. A
+                # varredura prolongada só é mantida quando o total é bem maior
+                # que o limiar — e com severidade menor.
+                if len(targets) < self.threshold_targets * 3:
                     continue
+            ts = [e[0] for e in events]
             duration = float(ts[-1] - ts[0]) if ts else 0.0
             alerts.append({
-                'severity': 'high',
+                'severity': 'high' if fast else 'medium',
                 'category': 'scan',
                 'title': 'ARP Host Discovery (varredura interna)',
                 'description': (
-                    f'Host {src} enviou ARP requests para {len(targets)} '
+                    f'O host {src} enviou ARP requests para {len(targets)} '
                     f'destinos distintos (não-impressoras) em {duration:.1f}s'
                 ),
                 'ip': src,
@@ -991,8 +1272,8 @@ class NdpSpoofingStreamingDetector(StreamingDetector):
                 'category': 'arp',
                 'title': 'IPv6 NDP Spoofing Detected',
                 'description': (
-                    f'IPv6 {tgt} changed MAC from {self.tgt_to_mac[tgt]} '
-                    f'to {mac} in a Neighbor Advertisement'
+                    f'O IPv6 {tgt} trocou o MAC de {self.tgt_to_mac[tgt]} '
+                    f'para {mac} em um Neighbor Advertisement'
                 ),
                 'ip': tgt,
                 'details': {
@@ -1003,11 +1284,11 @@ class NdpSpoofingStreamingDetector(StreamingDetector):
                     'protocol': 'ICMPv6-ND',
                 },
                 'recommendation': (
-                    'A changing IPv6→MAC binding in Neighbor Advertisements '
-                    'is the v6 equivalent of ARP spoofing (MITM). Enable RA '
-                    'Guard / ND inspection on switches, verify which host '
-                    'legitimately owns the address, and isolate the '
-                    'advertising MAC.'
+                    'Uma associação IPv6→MAC que muda em Neighbor '
+                    'Advertisements é o equivalente v6 do ARP spoofing (MITM). '
+                    'Ative RA Guard / inspeção ND nos switches, verifique qual '
+                    'host é o dono legítimo do endereço e isole o MAC que está '
+                    'anunciando.'
                 ),
             })
         self.tgt_to_mac[tgt] = mac
@@ -1020,8 +1301,8 @@ class NdpSpoofingStreamingDetector(StreamingDetector):
                     'category': 'arp',
                     'title': 'Unsolicited IPv6 NA Flood',
                     'description': (
-                        f'MAC {mac} sent {self.override_count[mac]} override '
-                        'Neighbor Advertisements (unsolicited)'
+                        f'O MAC {mac} enviou {self.override_count[mac]} '
+                        'Neighbor Advertisements com flag override (não solicitados)'
                     ),
                     'ip': getattr(nd, 'src_ip', None) or tgt,
                     'details': {
@@ -1031,10 +1312,10 @@ class NdpSpoofingStreamingDetector(StreamingDetector):
                         'protocol': 'ICMPv6-ND',
                     },
                     'recommendation': (
-                        'Bursts of unsolicited override NAs are how v6 '
-                        'poisoning tools (parasite6, Responder) keep a '
-                        'spoofed cache entry alive. Enable RA Guard / ND '
-                        'inspection and monitor this MAC.'
+                        'Rajadas de NAs override não solicitados são como as '
+                        'ferramentas de envenenamento v6 (parasite6, Responder) '
+                        'mantêm viva uma entrada de cache forjada. Ative RA '
+                        'Guard / inspeção ND e monitore este MAC.'
                     ),
                 })
 
@@ -1043,15 +1324,41 @@ class NdpSpoofingStreamingDetector(StreamingDetector):
 
 
 class DnsTunnelingStreamingDetector(StreamingDetector):
-    """Streaming de _detect_dns_tunneling."""
+    """Long, high-entropy subdomains -> DNS tunneling / exfil.
+
+    Aggregated per (source, registrable zone) — the pre-2026-09 version
+    raised one *critical* per query and only looked at the FIRST label, which
+    (a) turned a single odd lookup into a critical and (b) missed tools like
+    dnscat2/iodine/DNSExfiltrator that split the payload across several
+    <=63-byte labels. The encoded part is now everything below the base
+    zone (dots removed), and severity grows with the number of distinct
+    suspicious names sent to the zone.
+
+    Queries to zones of DNS-based reputation services (AV/EDR file-hash
+    lookups, DNSBLs, Team Cymru) are skipped: they are long hex/base32 by
+    design and are resolved by the vendor's own authoritative servers, so
+    they cannot be an attacker-controlled channel.
+    """
     name = 'dns_tunneling'
+
+    MAX_ZONES = 50_000
+    MAX_SAMPLES = 5
 
     def __init__(self, analyzer):
         super().__init__(analyzer)
+        from ..constants import DNS_REPUTATION_LOOKUP_ZONES
         self.subdomain_threshold = self.thresholds.get(
             'dns_subdomain_length', 50)
         self.entropy_threshold = self.thresholds.get('dns_entropy_min', 3.5)
-        self.alerts = []
+        self._benign_zones = DNS_REPUTATION_LOOKUP_ZONES
+        # (src, base_zone) -> aggregate
+        self.agg = {}
+
+    def _is_benign_zone(self, base, query):
+        for z in self._benign_zones:
+            if base == z or query.endswith('.' + z):
+                return True
+        return False
 
     def update(self, pkt):
         if DNS not in pkt or IP not in pkt:
@@ -1063,41 +1370,98 @@ class DnsTunnelingStreamingDetector(StreamingDetector):
             query = pkt[DNSQR].qname
             if isinstance(query, bytes):
                 query = query.decode('utf-8', errors='ignore')
-            query = query.rstrip('.')
+            query = query.rstrip('.').lower()
             parts = query.split('.')
             if len(parts) < 3:
                 return
-            subdomain = parts[0]
-            if len(subdomain) <= self.subdomain_threshold:
+            if parts[-1] in ('local', 'arpa', 'localdomain', 'home',
+                             'internal', 'lan'):
                 return
-            entropy = self.analyzer._calculate_entropy(subdomain)
+            from ..constants import base_zone
+            base = base_zone(parts)
+            n_base = base.count('.') + 1
+            sub_labels = parts[:-n_base]
+            if not sub_labels:
+                return
+            longest = max(len(lbl) for lbl in sub_labels)
+            encoded = ''.join(sub_labels)
+            # One long label (classic) OR the payload split across several
+            # labels whose concatenation is long (dnscat2/iodine style).
+            if not (longest > self.subdomain_threshold
+                    or (len(sub_labels) >= 2
+                        and len(encoded) > self.subdomain_threshold * 1.6)):
+                return
+            entropy = self.analyzer._calculate_entropy(encoded)
             if entropy <= self.entropy_threshold:
                 return
-            self.alerts.append({
-                'severity': 'critical',
-                'category': 'dns',
-                'title': 'DNS Tunneling Suspected',
-                'description': (
-                    f'Long subdomain ({len(subdomain)} chars) with high '
-                    f'entropy ({entropy:.2f})'
-                ),
-                'ip': pkt[IP].src,
-                'details': {
-                    'domain': query,
-                    'subdomain': subdomain,
-                    'subdomain_length': len(subdomain),
-                    'entropy': round(entropy, 2),
-                },
-                'recommendation': (
-                    'Block domain and investigate host for malware. DNS '
-                    'tunneling is commonly used for data exfiltration.'
-                ),
-            })
+            if self._is_benign_zone(base, query):
+                return
+            src = pkt[IP].src
+            key = (src, base)
+            rec = self.agg.get(key)
+            ts = float(pkt.time)
+            if rec is None:
+                if len(self.agg) >= self.MAX_ZONES:
+                    return
+                rec = self.agg[key] = {
+                    'names': set(), 'samples': [], 'max_len': 0,
+                    'max_entropy': 0.0, 'first_ts': ts, 'last_ts': ts,
+                    'first_sub': '.'.join(sub_labels),
+                    'first_entropy': entropy,
+                }
+            if query not in rec['names'] and len(rec['names']) < 10_000:
+                rec['names'].add(query)
+                if len(rec['samples']) < self.MAX_SAMPLES:
+                    rec['samples'].append(query)
+            rec['max_len'] = max(rec['max_len'], len('.'.join(sub_labels)))
+            rec['max_entropy'] = max(rec['max_entropy'], entropy)
+            rec['first_ts'] = min(rec['first_ts'], ts)
+            rec['last_ts'] = max(rec['last_ts'], ts)
         except Exception:
             pass
 
     def finalize(self):
-        return self.alerts
+        alerts = []
+        for (src, base), rec in self.agg.items():
+            n = len(rec['names'])
+            if n >= 10:
+                severity = 'critical'
+            elif n >= 3:
+                severity = 'high'
+            else:
+                severity = 'medium'
+            alerts.append({
+                'severity': severity,
+                'category': 'dns',
+                'title': 'DNS Tunneling Suspected',
+                'description': (
+                    f'O host {src} enviou {n} consulta(s) distinta(s) para a '
+                    f'zona {base} com subdomínio longo (até {rec["max_len"]} '
+                    f'caracteres) e entropia alta (até '
+                    f'{rec["max_entropy"]:.2f})'
+                ),
+                'ip': src,
+                'details': {
+                    'src_ip': src,
+                    'base_domain': base,
+                    'domain': rec['samples'][0] if rec['samples'] else base,
+                    'subdomain': rec['first_sub'],
+                    'subdomain_length': rec['max_len'],
+                    'entropy': round(rec['max_entropy'], 2),
+                    'distinct_queries': n,
+                    'samples': rec['samples'],
+                    'first_ts': rec['first_ts'],
+                    'last_ts': rec['last_ts'],
+                },
+                'recommendation': (
+                    'Bloqueie o domínio e investigue o host em busca de '
+                    'malware. O tunelamento DNS é comumente usado para '
+                    'exfiltração de dados. Poucas consultas isoladas podem ser '
+                    'um serviço legítimo de reputação/telemetria — confira o '
+                    'dono da zona antes de escalar.'
+                ),
+            })
+        return alerts
 
 
 class DnsCumulativeExfilStreamingDetector(StreamingDetector):
@@ -1125,13 +1489,32 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
         self.subdomain_threshold = self.thresholds.get(
             'dns_cumulative_exfil_subdomains', 100,
         )
-        # (src_ip, base_domain) -> {bytes, subdomains:set, first_ts, last_ts}
+        from ..constants import (
+            DNS_REPUTATION_LOOKUP_ZONES, DNS_PROVIDER_OWNED_ZONES,
+        )
+        # Zones whose authoritative servers belong to the vendor — queries
+        # there can never reach an attacker (see constants).
+        self._skip_zones = set(DNS_REPUTATION_LOOKUP_ZONES) | set(
+            DNS_PROVIDER_OWNED_ZONES)
+        # (src_ip, base_domain) -> {bytes, subdomains:set, encoded, first_ts, last_ts}
         self.agg = defaultdict(lambda: {
             'bytes': 0,
             'subdomains': set(),
+            'encoded': 0,
             'first_ts': 0.0,
             'last_ts': 0.0,
         })
+
+    def _looks_encoded(self, sub):
+        """Payload-carrying subdomains are long base32/base64/hex blobs;
+        hostnames under a corporate/CDN zone (srv01, wks-finance-12,
+        eu-west-1) are short and pronounceable."""
+        joined = sub.replace('.', '')
+        if (len(joined) >= 20
+                and self.analyzer._calculate_entropy(joined) >= 3.8):
+            return True
+        return (len(joined) >= 12
+                and self.analyzer._dga_score(joined) >= 0.7)
 
     def update(self, pkt):
         if DNS not in pkt or IP not in pkt:
@@ -1158,6 +1541,8 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
             # misturaria domínios não relacionados na mesma zona.
             from ..constants import base_zone
             base = base_zone(parts)
+            if base in self._skip_zones:
+                return
             n_base = base.count('.') + 1
             # O "sub" é tudo antes da zona-base. Para `a.b.c.evil.com` →
             # subdomínio = 'a.b.c'.
@@ -1167,7 +1552,10 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
             src_ip = pkt[IP].src
             rec = self.agg[(src_ip, base)]
             rec['bytes'] += len(query)
-            rec['subdomains'].add(sub)
+            if sub not in rec['subdomains'] and len(rec['subdomains']) < 20_000:
+                rec['subdomains'].add(sub)
+                if self._looks_encoded(sub):
+                    rec['encoded'] += 1
             if rec['first_ts'] == 0.0:
                 rec['first_ts'] = pkt.time
             rec['last_ts'] = pkt.time
@@ -1182,23 +1570,30 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
                     and n_sub < self.subdomain_threshold):
                 continue
             duration = max(0.0, rec['last_ts'] - rec['first_ts'])
-            # Bytes acima do limite + muitos subdomínios = critical;
-            # qualquer um dos dois sozinho = high.
-            if (rec['bytes'] >= self.byte_threshold
-                    and n_sub >= self.subdomain_threshold):
-                severity = 'critical'
+            # Fração de subdomínios com cara de payload codificado. Muitos
+            # nomes LEGÍVEIS numa zona (hostnames de uma rede corporativa,
+            # edges regionais de um SaaS) é inventário, não exfiltração.
+            encoded_ratio = rec['encoded'] / n_sub if n_sub else 0.0
+            both = (rec['bytes'] >= self.byte_threshold
+                    and n_sub >= self.subdomain_threshold)
+            if encoded_ratio >= 0.5:
+                # Bytes acima do limite + muitos subdomínios = critical;
+                # qualquer um dos dois sozinho = high.
+                severity = 'critical' if both else 'high'
+            elif encoded_ratio >= 0.2:
+                severity = 'medium'
             else:
-                severity = 'high'
+                severity = 'low'
             alerts.append({
                 'severity': severity,
                 'category': 'dns',
                 'title': 'Cumulative DNS Exfiltration Suspected',
                 'description': (
-                    f'Host {src_ip} sent {rec["bytes"]} bytes across '
-                    f'{n_sub} distinct subdomains to a single zone '
-                    f'({base}) over {duration:.0f}s. Pattern matches '
-                    'slow DNS exfiltration even when individual queries '
-                    'look normal.'
+                    f'O host {src_ip} enviou {rec["bytes"]} bytes distribuídos '
+                    f'em {n_sub} subdomínios distintos para uma única zona '
+                    f'({base}) ao longo de {duration:.0f}s. O padrão condiz '
+                    'com exfiltração DNS lenta, mesmo quando as queries '
+                    'individuais parecem normais.'
                 ),
                 'ip': src_ip,
                 'details': {
@@ -1206,6 +1601,8 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
                     'base_domain': base,
                     'cumulative_bytes': rec['bytes'],
                     'unique_subdomains': n_sub,
+                    'encoded_subdomains': rec['encoded'],
+                    'encoded_ratio': round(encoded_ratio, 3),
                     'duration_seconds': round(duration, 1),
                     'first_ts': rec['first_ts'],
                     'last_ts': rec['last_ts'],
@@ -1214,10 +1611,10 @@ class DnsCumulativeExfilStreamingDetector(StreamingDetector):
                     )[:5],
                 },
                 'recommendation': (
-                    f'Blockear o domínio {base} nos resolvers internos, '
-                    f'inspecionar {src_ip} por implantes que usam DNS como '
-                    'canal C2/exfil (iodine, dnscat2, DNSExfiltrator) e '
-                    'auditar o que foi extraído antes do bloqueio.'
+                    f'Bloqueie o domínio {base} nos resolvers internos, '
+                    f'inspecione {src_ip} em busca de implantes que usam DNS '
+                    'como canal C2/exfil (iodine, dnscat2, DNSExfiltrator) e '
+                    'audite o que foi extraído antes do bloqueio.'
                 ),
             })
         return alerts
@@ -1240,10 +1637,10 @@ class InsecureProtocolsStreamingDetector(StreamingDetector):
         'FTP': {
             'title': 'Insecure Protocol: FTP',
             'desc_prefix': (
-                'FTP protocol detected - credentials transmitted in plain text'
+                'Protocolo FTP detectado - credenciais transmitidas em texto claro'
             ),
             'recommendation':
-                'Migrate to SFTP or FTPS for secure file transfers.',
+                'Migre para SFTP ou FTPS para transferências de arquivos seguras.',
             'severity_established': 'high',
             'severity_open': 'high',
             'severity_failed': 'low',
@@ -1251,10 +1648,10 @@ class InsecureProtocolsStreamingDetector(StreamingDetector):
         },
         'Telnet': {
             'title': 'Insecure Protocol: Telnet',
-            'desc_prefix': 'Telnet protocol detected - extremely insecure',
+            'desc_prefix': 'Protocolo Telnet detectado - extremamente inseguro',
             'recommendation': (
-                'Replace Telnet with SSH immediately. Telnet transmits all '
-                'data in clear text.'
+                'Substitua o Telnet por SSH imediatamente. O Telnet transmite '
+                'todos os dados em texto claro.'
             ),
             'severity_established': 'critical',
             'severity_open': 'high',
@@ -1478,14 +1875,19 @@ class CleartextCredentialsStreamingDetector(StreamingDetector):
             return
         upper = text.upper()
         # ---- STARTTLS upgrade: marca o par como criptografado dali em diante.
-        # Heurística: cliente OU servidor pediu STARTTLS e a resposta foi
-        # positiva ("220 2.0.0", "OK", "+OK", "234"). Simplificamos marcando
-        # quando *qualquer* lado menciona STARTTLS — falsos negativos aqui
-        # significam apenas alertas que não deveriam disparar; estamos
-        # OPT-IN para alertar.
-        if 'STARTTLS' in upper:
-            self.starttls_done.add((client, server, port))
-            return
+        # Só o COMANDO do cliente conta (STARTTLS / IMAP "tag STARTTLS" /
+        # POP3 STLS / FTP AUTH TLS). A versão anterior marcava quando
+        # qualquer lado mencionava STARTTLS — mas o servidor ANUNCIA
+        # "250-STARTTLS" na resposta ao EHLO em toda sessão SMTP, então um
+        # cliente que ignorava o upgrade e mandava AUTH LOGIN em claro (o
+        # exato caso que este detector existe para pegar) ficava invisível.
+        if direction in ('c2s', 'ftp_c2s'):
+            first_line = upper.splitlines()[0].strip() if upper else ''
+            tokens = first_line.split()
+            if (any(t in ('STARTTLS', 'STLS') for t in tokens[:2])
+                    or first_line.startswith(('AUTH TLS', 'AUTH SSL'))):
+                self.starttls_done.add((client, server, port))
+                return
         ts = pkt.time
         # ---- Mail: SMTP/POP3/IMAP/Submission.
         if direction == 'c2s' and port in self.MAIL_PORTS_PLAIN:
@@ -1542,15 +1944,21 @@ class CleartextCredentialsStreamingDetector(StreamingDetector):
             )
             conn_status = self.tracker.status(dst, src, port)
             bytes_exchanged = self.tracker.bytes_exchanged(dst, src, port)
+            # Credencial em claro que atravessa a internet é exposta a
+            # qualquer salto do caminho (critical); dentro da LAN (impressora,
+            # roteador, intranet) continua sendo exposição real, mas restrita
+            # a quem já está na rede (high).
+            internal = (self.analyzer._is_local_ip(src)
+                        and self.analyzer._is_local_ip(dst))
             alerts.append({
-                'severity': 'critical',
+                'severity': 'high' if internal else 'critical',
                 'category': 'protocol',
                 'title': f'Cleartext Credentials ({proto})',
                 'description': (
-                    f'Plaintext authentication observed: {label} from '
-                    f'{src} to {dst}:{port}' + (
-                        f' (also: {other_labels})' if other_labels else ''
-                    ) + '. Credentials are visible to anyone on the wire.'
+                    f'Autenticação em texto claro observada: {label} de '
+                    f'{src} para {dst}:{port}' + (
+                        f' (também: {other_labels})' if other_labels else ''
+                    ) + '. As credenciais ficam visíveis para qualquer um na rede.'
                 ),
                 'ip': src,
                 'details': {
@@ -1571,11 +1979,11 @@ class CleartextCredentialsStreamingDetector(StreamingDetector):
                     'bytes_exchanged': bytes_exchanged,
                 },
                 'recommendation': (
-                    'Force TLS/STARTTLS on this service. For SMTP use 587 + '
-                    'STARTTLS or 465 implicit TLS; for IMAP use 993; for POP3 '
-                    'use 995. Rotate any account whose credentials may have '
-                    'been transmitted, and audit historic captures from the '
-                    'same hosts.'
+                    'Force TLS/STARTTLS neste serviço. Para SMTP use 587 + '
+                    'STARTTLS ou 465 com TLS implícito; para IMAP use 993; para '
+                    'POP3 use 995. Troque a senha de qualquer conta cujas '
+                    'credenciais possam ter sido transmitidas e audite capturas '
+                    'antigas dos mesmos hosts.'
                 ),
             })
         return alerts
@@ -1674,13 +2082,14 @@ class ExternalSmbStreamingDetector(StreamingDetector):
                     'category': 'smb',
                     'title': 'External IP Accessing SMB',
                     'description': (
-                        f'External IP {src_ip} is accessing SMB on local '
-                        f'host {dst_ip}'
+                        f'O IP externo {src_ip} está acessando SMB no host '
+                        f'local {dst_ip}'
                     ),
                     'recommendation': (
-                        'SMB should NOT be accessible from external networks. '
-                        'Block SMB ports (445, 139) at the firewall for '
-                        'external traffic. Investigate potential compromise.'
+                        'O SMB NÃO deveria estar acessível a partir de redes '
+                        'externas. Bloqueie as portas SMB (445, 139) no '
+                        'firewall para tráfego externo. Investigue um possível '
+                        'comprometimento.'
                     ),
                     'details_extra': {
                         'external_ip': src_ip,
@@ -1694,14 +2103,13 @@ class ExternalSmbStreamingDetector(StreamingDetector):
                     'category': 'smb',
                     'title': 'SMB Traffic to External IP',
                     'description': (
-                        f'Local host {src_ip} is sending SMB traffic to '
-                        f'external IP {dst_ip}'
+                        f'O host local {src_ip} está enviando tráfego SMB para '
+                        f'o IP externo {dst_ip}'
                     ),
                     'recommendation': (
-                        'SMB traffic to external IPs is unusual and '
-                        'potentially dangerous. This could indicate data '
-                        'exfiltration or compromised host. Investigate '
-                        'immediately.'
+                        'Tráfego SMB para IPs externos é incomum e '
+                        'potencialmente perigoso. Pode indicar exfiltração de '
+                        'dados ou host comprometido. Investigue imediatamente.'
                     ),
                     'details_extra': {
                         'local_source': src_ip,
@@ -1709,6 +2117,22 @@ class ExternalSmbStreamingDetector(StreamingDetector):
                         'direction': 'outbound',
                     },
                 }
+            # Severity follows how far the session got. An SMB session that
+            # established across the perimeter is the real finding; a probe
+            # that only met RST/silence means the service was not reachable.
+            severity = base['severity']
+            if not established:
+                if direction == 'inbound':
+                    # SYN-ACK = the internal host answers the internet on 445
+                    # (exposed); RST/silence = firewall let the probe in but
+                    # nothing listened.
+                    severity = ('high' if conn_status == 'open_no_ack'
+                                else 'medium')
+                else:
+                    # Blocked/unanswered outbound SMB: still worth a look (a
+                    # UNC path in a lure document leaks NTLM when it works),
+                    # but nothing left the network.
+                    severity = 'medium'
             details = dict(base['details_extra'])
             details.update({
                 'src_ip': src_ip,
@@ -1718,8 +2142,10 @@ class ExternalSmbStreamingDetector(StreamingDetector):
                 'connection_established': established,
                 'bytes_exchanged': bytes_total,
             })
+            if severity != base['severity']:
+                details['severity_original'] = base['severity']
             alerts.append({
-                'severity': base['severity'],
+                'severity': severity,
                 'category': base['category'],
                 'title': base['title'],
                 'description': base['description'],
@@ -1748,9 +2174,19 @@ class PingSweepStreamingDetector(StreamingDetector):
                 return
         except Exception:
             return
+        dst = pkt[IP].dst
+        # Multicast/broadcast echo (all-hosts ping) is one packet, not a
+        # sweep of distinct hosts.
+        try:
+            ipobj = ipaddress.ip_address(dst)
+            if ipobj.is_multicast or dst.endswith('.255'):
+                return
+        except ValueError:
+            return
         rec = self.by_src[pkt[IP].src]
-        rec['targets'].add(pkt[IP].dst)
-        rec['ts'].append(pkt.time)
+        rec['targets'].add(dst)
+        if len(rec['ts']) < 200_000:
+            rec['ts'].append((float(pkt.time), dst))
 
     def finalize(self):
         alerts = []
@@ -1759,34 +2195,77 @@ class PingSweepStreamingDetector(StreamingDetector):
             total_targets = len(targets)
             if total_targets < self.threshold_hosts:
                 continue
-            ts = sorted(data['ts'])
-            duration = ts[-1] - ts[0]
-            # Sliding window: count distinct timestamps in any threshold_window
-            window_ok = True
-            if self.threshold_window > 0:
-                # Heurística: aceita se total absoluto >> threshold (slow sweep)
-                # ou se duração total cabe na janela.
-                window_ok = duration <= self.threshold_window or total_targets >= self.threshold_hosts * 3
-            if not window_ok:
+            events = sorted(data['ts'])
+            duration = events[-1][0] - events[0][0]
+            # Sliding window over DISTINCT targets (the old check only
+            # compared the capture-long duration against the window).
+            best = 0
+            counts = Counter()
+            distinct = 0
+            j = 0
+            n = len(events)
+            for i in range(n):
+                while j < n and events[j][0] - events[i][0] <= self.threshold_window:
+                    if counts[events[j][1]] == 0:
+                        distinct += 1
+                    counts[events[j][1]] += 1
+                    j += 1
+                best = max(best, distinct)
+                counts[events[i][1]] -= 1
+                if counts[events[i][1]] == 0:
+                    distinct -= 1
+            fast = (self.threshold_window <= 0
+                    or best >= self.threshold_hosts)
+            if not fast and total_targets < self.threshold_hosts * 3:
                 continue
+            # Monitoring (Zabbix/Nagios/PRTG/UPS agents) pings the SAME hosts
+            # over and over at a fixed cadence; a discovery sweep touches
+            # each target once or twice. Median echoes per target separates
+            # them.
+            per_target = sorted(Counter(t for _, t in events).values())
+            median_pings = per_target[len(per_target) // 2]
+            monitoring_like = median_pings >= 4 and duration > 300
+            if monitoring_like:
+                severity = 'low'
+            elif fast:
+                severity = 'high'
+            else:
+                severity = 'medium'
+            description = (
+                f'O host {src} fez ping em {total_targets} hosts distintos '
+                f'em {duration:.1f}s (pico de {best} alvos em '
+                f'{self.threshold_window}s)'
+            )
+            if monitoring_like:
+                description += (
+                    f'. Cada alvo recebeu ~{median_pings} pings de forma '
+                    'recorrente — padrão de monitoramento, não de descoberta.'
+                )
             alerts.append({
-                'severity': 'high',
+                'severity': severity,
                 'category': 'scan',
                 'title': 'ICMP Ping Sweep',
-                'description': (
-                    f'Host {src} pinged {total_targets} distinct hosts '
-                    f'in {duration:.1f}s'
-                ),
+                'description': description,
                 'ip': src,
                 'details': {
                     'src': src,
                     'targets_count': total_targets,
+                    'window_max_targets': best,
                     'duration_seconds': round(duration, 2),
+                    'median_pings_per_target': median_pings,
+                    'monitoring_pattern': monitoring_like,
                     'targets_sample': sorted(targets)[:10],
+                    'first_ts': events[0][0],
+                    'last_ts': events[-1][0],
                 },
                 'recommendation': (
-                    'A host issuing many ICMP echo requests across a subnet '
-                    'is performing host discovery. Investigate the source.'
+                    'Um host disparando muitos ICMP echo requests por uma '
+                    'sub-rede está fazendo descoberta de hosts. Investigue a '
+                    'origem.' + (
+                        ' O padrão repetitivo sugere um servidor de '
+                        'monitoramento — se for o caso, cadastre o papel do '
+                        'host ou crie uma regra de supressão.'
+                        if monitoring_like else '')
                 ),
             })
         return alerts
@@ -1906,18 +2385,18 @@ class HorizontalScanStreamingDetector(StreamingDetector):
                     severity = 'medium'
             if one_sided:
                 handshake_txt = (
-                    'return path not captured (asymmetric/egress-only tap) — '
-                    'handshake confirmation unavailable'
+                    'caminho de retorno não capturado (tap assimétrico/somente '
+                    'saída) — confirmação por handshake indisponível'
                 )
             else:
-                handshake_txt = f'{len(answered)} completed the TCP handshake'
+                handshake_txt = f'{len(answered)} completaram o handshake TCP'
             alerts.append({
                 'severity': severity,
                 'category': 'scan',
                 'title': 'Horizontal Port Scan (Host Sweep)',
                 'description': (
-                    f'Host {src} probed port {port} on {len(effective)} '
-                    f'distinct hosts in {duration:.1f}s ({handshake_txt})'
+                    f'O host {src} sondou a porta {port} em {len(effective)} '
+                    f'hosts distintos em {duration:.1f}s ({handshake_txt})'
                 ),
                 'ip': src,
                 'details': {
@@ -1932,18 +2411,19 @@ class HorizontalScanStreamingDetector(StreamingDetector):
                     'hosts_sample': sorted(effective)[:10],
                 },
                 'recommendation': (
-                    'A single source probing one port across many hosts '
-                    'indicates service discovery / host sweep (often pre-'
-                    'attack reconnaissance). '
-                    + ('The return path was not captured, so the TCP '
-                       'handshake could not confirm the scan — a legitimate '
-                       'monitoring/backup server polling many hosts looks the '
-                       'same on an asymmetric tap. Correlate with the host '
-                       'role before escalating.'
+                    'Uma única origem sondando uma porta em muitos hosts '
+                    'indica descoberta de serviços / varredura de hosts '
+                    '(frequentemente reconhecimento pré-ataque). '
+                    + ('O caminho de retorno não foi capturado, então o '
+                       'handshake TCP não pôde confirmar a varredura — um '
+                       'servidor legítimo de monitoramento/backup consultando '
+                       'muitos hosts parece igual num tap assimétrico. '
+                       'Correlacione com o papel do host antes de escalar.'
                        if one_sided else
-                       'A low answer ratio (few completed handshakes) means '
-                       'most probes hit dead or filtered hosts — a strong '
-                       'scan signature. Investigate the source for compromise.')
+                       'Uma razão de respostas baixa (poucos handshakes '
+                       'completos) significa que a maioria das sondas atingiu '
+                       'hosts mortos ou filtrados — uma forte assinatura de '
+                       'varredura. Investigue a origem em busca de comprometimento.')
                 ),
             })
         return alerts
@@ -1990,26 +2470,55 @@ class SnmpWalkStreamingDetector(StreamingDetector):
                     break
             if best < self.threshold:
                 continue
+            # An NMS (Zabbix/LibreNMS/PRTG/Cacti) walks the same device on a
+            # fixed poll cycle: several separate bursts over the capture. A
+            # one-off enumeration is a single burst. Bursts = groups of
+            # queries separated by gaps longer than the window.
+            bursts = 1
+            for k in range(1, len(ts_list)):
+                if ts_list[k] - ts_list[k - 1] > self.window:
+                    bursts += 1
+            recurring = bursts >= 3
+            src_external = not self.analyzer._is_local_ip(src)
+            if src_external:
+                severity = 'critical'
+            elif recurring:
+                severity = 'low'
+            else:
+                severity = 'high'
+            description = (
+                f'O host {src} enviou {best} queries SNMP para {dst} '
+                f'dentro de uma janela de {self.window}s '
+                f'(total {len(ts_list)} na captura, {bursts} rajada(s))'
+            )
+            if src_external:
+                description += '. A origem é EXTERNA à rede.'
+            elif recurring:
+                description += (
+                    '. Rajadas recorrentes indicam polling de um sistema de '
+                    'monitoramento, não enumeração pontual.'
+                )
             alerts.append({
-                'severity': 'high',
+                'severity': severity,
                 'category': 'scan',
                 'title': 'SNMP Walk Detected',
-                'description': (
-                    f'Host {src} sent {best} SNMP queries to {dst} within a '
-                    f'{self.window}s window (total {len(ts_list)} in capture)'
-                ),
+                'description': description,
                 'ip': src,
                 'details': {
                     'src': src, 'dst': dst,
                     'queries_in_window': best,
                     'total_queries': len(ts_list),
                     'window_seconds': self.window,
+                    'bursts': bursts,
+                    'recurring_polling': recurring,
+                    'first_ts': ts_list[0],
+                    'last_ts': ts_list[-1],
                 },
                 'recommendation': (
-                    'High-volume SNMP queries (GETNEXT/GETBULK) indicate an '
-                    'SNMP walk used to enumerate device configuration. Verify '
-                    'if authorized; enforce SNMPv3 with authentication and '
-                    'restrict SNMP at the firewall.'
+                    'Queries SNMP em alto volume (GETNEXT/GETBULK) indicam um '
+                    'SNMP walk usado para enumerar a configuração do '
+                    'dispositivo. Verifique se é autorizado; imponha SNMPv3 '
+                    'com autenticação e restrinja o SNMP no firewall.'
                 ),
             })
         return alerts
@@ -2023,6 +2532,7 @@ class LlmnrNbtnsStreamingDetector(StreamingDetector):
         super().__init__(analyzer)
         self.threshold = self.thresholds.get('llmnr_response_threshold', 10)
         self.by_src = defaultdict(int)
+        self.names_by_src = defaultdict(set)
 
     def update(self, pkt):
         if UDP not in pkt or IP not in pkt:
@@ -2050,6 +2560,11 @@ class LlmnrNbtnsStreamingDetector(StreamingDetector):
         try:
             if int(layer.qr) == 1 and int(layer.ancount) > 0:
                 self.by_src[src] += 1
+                name = getattr(layer, 'qname', '') or ''
+                if name:
+                    names = self.names_by_src[src]
+                    if len(names) < 200:
+                        names.add(name)
         except Exception:
             pass
 
@@ -2058,22 +2573,48 @@ class LlmnrNbtnsStreamingDetector(StreamingDetector):
         for src, count in self.by_src.items():
             if count < self.threshold:
                 continue
-            severity = 'critical' if count >= self.threshold * 3 else 'high'
+            names = self.names_by_src.get(src) or set()
+            # Every Windows host answers LLMNR/NBT-NS for its OWN name (and
+            # its NetBIOS variants) — a busy file server does so hundreds of
+            # times a day. Responder answers for WHATEVER is asked. So the
+            # number of distinct names answered is the discriminator.
+            if names and len(names) <= 2:
+                severity = 'low'
+            elif count >= self.threshold * 3 or len(names) >= 5:
+                severity = 'critical'
+            else:
+                severity = 'high'
+            names_txt = (f' para {len(names)} nome(s) distinto(s)'
+                         if names else '')
+            description = (
+                f'O host {src} respondeu {count} requisição(ões) '
+                f'LLMNR/NBT-NS{names_txt}'
+            )
+            if names and len(names) <= 2:
+                description += (
+                    ' — sempre o(s) mesmo(s) nome(s), o que é o host '
+                    'respondendo pelo próprio nome (comportamento normal do '
+                    'Windows com LLMNR/NetBIOS ativos).'
+                )
+            else:
+                description += (
+                    ' — característico de envenenamento no estilo Responder')
             alerts.append({
                 'severity': severity,
                 'category': 'lateral',
                 'title': 'LLMNR/NBT-NS Response Activity (Possible Poisoning)',
-                'description': (
-                    f'Host {src} answered {count} LLMNR/NBT-NS request(s) — '
-                    'characteristic of Responder-style poisoning'
-                ),
+                'description': description,
                 'ip': src,
-                'details': {'src': src, 'response_count': count},
+                'details': {
+                    'src': src, 'response_count': count,
+                    'distinct_names': len(names),
+                    'names_sample': sorted(names)[:10],
+                },
                 'recommendation': (
-                    'Frequent LLMNR/NBT-NS responses are unusual outside '
-                    'legitimate name servers. Disable LLMNR via Group Policy, '
-                    'disable NetBIOS over TCP/IP, and isolate this host for '
-                    'forensic analysis.'
+                    'Respostas LLMNR/NBT-NS frequentes são incomuns fora de '
+                    'servidores de nomes legítimos. Desative o LLMNR via Group '
+                    'Policy, desative o NetBIOS sobre TCP/IP e isole este host '
+                    'para análise forense.'
                 ),
             })
         return alerts
@@ -2087,7 +2628,8 @@ class IcmpTunnelingStreamingDetector(StreamingDetector):
         super().__init__(analyzer)
         self.threshold_size = self.thresholds.get('icmp_payload_threshold', 64)
         self.threshold_count = self.thresholds.get('icmp_min_large_packets', 10)
-        self.by_pair = defaultdict(lambda: {'count': 0, 'total': 0, 'sizes': []})
+        self.by_pair = defaultdict(
+            lambda: {'count': 0, 'total': 0, 'sizes': [], 'filler': 0})
 
     def update(self, pkt):
         if ICMP not in pkt or IP not in pkt:
@@ -2098,18 +2640,44 @@ class IcmpTunnelingStreamingDetector(StreamingDetector):
             return
         if icmp_type not in (0, 8):
             return
-        payload_len = 0
+        payload = b''
         if Raw in pkt:
             try:
-                payload_len = len(bytes(pkt[Raw].load))
+                payload = bytes(pkt[Raw].load)
             except Exception:
-                payload_len = 0
+                payload = b''
+        payload_len = len(payload)
         if payload_len < self.threshold_size:
             return
         rec = self.by_pair[(pkt[IP].src, pkt[IP].dst)]
         rec['count'] += 1
         rec['total'] += payload_len
-        rec['sizes'].append(payload_len)
+        if len(rec['sizes']) < 10_000:
+            rec['sizes'].append(payload_len)
+        if self._is_filler_pattern(payload):
+            rec['filler'] += 1
+
+    @staticmethod
+    def _is_filler_pattern(payload):
+        """True for the fixed filler that ping tools put in echo data:
+        Windows repeats 'abcdefghijklmnopqrstuvwabcdefghi', Linux/BSD send
+        an incrementing byte run after the timestamp, others zero-fill.
+        Large pings with filler are MTU/path tests or monitoring probes; a
+        tunnel carries changing data (commands, encrypted/compressed bytes).
+        """
+        body = payload[16:] if len(payload) > 32 else payload
+        if not body:
+            return True
+        if len(set(body)) <= 2:
+            return True
+        steps = sum(1 for i in range(1, len(body))
+                    if (body[i] - body[i - 1]) & 0xFF == 1)
+        if steps >= 0.9 * (len(body) - 1):
+            return True
+        for period in range(1, 33):
+            if len(body) > period * 2 and body[period:] == body[:-period]:
+                return True
+        return False
 
     def finalize(self):
         alerts = []
@@ -2118,15 +2686,26 @@ class IcmpTunnelingStreamingDetector(StreamingDetector):
                 continue
             avg = s['total'] / s['count']
             max_size = max(s['sizes'])
-            severity = 'critical' if avg >= 512 else 'high'
+            filler_ratio = s['filler'] / s['count']
+            if filler_ratio >= 0.9:
+                severity = 'low'
+            else:
+                severity = 'critical' if avg >= 512 else 'high'
+            description = (
+                f'{s["count"]} pacotes ICMP echo grandes de {src} para {dst} '
+                f'(payload médio {avg:.0f}B, máx {max_size}B)'
+            )
+            if filler_ratio >= 0.9:
+                description += (
+                    '. O conteúdo é o preenchimento padrão de ferramentas de '
+                    'ping (sequência repetida/incremental) — típico de teste de '
+                    'MTU ou monitoramento, não de dados tunelados.'
+                )
             alerts.append({
                 'severity': severity,
                 'category': 'exfil',
                 'title': 'Possible ICMP Tunneling',
-                'description': (
-                    f'{s["count"]} large ICMP echo packets from {src} to {dst} '
-                    f'(avg payload {avg:.0f}B, max {max_size}B)'
-                ),
+                'description': description,
                 'ip': src,
                 'details': {
                     'src': src, 'dst': dst,
@@ -2134,12 +2713,13 @@ class IcmpTunnelingStreamingDetector(StreamingDetector):
                     'avg_payload_bytes': round(avg, 0),
                     'max_payload_bytes': max_size,
                     'total_payload_bytes': s['total'],
+                    'filler_pattern_ratio': round(filler_ratio, 3),
                 },
                 'recommendation': (
-                    'Standard ICMP echo carries minimal payload. Large or '
-                    'numerous payloads indicate covert tunneling (ptunnel, '
-                    'icmpsh, Loki). Block ICMP egress or restrict to known '
-                    'monitoring sources.'
+                    'O ICMP echo padrão carrega payload mínimo. Payloads '
+                    'grandes ou numerosos indicam tunelamento oculto (ptunnel, '
+                    'icmpsh, Loki). Bloqueie a saída de ICMP ou restrinja a '
+                    'fontes de monitoramento conhecidas.'
                 ),
             })
         return alerts
@@ -2205,14 +2785,13 @@ class VolumeExfiltrationStreamingDetector(StreamingDetector):
                 'last_ts': s['last_ts'],
             }
             description = (
-                f'Host {src} uploaded {s["out"] / 1024 / 1024:.1f} MB to '
-                f'{dst} (out/in ratio {ratio:.1f}x)'
+                f'O host {src} enviou {s["out"] / 1024 / 1024:.1f} MB para '
+                f'{dst} (razão saída/entrada {ratio:.1f}x)'
             )
             recommendation = (
-                'High upload-to-download ratio is consistent with data '
-                'exfiltration. Investigate the destination IP, '
-                'application owning the connection and the type of data '
-                'transferred.'
+                'Uma razão alta de upload em relação ao download é consistente '
+                'com exfiltração de dados. Investigue o IP de destino, a '
+                'aplicação dona da conexão e o tipo de dado transferido.'
             )
             severity, description, recommendation = _apply_sanctioned_downgrade(
                 self.analyzer, dst, severity, details,
@@ -2323,9 +2902,9 @@ class SustainedExfilRatioStreamingDetector(StreamingDetector):
                 'last_ts': s['last_ts'],
             }
             description = (
-                f'Host {src} uploaded {out_b / 1024:.0f} KB to {dst} '
-                f'sustained over {duration / 60:.1f} min with out/in '
-                f'ratio {ratio:.1f}x (~{bps / 1024:.1f} KB/s). Volume '
+                f'O host {src} enviou {out_b / 1024:.0f} KB para {dst} '
+                f'de forma sustentada por {duration / 60:.1f} min com razão '
+                f'saída/entrada {ratio:.1f}x (~{bps / 1024:.1f} KB/s). O volume '
                 f'fica abaixo do alerta de exfil tradicional, mas '
                 f'o padrão lento+constante é típico de implant.'
             )
@@ -2358,6 +2937,10 @@ class InternalLateralStreamingDetector(StreamingDetector):
     def __init__(self, analyzer):
         super().__init__(analyzer)
         self.threshold = self.thresholds.get('lateral_min_targets', 5)
+        # A target reached on the same port by >= this many OTHER internal
+        # clients is treated as a shared server (DC, file/print server).
+        self.shared_server_min_clients = self.thresholds.get(
+            'lateral_shared_server_min_clients', 3)
         self.lateral_ports = analyzer.LATERAL_PORTS
         self.by_src_port = defaultdict(set)
 
@@ -2380,32 +2963,52 @@ class InternalLateralStreamingDetector(StreamingDetector):
 
     def finalize(self):
         alerts = []
+        # Shared servers: a (host, port) that several DIFFERENT internal
+        # clients connect to is infrastructure — DCs on 88/135/445, file and
+        # print servers on 445, jump hosts on 3389/22. A workstation mapping
+        # drives on 3 DCs + 2 file servers is not lateral movement; lateral
+        # movement fans out to peers nobody else talks to on that port.
+        popularity = defaultdict(set)
+        for (src, port), targets in self.by_src_port.items():
+            for dst in targets:
+                popularity[(dst, port)].add(src)
         for (src, port), targets in self.by_src_port.items():
             if len(targets) < self.threshold:
                 continue
+            shared = {d for d in targets
+                      if len(popularity[(d, port)] - {src})
+                      >= self.shared_server_min_clients}
+            peers = targets - shared
+            if len(peers) < self.threshold:
+                continue
             proto = self.lateral_ports[port]
-            severity = 'critical' if len(targets) >= self.threshold * 2 else 'high'
+            severity = 'critical' if len(peers) >= self.threshold * 2 else 'high'
             alerts.append({
                 'severity': severity,
                 'category': 'lateral',
                 'title': f'Internal Lateral Movement Suspected ({proto})',
                 'description': (
-                    f'Internal host {src} initiated {proto} connections to '
-                    f'{len(targets)} distinct internal target(s)'
+                    f'O host interno {src} iniciou conexões {proto} para '
+                    f'{len(peers)} alvo(s) interno(s) distinto(s) que não são '
+                    f'servidores compartilhados'
+                    + (f' (além de {len(shared)} servidor(es) usados por '
+                       'outros clientes, desconsiderados)' if shared else '')
                 ),
                 'ip': src,
                 'details': {
                     'src': src,
                     'protocol': proto,
                     'port': port,
-                    'target_count': len(targets),
-                    'targets_sample': sorted(targets)[:10],
+                    'target_count': len(peers),
+                    'targets_sample': sorted(peers)[:10],
+                    'shared_servers_excluded': sorted(shared)[:10],
                 },
                 'recommendation': (
-                    f'Wide {proto} fan-out from a single host suggests '
-                    'credential spraying, PSExec/WinRM lateral movement, or '
-                    'post-exploitation pivoting. Verify host integrity and '
-                    'review authentication logs on targets.'
+                    f'Um leque amplo de {proto} a partir de um único host '
+                    'sugere credential spraying, movimento lateral por '
+                    'PSExec/WinRM ou pivoteamento pós-exploração. Verifique a '
+                    'integridade do host e revise os logs de autenticação nos '
+                    'alvos.'
                 ),
             })
         return alerts
@@ -2433,6 +3036,11 @@ class BeaconingStreamingDetector(StreamingDetector):
     NTP_CLEAN_INTERVALS = (
         30, 45, 60, 90, 120, 180, 240, 300, 600, 900, 1200, 1800, 2400, 3600,
     )
+    # Periodicity measured on few connections is weak evidence (see
+    # _calibrate): below MIN_SAMPLES_HIGH the alert is capped at medium,
+    # below MIN_SAMPLES_CRITICAL at high.
+    MIN_SAMPLES_HIGH = 10
+    MIN_SAMPLES_CRITICAL = 20
 
     def __init__(self, analyzer):
         super().__init__(analyzer)
@@ -2569,18 +3177,18 @@ class BeaconingStreamingDetector(StreamingDetector):
                 bumps = (10 if phase_locked else 0) + (10 if size_uniform else 0)
                 confidence = min(99, base_conf + bumps)
                 desc = (
-                    f'Host {src_ip} shows periodic connections to '
-                    f'{dst_ip}:{dst_port} ({len(timestamps)} connections, '
-                    f'{jitter_percent:.1f}% jitter, '
-                    f'~{mean_interval:.1f}s interval)'
+                    f'O host {src_ip} apresenta conexões periódicas para '
+                    f'{dst_ip}:{dst_port} ({len(timestamps)} conexões, '
+                    f'{jitter_percent:.1f}% de jitter, '
+                    f'intervalo ~{mean_interval:.1f}s)'
                 )
                 if phase_locked:
                     desc += (
-                        f'. Wallclock-aligned to {clean_interval}s grid '
-                        '(NTP-anchored sleep timer)'
+                        f'. Alinhado ao wallclock na grade de {clean_interval}s '
+                        '(timer de sleep ancorado em NTP)'
                     )
                 if size_uniform:
-                    desc += f'. Uniform request size (CV={size_cv:.2f}, n={size_n})'
+                    desc += f'. Tamanho de request uniforme (CV={size_cv:.2f}, n={size_n})'
                 _record((src_ip, dst_ip, dst_port), {
                     'severity': severity,
                     'confidence': confidence,
@@ -2602,11 +3210,11 @@ class BeaconingStreamingDetector(StreamingDetector):
                         **multi_signal,
                     },
                     'recommendation': (
-                        'This pattern is consistent with C2 (Command and '
-                        'Control) beaconing. Investigate the destination '
-                        f'IP {dst_ip} and port {dst_port}. Check for malware '
-                        'on the source host. Block the destination if '
-                        'confirmed malicious.'
+                        'Este padrão é consistente com beaconing de C2 '
+                        '(Command and Control). Investigue o IP de destino '
+                        f'{dst_ip} e a porta {dst_port}. Verifique se há '
+                        'malware no host de origem. Bloqueie o destino se '
+                        'confirmado como malicioso.'
                     ),
                 })
 
@@ -2637,20 +3245,20 @@ class BeaconingStreamingDetector(StreamingDetector):
                 + (10 if size_uniform else 0),
             )
             ac_desc = (
-                f'Host {src_ip} shows periodic connections to '
-                f'{dst_ip}:{dst_port} ({len(timestamps)} connections, '
-                f'autocorrelation peak {peak_score:.2f} at lag '
-                f'{best_lag}, ~{mean_interval:.1f}s mean interval). '
-                'Pattern survives moderate per-beacon jitter that '
-                'linear-jitter tests would miss.'
+                f'O host {src_ip} apresenta conexões periódicas para '
+                f'{dst_ip}:{dst_port} ({len(timestamps)} conexões, '
+                f'pico de autocorrelação {peak_score:.2f} no lag '
+                f'{best_lag}, intervalo médio ~{mean_interval:.1f}s). '
+                'O padrão sobrevive a um jitter moderado por beacon que '
+                'testes de jitter linear não detectariam.'
             )
             if phase_locked:
                 ac_desc += (
-                    f' Wallclock-aligned to {clean_interval}s grid '
-                    '(NTP-anchored sleep timer).'
+                    f' Alinhado ao wallclock na grade de {clean_interval}s '
+                    '(timer de sleep ancorado em NTP).'
                 )
             if size_uniform:
-                ac_desc += f' Uniform request size (CV={size_cv:.2f}, n={size_n}).'
+                ac_desc += f' Tamanho de request uniforme (CV={size_cv:.2f}, n={size_n}).'
             _record((src_ip, dst_ip, dst_port), {
                 'severity': ac_severity,
                 'confidence': ac_confidence,
@@ -2674,15 +3282,39 @@ class BeaconingStreamingDetector(StreamingDetector):
                     **multi_signal,
                 },
                 'recommendation': (
-                    'Periodic signal detected despite jitter. This is '
-                    'consistent with C2 frameworks (Cobalt Strike, Sliver, '
-                    'Mythic) that inject random delay between beacons. '
-                    f'Inspect destination {dst_ip}:{dst_port} and the '
-                    f'source host {src_ip} for implants.'
+                    'Sinal periódico detectado apesar do jitter. Isso é '
+                    'consistente com frameworks de C2 (Cobalt Strike, Sliver, '
+                    'Mythic) que injetam atraso aleatório entre beacons. '
+                    f'Inspecione o destino {dst_ip}:{dst_port} e o '
+                    f'host de origem {src_ip} em busca de implantes.'
                 ),
             })
 
-        return list(alerts_by_key.values())
+        return [self._calibrate(a) for a in alerts_by_key.values()]
+
+    def _calibrate(self, alert):
+        """Evidence-proportional severity.
+
+        Five connections with low jitter used to be *critical*: any app that
+        polls an API a handful of times (mail check, weather widget, update
+        probe) looks exactly like that. Few samples cap the severity; the
+        extra signals (wall-clock phase lock + uniform request size) still
+        unlock critical because together they describe a hard-coded timer.
+        Destinations that resolve to big platforms go one notch down.
+        """
+        d = alert['details']
+        n = d.get('connection_count') or 0
+        strong = d.get('wallclock_phase_locked') and d.get('size_uniform')
+        sev = alert['severity']
+        if n < self.MIN_SAMPLES_HIGH and not strong:
+            sev = _cap_severity(sev, 'medium')
+        elif n < self.MIN_SAMPLES_CRITICAL and not strong:
+            sev = _cap_severity(sev, 'high')
+        if sev != alert['severity']:
+            d['severity_capped_by_samples'] = alert['severity']
+        alert['severity'] = _apply_known_service_downgrade(
+            self.analyzer, d.get('destination_ip'), sev, d)
+        return alert
 
 
 class ConnectionBeaconingStreamingDetector(StreamingDetector):
@@ -2835,6 +3467,9 @@ class ConnectionBeaconingStreamingDetector(StreamingDetector):
                 severity = 'high'
             else:
                 severity = 'medium'
+            known_service_details = {}
+            severity = _apply_known_service_downgrade(
+                self.analyzer, dst, severity, known_service_details)
             if method == 'jitter':
                 base_conf = max(35, min(95, int(95 - jitter_percent * 5)))
             else:
@@ -2844,27 +3479,27 @@ class ConnectionBeaconingStreamingDetector(StreamingDetector):
                              + (10 if size_uniform else 0))
 
             desc = (
-                f'Host {src} keeps ONE TCP connection to {dst}:{dport} '
-                f'(src port {sport}) and sends data in {n} periodic bursts '
-                f'(~{mean_interval:.1f}s interval'
+                f'O host {src} mantém UMA conexão TCP com {dst}:{dport} '
+                f'(porta de origem {sport}) e envia dados em {n} bursts '
+                f'periódicos (intervalo ~{mean_interval:.1f}s'
             )
             if method == 'jitter':
-                desc += f', {jitter_percent:.1f}% jitter'
+                desc += f', {jitter_percent:.1f}% de jitter'
             else:
-                desc += f', autocorrelation peak {ac_peak:.2f} at lag {ac_lag}'
+                desc += f', pico de autocorrelação {ac_peak:.2f} no lag {ac_lag}'
             desc += (
-                f') over {duration / 60:.1f} min. Beacons inside a persistent '
-                'connection (HTTP2/WebSocket/keep-alive C2) never show up in '
-                'SYN-based beaconing.'
+                f') ao longo de {duration / 60:.1f} min. Beacons dentro de uma '
+                'conexão persistente (C2 via HTTP2/WebSocket/keep-alive) nunca '
+                'aparecem no beaconing baseado em SYN.'
             )
             if phase_locked:
                 desc += (
-                    f' Wallclock-aligned to {clean_interval}s grid '
-                    '(NTP-anchored sleep timer).'
+                    f' Alinhado ao wallclock na grade de {clean_interval}s '
+                    '(timer de sleep ancorado em NTP).'
                 )
             if size_uniform:
                 desc += (
-                    f' Uniform check-in size (CV={size_cv:.2f}, n={size_n}).'
+                    f' Tamanho de check-in uniforme (CV={size_cv:.2f}, n={size_n}).'
                 )
 
             alerts.append({
@@ -2901,15 +3536,16 @@ class ConnectionBeaconingStreamingDetector(StreamingDetector):
                     'connection_status': 'established',
                     'connection_established': True,
                     'bytes_exchanged': rec['bytes'],
+                    **known_service_details,
                 },
                 'recommendation': (
-                    'Periodic check-ins inside one long-lived connection are '
-                    'how HTTP2/WebSocket C2 (Sliver, Mythic, custom implants) '
-                    'evade per-connection beacon detection. Identify the '
-                    f'process on {src} holding the connection to '
-                    f'{dst}:{dport}. Legitimate look-alikes: push/notification '
-                    'channels and MQTT keep-alives — confirm the destination '
-                    'reputation and the owning application before blocking.'
+                    'Check-ins periódicos dentro de uma única conexão de longa '
+                    'duração são como o C2 via HTTP2/WebSocket (Sliver, Mythic, '
+                    'implantes customizados) escapa da detecção de beacon por '
+                    f'conexão. Identifique o processo em {src} que mantém a '
+                    f'conexão com {dst}:{dport}. Sósias legítimos: canais de '
+                    'push/notificação e keep-alives MQTT — confirme a reputação '
+                    'do destino e a aplicação dona antes de bloquear.'
                 ),
             })
         return alerts
@@ -3070,11 +3706,11 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                     'category': 'brute_force',
                     'title': 'Kerberoasting Suspected (RC4-HMAC TGS-REQ)',
                     'description': (
-                        f'Client {src} requested {rec["tgs_req_rc4"]} '
-                        f'Kerberos service ticket(s) from KDC {dst} using '
-                        f'RC4-HMAC (etype 23). Modern AD uses AES; explicit '
-                        f'RC4 TGS-REQ is the canonical Kerberoasting '
-                        f'signature for offline cracking.'
+                        f'O cliente {src} solicitou {rec["tgs_req_rc4"]} '
+                        f'ticket(s) de serviço Kerberos ao KDC {dst} usando '
+                        f'RC4-HMAC (etype 23). O AD moderno usa AES; um TGS-REQ '
+                        f'explicitamente em RC4 é a assinatura canônica de '
+                        f'Kerberoasting para crack offline.'
                     ),
                     'ip': src,
                     'details': {
@@ -3091,11 +3727,11 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                         'bytes_exchanged': rec['bytes'],
                     },
                     'recommendation': (
-                        'Audit which SPN was requested (server-side: Event '
-                        'ID 4769 with ticket-encryption 0x17). Set strong, '
-                        'long random passwords on service accounts, or move '
-                        'them to gMSA. Disable RC4 cluster-wide once all '
-                        'systems negotiate AES.'
+                        'Audite qual SPN foi solicitado (no servidor: Event '
+                        'ID 4769 com ticket-encryption 0x17). Defina senhas '
+                        'fortes, longas e aleatórias nas contas de serviço, ou '
+                        'migre-as para gMSA. Desative o RC4 em todo o cluster '
+                        'assim que todos os sistemas negociarem AES.'
                     ),
                     'mitre_attack': {
                         'technique_id': 'T1558.003',
@@ -3125,12 +3761,12 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                     'category': 'brute_force',
                     'title': 'AS-REP Roasting Suspected (no PREAUTH-REQUIRED)',
                     'description': (
-                        f'Client {src} received {rec["as_rep"]} Kerberos '
-                        f'AS-REP from KDC {dst} with zero '
-                        f'PREAUTH-REQUIRED errors in between. Either the '
-                        f'principals queried have DONT_REQUIRE_PREAUTH set '
-                        f'(roastable) or the client is enumerating accounts '
-                        f'to find roastable ones.'
+                        f'O cliente {src} recebeu {rec["as_rep"]} AS-REP '
+                        f'Kerberos do KDC {dst} com zero erros '
+                        f'PREAUTH-REQUIRED no meio. Ou os '
+                        f'principais consultados têm DONT_REQUIRE_PREAUTH '
+                        f'ativado (roastable), ou o cliente está enumerando '
+                        f'contas para encontrar as roastable.'
                     ),
                     'ip': src,
                     'details': {
@@ -3149,11 +3785,11 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                         'bytes_exchanged': rec['bytes'],
                     },
                     'recommendation': (
-                        'List accounts with DONT_REQUIRE_PREAUTH set '
+                        'Liste as contas com DONT_REQUIRE_PREAUTH ativado '
                         '(Get-ADUser -Filter {DoesNotRequirePreAuth -eq '
-                        '$true}) — these are extractable by anyone who can '
-                        'reach the KDC. Remove the flag where possible and '
-                        'force AES-only encryption types.'
+                        '$true}) — elas podem ser extraídas por qualquer um '
+                        'que alcance o KDC. Remova o flag onde possível e '
+                        'force tipos de criptografia somente AES.'
                     ),
                     'mitre_attack': {
                         'technique_id': 'T1558.004',
@@ -3174,10 +3810,10 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                     'category': 'brute_force',
                     'title': 'Kerberos RC4 Downgrade',
                     'description': (
-                        f'Client {src} sent {rec["as_req_rc4_only"]} '
-                        f'AS-REQ to {dst} listing only RC4-HMAC as the '
-                        f'supported etype. This pattern is used to force '
-                        f'RC4 ticket issuance for downstream Kerberoast.'
+                        f'O cliente {src} enviou {rec["as_req_rc4_only"]} '
+                        f'AS-REQ para {dst} listando apenas RC4-HMAC como '
+                        f'etype suportado. Esse padrão é usado para forçar a '
+                        f'emissão de tickets RC4 para um Kerberoast posterior.'
                     ),
                     'ip': src,
                     'details': {
@@ -3194,10 +3830,10 @@ class KerberosAbuseStreamingDetector(StreamingDetector):
                         'bytes_exchanged': rec['bytes'],
                     },
                     'recommendation': (
-                        'Investigate this client — modern Windows/Linux '
-                        'Kerberos stacks send AES etypes. Verify whether '
-                        'msDS-SupportedEncryptionTypes has been tampered '
-                        'with on the target account.'
+                        'Investigue este cliente — stacks Kerberos modernas de '
+                        'Windows/Linux enviam etypes AES. Verifique se o '
+                        'msDS-SupportedEncryptionTypes foi adulterado '
+                        'na conta alvo.'
                     ),
                     'mitre_attack': {
                         'technique_id': 'T1562.010',
@@ -3292,9 +3928,24 @@ class BruteForceStreamingDetector(StreamingDetector):
         self.time_window = self.thresholds.get('brute_force_time_window', 60)
         self.attempts = defaultdict(list)
         # Tracker compartilha estado de handshake + bytes por (server, client,
-        # port). Permite reportar se ALGUMA tentativa virou conexão real
-        # (sinal forte de credencial válida).
+        # port). Permite reportar se ALGUMA tentativa virou conexão real.
         self.tracker = TcpFlowTracker()
+        # Payload bytes per individual connection (client, server, port,
+        # client_sport). Lets finalize tell a credential-guessing loop (many
+        # short, same-sized auth exchanges) from an application connection
+        # pool / chatty client (many connections carrying varied, sizeable
+        # data) — the #1 false positive of a pure SYN-rate rule on DB ports.
+        self.conn_bytes = {}
+
+    MAX_CONN_TRACKED = 1_000_000
+
+    def _add_conn_bytes(self, key, n):
+        cur = self.conn_bytes.get(key)
+        if cur is None:
+            if len(self.conn_bytes) >= self.MAX_CONN_TRACKED:
+                return
+            cur = 0
+        self.conn_bytes[key] = cur + n
 
     def update(self, pkt):
         if IP not in pkt:
@@ -3315,11 +3966,23 @@ class BruteForceStreamingDetector(StreamingDetector):
                 self.tracker.observe_tcp(
                     src_ip, dst_ip, sport, pkt, sender_is_client=False,
                 )
+            if dport in self.TARGET_PORTS or sport in self.TARGET_PORTS:
+                n = getattr(pkt[TCP], 'plen', None)
+                if n is None:
+                    try:
+                        n = len(pkt[Raw].load) if Raw in pkt else 0
+                    except Exception:
+                        n = 0
+                if n:
+                    if dport in self.TARGET_PORTS:
+                        self._add_conn_bytes((src_ip, dst_ip, dport, sport), n)
+                    else:
+                        self._add_conn_bytes((dst_ip, src_ip, sport, dport), n)
             # SYN para porta-alvo: nova tentativa do cliente. Exige ACK=0 para
             # não contar o SYN-ACK de resposta do servidor como tentativa.
             if dport in self.TARGET_PORTS and (flags & 0x02) and not (flags & 0x10):
                 self.attempts[(src_ip, dst_ip, dport)].append({
-                    'timestamp': ts, 'is_failed': False,
+                    'timestamp': ts, 'is_failed': False, 'sport': sport,
                 })
             # RST do servidor: marca última tentativa como falha
             if sport in self.TARGET_PORTS and (flags & 0x04):
@@ -3332,80 +3995,148 @@ class BruteForceStreamingDetector(StreamingDetector):
                 pkt, ports=self.TARGET_PORTS.keys(), create_missing=False,
             )
 
+    @staticmethod
+    def _profile(sizes):
+        """(with_data, median, cv) over per-connection payload sizes."""
+        data = sorted(b for b in sizes if b > 0)
+        if not data:
+            return 0, 0, None
+        median = data[len(data) // 2]
+        mean = sum(data) / len(data)
+        if len(data) < 3 or mean <= 0:
+            return len(data), median, None
+        var = sum((b - mean) ** 2 for b in data) / len(data)
+        return len(data), median, (var ** 0.5) / mean
+
     def finalize(self):
         alerts = []
-        already_alerted = set()
         for (src_ip, dst_ip, dst_port), attempt_list in self.attempts.items():
+            if len(attempt_list) < self.threshold_attempts:
+                continue
             attempt_list.sort(key=lambda x: x['timestamp'])
-            for i in range(len(attempt_list)):
-                if (src_ip, dst_ip, dst_port) in already_alerted:
-                    break
-                window_start = attempt_list[i]['timestamp']
-                window_end = window_start + self.time_window
-                in_window = [a for a in attempt_list
-                             if window_start <= a['timestamp'] <= window_end]
-                if len(in_window) < self.threshold_attempts:
-                    continue
-                failed_count = sum(1 for a in in_window if a['is_failed'])
-                protocol = self.TARGET_PORTS[dst_port]
-                # SMB/RDP brute forces são vetor primário de ransomware —
-                # mesmo sem RST claro o número alto de tentativas já é
-                # critical. Idem para MSSQL (sa account).
-                always_critical = protocol in ('SMB', 'RDP', 'MSSQL')
-                if always_critical or failed_count > self.threshold_attempts * 0.7:
-                    severity = 'critical'
-                else:
-                    severity = 'high'
-                conn_status = self.tracker.status(dst_ip, src_ip, dst_port)
-                bytes_exchanged = self.tracker.bytes_exchanged(
-                    dst_ip, src_ip, dst_port,
+            # Two-pointer sliding window (the old per-start rescan was
+            # O(n^2): a DB client with 100k pooled connections stalled the
+            # whole analysis here). Keeps the densest window.
+            best_i, best_j = 0, 0
+            j = 0
+            n = len(attempt_list)
+            for i in range(n):
+                limit = attempt_list[i]['timestamp'] + self.time_window
+                while j < n and attempt_list[j]['timestamp'] <= limit:
+                    j += 1
+                if j - i > best_j - best_i:
+                    best_i, best_j = i, j
+            in_window = attempt_list[best_i:best_j]
+            if len(in_window) < self.threshold_attempts:
+                continue
+            failed_count = sum(1 for a in in_window if a['is_failed'])
+            protocol = self.TARGET_PORTS[dst_port]
+            sizes = [self.conn_bytes.get((src_ip, dst_ip, dst_port,
+                                          a.get('sport')), 0)
+                     for a in in_window]
+            with_data, median_bytes, size_cv = self._profile(sizes)
+            external_src = (not self.analyzer._is_local_ip(src_ip)
+                            and self.analyzer._is_local_ip(dst_ip))
+            # SMB/RDP brute forces são vetor primário de ransomware — mesmo
+            # sem RST claro o número alto de tentativas já é critical. Idem
+            # para MSSQL (sa account).
+            always_critical = protocol in ('SMB', 'RDP', 'MSSQL')
+            if always_critical or failed_count > self.threshold_attempts * 0.7:
+                severity = 'critical'
+            else:
+                severity = 'high'
+            pattern = 'credential_guessing'
+            no_payload = (with_data == 0
+                          and self.tracker.bytes_exchanged(
+                              dst_ip, src_ip, dst_port) == 0)
+            app_like = (
+                with_data >= 0.8 * len(in_window)
+                and failed_count < 0.3 * len(in_window)
+                and (median_bytes >= 20_000
+                     or (size_cv is not None and size_cv >= 0.6
+                         and median_bytes >= 2_000))
+            )
+            if no_payload:
+                # Nenhum byte de aplicação: o serviço nunca respondeu (retry
+                # de cliente mal configurado, host fora do ar, varredura).
+                # Sem troca de dados não há senha sendo testada.
+                pattern = 'connection_retries'
+                severity = 'medium' if external_src else 'low'
+            elif app_like and not external_src:
+                # Muitas conexões com volume grande/variável = pool de
+                # conexões de aplicação, cliente de e-mail sincronizando,
+                # automação (Ansible) — não um laço de login.
+                pattern = 'application_traffic'
+                severity = 'low'
+            elif not external_src and size_cv is not None and size_cv >= 0.6:
+                pattern = 'mixed'
+                severity = 'medium'
+            conn_status = self.tracker.status(dst_ip, src_ip, dst_port)
+            bytes_exchanged = self.tracker.bytes_exchanged(
+                dst_ip, src_ip, dst_port,
+            )
+            description = (
+                f'O IP {src_ip} abriu {len(in_window)} conexões '
+                f'ao {protocol} em {dst_ip} em {self.time_window}s '
+                f'({failed_count} rejeitadas com RST)'
+            )
+            if pattern == 'connection_retries':
+                description += (
+                    '. Nenhuma conexão trocou dados de aplicação — parece '
+                    'repetição de conexão a um serviço indisponível ou '
+                    'varredura, não tentativa de login.'
                 )
-                description = (
-                    f'IP {src_ip} attempted {len(in_window)} connections '
-                    f'to {protocol} on {dst_ip} in {self.time_window}s '
-                    f'({failed_count} failed)'
+            elif pattern == 'application_traffic':
+                description += (
+                    f'. As conexões carregam volume grande/variável (mediana '
+                    f'{median_bytes} B) — padrão de pool de conexões ou '
+                    'aplicação, não de tentativas de senha.'
                 )
-                if conn_status == 'established':
-                    description += (
-                        ' — uma das tentativas estabeleceu conexão TCP '
-                        '(possível credencial válida).'
-                    )
-                alerts.append({
-                    'severity': severity,
-                    'category': 'brute_force',
-                    'title': f'Brute Force Attack Detected ({protocol})',
-                    'description': description,
-                    'ip': src_ip,
-                    'details': {
-                        'source_ip': src_ip,
-                        'src_ip': src_ip,
-                        'dst_ip': dst_ip,
-                        'target_ip': dst_ip,
-                        'protocol': protocol,
-                        'port': dst_port,
-                        'total_attempts': len(in_window),
-                        'failed_attempts': failed_count,
-                        'time_window': self.time_window,
-                        'duration': round(
-                            in_window[-1]['timestamp']
-                            - in_window[0]['timestamp'], 2,
-                        ),
-                        'first_ts': float(in_window[0]['timestamp']),
-                        'last_ts': float(in_window[-1]['timestamp']),
-                        'connection_status': conn_status,
-                        'connection_established':
-                            conn_status == 'established',
-                        'bytes_exchanged': bytes_exchanged,
-                    },
-                    'recommendation': self.RECOMMENDATIONS.get(
-                        protocol,
-                        f'This is a brute force attack on {protocol}. Block '
-                        f'the source IP {src_ip} immediately. Review '
-                        f'authentication logs on {dst_ip}.',
+            elif conn_status == 'established':
+                description += (
+                    '. As conexões completaram o handshake TCP — o serviço '
+                    'está acessível; confira nos logs de autenticação se '
+                    'alguma tentativa teve sucesso.'
+                )
+            alerts.append({
+                'severity': severity,
+                'category': 'brute_force',
+                'title': f'Brute Force Attack Detected ({protocol})',
+                'description': description,
+                'ip': src_ip,
+                'details': {
+                    'source_ip': src_ip,
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'target_ip': dst_ip,
+                    'protocol': protocol,
+                    'port': dst_port,
+                    'total_attempts': len(in_window),
+                    'failed_attempts': failed_count,
+                    'time_window': self.time_window,
+                    'duration': round(
+                        in_window[-1]['timestamp']
+                        - in_window[0]['timestamp'], 2,
                     ),
-                })
-                already_alerted.add((src_ip, dst_ip, dst_port))
-                break
+                    'first_ts': float(in_window[0]['timestamp']),
+                    'last_ts': float(in_window[-1]['timestamp']),
+                    'connection_status': conn_status,
+                    'connection_established':
+                        conn_status == 'established',
+                    'bytes_exchanged': bytes_exchanged,
+                    'pattern': pattern,
+                    'connections_with_data': with_data,
+                    'median_bytes_per_connection': median_bytes,
+                    'bytes_size_cv': (round(size_cv, 3)
+                                      if size_cv is not None else None),
+                },
+                'recommendation': self.RECOMMENDATIONS.get(
+                    protocol,
+                    f'Isto é um ataque de brute force ao {protocol}. '
+                    f'Bloqueie o IP de origem {src_ip} imediatamente. '
+                    f'Revise os logs de autenticação em {dst_ip}.',
+                ),
+            })
         return alerts
 
 
@@ -3505,16 +4236,50 @@ class PasswordSprayingStreamingDetector(StreamingDetector):
             connection_status = (
                 'established' if established_targets else 'scan_no_response'
             )
+            # Context for internal sources. A management/backup/inventory
+            # server (SCCM, Veeam, WSUS, PDQ, an admin script) also touches
+            # dozens of hosts on 445/5985 — but it gets in everywhere and
+            # moves real data, whereas a spray mostly fails with tiny auth
+            # exchanges. External sources keep full severity: there is no
+            # benign reason for the internet to fan out over our auth ports.
+            pattern = 'spray'
+            src_internal = self.analyzer._is_local_ip(src_ip)
+            if src_internal:
+                per_target_bytes = sorted(
+                    self.tracker.bytes_exchanged(d, src_ip, port)
+                    for d in dst_map.keys())
+                median_tb = per_target_bytes[len(per_target_bytes) // 2]
+                if (len(established_targets) >= 0.8 * len(dst_map)
+                        and median_tb >= 50_000):
+                    pattern = 'management'
+                    severity = 'medium'
+                elif total_bytes == 0:
+                    # Nothing answered with data: a sweep of the port, not
+                    # credential attempts (Horizontal Scan covers it).
+                    pattern = 'sweep_no_auth'
+                    severity = 'medium'
             description = (
-                f'IP {src_ip} attempted {protocol} authentication against '
-                f'{best_count} distinct hosts within '
+                f'O IP {src_ip} tentou autenticação {protocol} contra '
+                f'{best_count} hosts distintos em '
                 f'{int(best_end - best_start)}s '
-                f'(spraying pattern — bypasses per-account lockout).'
+                f'(padrão de spraying — burla o lockout por conta).'
             )
-            if established_targets:
+            if pattern == 'management':
+                description += (
+                    f' Porém {len(established_targets)} alvo(s) tiveram sessão '
+                    'estabelecida com volume de dados alto — perfil de servidor '
+                    'de gerência/backup/inventário, não de tentativa de senha.'
+                )
+            elif pattern == 'sweep_no_auth':
+                description += (
+                    ' Nenhum alvo trocou dados — varredura da porta, sem '
+                    'tentativa de autenticação observada.'
+                )
+            elif established_targets:
                 description += (
                     f' {len(established_targets)} alvo(s) tiveram conexão '
-                    'TCP estabelecida — credencial válida provável.'
+                    'TCP estabelecida — verifique nos logs se alguma '
+                    'autenticação teve sucesso.'
                 )
             alerts.append({
                 'severity': severity,
@@ -3538,12 +4303,14 @@ class PasswordSprayingStreamingDetector(StreamingDetector):
                     'bytes_exchanged': total_bytes,
                     'established_targets': sorted(established_targets)[:10],
                     'established_target_count': len(established_targets),
+                    'pattern': pattern,
                 },
                 'recommendation': (
-                    f'Password spraying typically precedes AD lateral movement. '
-                    f'Block {src_ip}, audit failed-logon events on all '
-                    f'{best_count} targets, and check whether any account had '
-                    f'a successful logon shortly after this window.'
+                    f'Password spraying tipicamente precede movimento lateral '
+                    f'no AD. Bloqueie {src_ip}, audite os eventos de logon '
+                    f'falho em todos os {best_count} alvos e verifique se '
+                    f'alguma conta teve um logon bem-sucedido logo após esta '
+                    f'janela.'
                 ),
             })
         return alerts
@@ -3575,6 +4342,10 @@ class DgaStreamingDetector(StreamingDetector):
             label = self.analyzer._extract_dns_label(query)
             if not label or len(label) < self.min_length:
                 return
+            # Punycode (IDN) labels are ASCII-encoded Unicode — high entropy
+            # by construction, not algorithmic generation.
+            if label.startswith('xn--'):
+                return
             src_ip = pkt[IP].src
             key = (src_ip, query)
             if key in self.seen:
@@ -3592,9 +4363,17 @@ class DgaStreamingDetector(StreamingDetector):
             items.sort(key=lambda x: x[1], reverse=True)
             max_score = items[0][1]
             avg_score = sum(s for _, s in items) / len(items)
-            severity = ('critical'
-                        if (max_score >= 0.85 or len(items) >= 10)
-                        else 'high')
+            # DGA malware cycles through MANY generated names (most answer
+            # NXDOMAIN); one random-looking domain is usually an ad/tracking
+            # or CDN brand. Severity grows with the number of distinct names
+            # (the old ladder made a single 0.85 label critical).
+            n_items = len(items)
+            if n_items >= 5 or (n_items >= 3 and max_score >= 0.85):
+                severity = 'critical'
+            elif n_items >= 2 or max_score >= 0.9:
+                severity = 'high'
+            else:
+                severity = 'medium'
             sample = [{'domain': d, 'score': round(s, 3)}
                       for d, s in items[:10]]
             # B.9 confidence: blends per-domain score strength with corpus
@@ -3608,9 +4387,9 @@ class DgaStreamingDetector(StreamingDetector):
                 'category': 'dns',
                 'title': 'Possible DGA Domain Activity',
                 'description': (
-                    f'Host {src_ip} queried {len(items)} algorithmically-'
-                    f'generated-looking domain(s) (max score {max_score:.2f}, '
-                    f'avg {avg_score:.2f})'
+                    f'O host {src_ip} consultou {len(items)} domínio(s) com '
+                    f'aparência de gerado por algoritmo (score máx '
+                    f'{max_score:.2f}, média {avg_score:.2f})'
                 ),
                 'ip': src_ip,
                 'details': {
@@ -3620,9 +4399,9 @@ class DgaStreamingDetector(StreamingDetector):
                     'samples': sample,
                 },
                 'recommendation': (
-                    'Algorithmically-generated domain names are typical of '
-                    'malware C2. Investigate the host immediately and block '
-                    'the domains at DNS/firewall.'
+                    'Nomes de domínio gerados por algoritmo são típicos de C2 '
+                    'de malware. Investigue o host imediatamente e bloqueie os '
+                    'domínios no DNS/firewall.'
                 ),
             })
         return alerts
@@ -3689,16 +4468,43 @@ class FastFluxStreamingDetector(StreamingDetector):
             avg_ttl = sum(ttls) / len(ttls)
             if avg_ttl > self.max_ttl:
                 continue
-            severity = ('critical'
-                        if (len(ips) >= self.min_ips * 2 and avg_ttl <= 60)
-                        else 'high')
+            from ..constants import (
+                DNS_PROVIDER_OWNED_ZONES, hostname_suffix_match,
+            )
+            # CDNs and global load balancers (Akamai, CloudFront, Fastly,
+            # Google, Microsoft) rotate many IPs with short TTLs by design —
+            # that is the textbook fast-flux false positive.
+            if hostname_suffix_match([domain], DNS_PROVIDER_OWNED_ZONES):
+                continue
+            # A flux botnet answers with compromised residential hosts
+            # scattered across unrelated networks; a CDN/load balancer answers
+            # from a few of its own prefixes. Diversity = distinct /16 (v4)
+            # or /32 (v6) networks per answered IP.
+            prefixes = set()
+            for ip_s in ips:
+                try:
+                    ipo = ipaddress.ip_address(ip_s)
+                except ValueError:
+                    continue
+                plen = 16 if ipo.version == 4 else 32
+                prefixes.add(ipaddress.ip_network(
+                    f'{ip_s}/{plen}', strict=False))
+            diversity = len(prefixes) / len(ips) if ips else 0.0
+            if len(prefixes) < 3:
+                severity = 'low'
+            elif diversity < 0.5:
+                severity = 'medium'
+            else:
+                severity = ('critical'
+                            if (len(ips) >= self.min_ips * 2 and avg_ttl <= 60)
+                            else 'high')
             alerts.append({
                 'severity': severity,
                 'category': 'dns',
                 'title': 'Fast-Flux Domain Suspected',
                 'description': (
-                    f"Domain '{domain}' resolves to {len(ips)} distinct IPs "
-                    f"with average TTL {avg_ttl:.0f}s"
+                    f"O domínio '{domain}' resolve para {len(ips)} IPs "
+                    f"distintos com TTL médio de {avg_ttl:.0f}s"
                 ),
                 'ip': self.domain_client.get(domain, ''),
                 'details': {
@@ -3707,24 +4513,42 @@ class FastFluxStreamingDetector(StreamingDetector):
                     'ips_sample': sorted(list(ips))[:10],
                     'avg_ttl_seconds': round(avg_ttl, 0),
                     'min_ttl_seconds': min(ttls),
+                    'distinct_networks': len(prefixes),
+                    'network_diversity': round(diversity, 3),
                 },
                 'recommendation': (
-                    'Fast-flux is used by botnets (e.g., Avalanche, Mirai '
-                    'variants) to evade blocklists. Investigate the domain '
-                    'reputation and block at DNS/firewall.'
+                    'Fast-flux é usado por botnets (ex.: Avalanche, variantes '
+                    'do Mirai) para escapar de blocklists. Investigue a '
+                    'reputação do domínio e bloqueie no DNS/firewall.'
                 ),
             })
         return alerts
 
 
 class NxdomainSpikeStreamingDetector(StreamingDetector):
-    """Streaming de _detect_nxdomain_spike."""
+    """Burst of NXDOMAIN answers to one client -> DGA probing.
+
+    Counts DISTINCT failed names inside the window. The old rule counted
+    responses, so one broken lookup retried by the resolver + A/AAAA pairs +
+    DNS search-suffix expansion (name.corp.local, name.local, ...) inflated
+    a single typo into a "spike". Reverse lookups (in-addr.arpa/ip6.arpa —
+    loggers and monitoring resolve thousands of PTRs that do not exist),
+    local zones and single-label names (Chrome's intranet-redirect probes,
+    WPAD) are ignored. Severity rises when the failed names themselves look
+    algorithmic.
+    """
     name = 'nxdomain_spike'
+
+    _IGNORED_SUFFIXES = ('.arpa', '.local', '.localdomain', '.lan', '.home',
+                         '.internal', '.corp', '.home.arpa')
+    MAX_EVENTS_PER_CLIENT = 100_000
 
     def __init__(self, analyzer):
         super().__init__(analyzer)
         self.threshold = self.thresholds.get('nxdomain_threshold', 20)
         self.window = self.thresholds.get('nxdomain_window', 60)
+        self.dga_threshold = self.thresholds.get('dga_score_threshold', 0.7)
+        # client -> [(ts, qname)]
         self.nxdomain_by_client = defaultdict(list)
 
     def update(self, pkt):
@@ -3734,52 +4558,102 @@ class NxdomainSpikeStreamingDetector(StreamingDetector):
         if d.qr != 1:
             return
         try:
-            if int(d.rcode) == 3:
-                self.nxdomain_by_client[pkt[IP].dst].append(pkt.time)
+            if int(d.rcode) != 3:
+                return
+            qname = ''
+            if DNSQR in pkt:
+                qname = pkt[DNSQR].qname
+                if isinstance(qname, bytes):
+                    qname = qname.decode('utf-8', errors='ignore')
+                qname = (qname or '').rstrip('.').lower()
+            if qname:
+                if '.' not in qname:
+                    return
+                if qname.endswith(self._IGNORED_SUFFIXES) or \
+                        qname.startswith(('wpad.', 'isatap.')):
+                    return
+            events = self.nxdomain_by_client[pkt[IP].dst]
+            if len(events) < self.MAX_EVENTS_PER_CLIENT:
+                events.append((float(pkt.time), qname or f'#{len(events)}'))
         except Exception:
             pass
 
     def finalize(self):
         alerts = []
-        for client_ip, timestamps in self.nxdomain_by_client.items():
-            if len(timestamps) < self.threshold:
+        for client_ip, events in self.nxdomain_by_client.items():
+            if len({q for _, q in events}) < self.threshold:
                 continue
-            timestamps.sort()
+            events.sort()
             best_count = 0
-            for i in range(len(timestamps)):
-                count = 0
-                for j in range(i, len(timestamps)):
-                    if timestamps[j] - timestamps[i] <= self.window:
-                        count += 1
-                    else:
-                        break
-                if count > best_count:
-                    best_count = count
-                if best_count >= self.threshold:
-                    break
+            best_names = set()
+            counts = Counter()
+            distinct = 0
+            j = 0
+            n = len(events)
+            for i in range(n):
+                while j < n and events[j][0] - events[i][0] <= self.window:
+                    if counts[events[j][1]] == 0:
+                        distinct += 1
+                    counts[events[j][1]] += 1
+                    j += 1
+                if distinct > best_count:
+                    best_count = distinct
+                    best_names = {q for q, c in counts.items() if c > 0}
+                counts[events[i][1]] -= 1
+                if counts[events[i][1]] == 0:
+                    distinct -= 1
             if best_count < self.threshold:
                 continue
-            severity = 'critical' if best_count >= self.threshold * 2 else 'high'
+            # How algorithmic are the failed names?
+            scored = 0
+            random_like = 0
+            for q in best_names:
+                if q.startswith('#'):
+                    continue
+                label = self.analyzer._extract_dns_label(q)
+                if not label or len(label) < 6:
+                    continue
+                scored += 1
+                if self.analyzer._dga_score(label) >= self.dga_threshold:
+                    random_like += 1
+            random_ratio = (random_like / scored) if scored else 0.0
+            if best_count >= self.threshold * 2 and random_ratio >= 0.3:
+                severity = 'critical'
+            elif scored and random_ratio < 0.1:
+                # Readable names failing (typos, decommissioned hosts,
+                # broken app config) — noisy, not DGA.
+                severity = 'medium'
+            else:
+                severity = 'high'
             alerts.append({
                 'severity': severity,
                 'category': 'dns',
                 'title': 'NXDOMAIN Spike Detected',
                 'description': (
-                    f'Host {client_ip} received {best_count} NXDOMAIN '
-                    f'responses within {self.window}s (total '
-                    f'{len(timestamps)} in capture)'
+                    f'O host {client_ip} recebeu NXDOMAIN para {best_count} '
+                    f'nomes distintos em {self.window}s (total '
+                    f'{len(events)} respostas na captura; '
+                    f'{random_like} de {scored} nomes com aparência '
+                    'algorítmica)'
                 ),
                 'ip': client_ip,
                 'details': {
                     'client_ip': client_ip,
                     'nxdomain_in_window': best_count,
                     'window_seconds': self.window,
-                    'total_nxdomain': len(timestamps),
+                    'total_nxdomain': len(events),
+                    'random_looking_ratio': round(random_ratio, 3),
+                    'names_sample': sorted(
+                        q for q in best_names if not q.startswith('#'))[:10],
+                    'first_ts': events[0][0],
+                    'last_ts': events[-1][0],
                 },
                 'recommendation': (
-                    'High NXDOMAIN volume often indicates DGA malware '
-                    'probing for live C2 domains. Investigate the host for '
-                    'malware.'
+                    'Um volume alto de NXDOMAIN frequentemente indica malware '
+                    'DGA sondando por domínios de C2 ativos. Investigue o host '
+                    'em busca de malware. Se os nomes forem legíveis (erros de '
+                    'digitação, servidores desativados), corrija a '
+                    'configuração da aplicação que os consulta.'
                 ),
             })
         return alerts
@@ -3817,14 +4691,22 @@ class SuspiciousTldStreamingDetector(StreamingDetector):
         alerts = []
         for (src_ip, tld), domains in self.by_src_tld.items():
             sample = sorted(list(domains))[:5]
-            severity = 'high' if len(domains) >= 5 else 'medium'
+            # Plenty of legitimate sites live on .xyz/.top/.club/.online; one
+            # or two lookups are browsing, many distinct names under a cheap
+            # TLD is the malware/phishing-infrastructure pattern.
+            if len(domains) >= 5:
+                severity = 'high'
+            elif len(domains) >= 3:
+                severity = 'medium'
+            else:
+                severity = 'low'
             alerts.append({
                 'severity': severity,
                 'category': 'dns',
                 'title': f'Queries to Suspicious TLD (.{tld})',
                 'description': (
-                    f'Host {src_ip} queried {len(domains)} domain(s) under '
-                    f'.{tld} (commonly abused TLD)'
+                    f'O host {src_ip} consultou {len(domains)} domínio(s) sob '
+                    f'.{tld} (TLD comumente abusado)'
                 ),
                 'ip': src_ip,
                 'details': {
@@ -3833,9 +4715,9 @@ class SuspiciousTldStreamingDetector(StreamingDetector):
                     'domains_sample': sample,
                 },
                 'recommendation': (
-                    'TLDs cheap or free to register are heavily abused by '
-                    'malware and phishing. Validate the legitimacy of these '
-                    'domains.'
+                    'TLDs baratos ou gratuitos de registrar são muito abusados '
+                    'por malware e phishing. Valide a legitimidade destes '
+                    'domínios.'
                 ),
             })
         return alerts
@@ -3869,13 +4751,16 @@ class DotStreamingDetector(StreamingDetector):
         alerts = []
         for src_ip, dst_ip in self.seen_pairs:
             is_known = dst_ip in self.known_resolvers
-            note = ' (known public resolver)' if is_known else ''
+            note = ' (resolver público conhecido)' if is_known else ''
             alerts.append({
-                'severity': 'medium',
+                # DoT to Google/Cloudflare/Quad9 is Android "Private DNS" or a
+                # browser setting — a visibility/policy issue (low). DoT to an
+                # unknown endpoint may be a private resolver or a tunnel.
+                'severity': 'low' if is_known else 'medium',
                 'category': 'dns',
                 'title': 'DNS-over-TLS (DoT) Connection',
                 'description': (
-                    f'Host {src_ip} connected to {dst_ip} on port 853 (DoT)'
+                    f'O host {src_ip} conectou-se a {dst_ip} na porta 853 (DoT)'
                     f'{note}'
                 ),
                 'ip': src_ip,
@@ -3887,9 +4772,10 @@ class DotStreamingDetector(StreamingDetector):
                     'known_public_resolver': is_known,
                 },
                 'recommendation': (
-                    'DoT bypasses corporate DNS visibility (no logs, no '
-                    'filtering). If not explicitly approved, block port 853 '
-                    'outbound and force DNS through the corporate resolver.'
+                    'O DoT contorna a visibilidade de DNS corporativo (sem '
+                    'logs, sem filtragem). Se não for explicitamente aprovado, '
+                    'bloqueie a porta 853 de saída e force o DNS pelo resolver '
+                    'corporativo.'
                 ),
             })
         return alerts
@@ -3917,21 +4803,22 @@ class PayloadEntropyCleartextStreamingDetector(StreamingDetector):
         t = self.thresholds
         self.min_bytes = int(t.get('payload_entropy_min_bytes', 4096))
         self.min_entropy = float(t.get('payload_entropy_min', 7.5))
-        self.flows = defaultdict(lambda: {'chunks': [], 'size': 0})
+        self.flows = defaultdict(
+            lambda: {'chunks': [], 'size': 0, 'proto_seen': False})
 
     def update(self, pkt):
         if TCP not in pkt or IP not in pkt or Raw not in pkt:
             return
-        sport = pkt[TCP].sport
         dport = pkt[TCP].dport
-        if dport in self.CLEARTEXT_PORTS:
-            proto = self.CLEARTEXT_PORTS[dport]
-            key = (pkt[IP].src, pkt[IP].dst, dport, proto)
-        elif sport in self.CLEARTEXT_PORTS:
-            proto = self.CLEARTEXT_PORTS[sport]
-            key = (pkt[IP].src, pkt[IP].dst, sport, proto)
-        else:
+        # Client -> server only (as documented). Server responses on 80/8080
+        # are routinely gzip/brotli bodies, images, zip/installer downloads —
+        # all near 8 bits/byte; including them (a capture starting mid-
+        # download has no "HTTP/" header to exempt it) was a steady source of
+        # "tunnel" false positives.
+        if dport not in self.CLEARTEXT_PORTS:
             return
+        proto = self.CLEARTEXT_PORTS[dport]
+        key = (pkt[IP].src, pkt[IP].dst, dport, proto)
         try:
             payload = bytes(pkt[Raw].load)
         except Exception:
@@ -3939,6 +4826,12 @@ class PayloadEntropyCleartextStreamingDetector(StreamingDetector):
         if not payload:
             return
         flow = self.flows[key]
+        # Any segment that opens with a protocol verb means this client
+        # speaks the protocol (an upload body after "POST ..." is legit
+        # binary). Checked on every segment, not only the first captured.
+        if not flow['proto_seen'] and \
+                any(payload.startswith(p) for p in self.HEADER_PREFIXES):
+            flow['proto_seen'] = True
         if flow['size'] < 65536:
             flow['chunks'].append(payload)
             flow['size'] += len(payload)
@@ -3948,12 +4841,11 @@ class PayloadEntropyCleartextStreamingDetector(StreamingDetector):
         for (src, dst, port, proto), flow in self.flows.items():
             if flow['size'] < self.min_bytes:
                 continue
+            if flow['proto_seen']:
+                continue
             blob = b''.join(flow['chunks'])
             entropy = self.analyzer._calculate_entropy(blob)
             if entropy < self.min_entropy:
-                continue
-            head = blob[:64]
-            if any(head.startswith(p) for p in self.HEADER_PREFIXES):
                 continue
             severity = 'high' if entropy >= 7.8 else 'medium'
             alerts.append({
@@ -3961,10 +4853,10 @@ class PayloadEntropyCleartextStreamingDetector(StreamingDetector):
                 'category': 'exfil',
                 'title': f'High-Entropy Payload on Cleartext Port ({proto})',
                 'description': (
-                    f'Flow {src} -> {dst}:{port} ({proto}) has {flow["size"]} '
-                    f'bytes of payload with Shannon entropy {entropy:.2f} '
-                    f'bits/byte. Cleartext protocols normally measure '
-                    f'4.5-6.5; >7.5 indicates encrypted/compressed traffic.'
+                    f'O fluxo {src} -> {dst}:{port} ({proto}) tem {flow["size"]} '
+                    f'bytes de payload com entropia de Shannon de {entropy:.2f} '
+                    f'bits/byte. Protocolos em texto claro normalmente medem '
+                    f'4,5-6,5; >7,5 indica tráfego criptografado/comprimido.'
                 ),
                 'ip': src,
                 'details': {
@@ -3973,10 +4865,10 @@ class PayloadEntropyCleartextStreamingDetector(StreamingDetector):
                     'entropy': round(entropy, 3),
                 },
                 'recommendation': (
-                    'High entropy on a cleartext port indicates encrypted '
-                    'or compressed payload — possible tunneling (e.g., '
-                    'TLS over 80, SSH over 25, malware-encoded data). '
-                    'Inspect the destination and consider blocking.'
+                    'Entropia alta em uma porta de texto claro indica payload '
+                    'criptografado ou comprimido — possível tunelamento (ex.: '
+                    'TLS sobre 80, SSH sobre 25, dados codificados por malware). '
+                    'Inspecione o destino e considere bloquear.'
                 ),
             })
         return alerts
@@ -4047,15 +4939,33 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
             encoded_label = parts[1]
             if len(encoded_label) < self._label_min:
                 return
-            # Entropy check — CS encodes base32-ish, entropy of real label is
-            # 3.5+ bits/symbol. Skip if it looks like a normal word.
+            zone = self._parent_zone(parts)
+            # The encoded label must sit BELOW the registrable zone. For
+            # `www.somelongbrandname.com` parts[1] IS the registered domain
+            # (the site's own name), not beacon data — that shape fired on
+            # any long www.* site.
+            if len(parts) - (zone.count('.') + 1) < 2:
+                return
+            # Vendor-answered zones (CDN/cloud/AV reputation) cannot relay
+            # queries to a Team Server.
+            from ..constants import (
+                DNS_PROVIDER_OWNED_ZONES, DNS_REPUTATION_LOOKUP_ZONES,
+            )
+            if zone in DNS_PROVIDER_OWNED_ZONES or \
+                    zone in DNS_REPUTATION_LOOKUP_ZONES:
+                return
+            # Entropy check — CS encodes hex/base32, entropy of real label is
+            # 3.5+ bits/symbol. Pronounceable words (api.mycompanyservices.*)
+            # carry no digits and score low on the DGA heuristic.
             try:
                 ent = self.analyzer._calculate_entropy(encoded_label)
             except Exception:
                 ent = 0.0
             if ent < 3.0:
                 return
-            zone = self._parent_zone(parts)
+            if not any(c.isdigit() for c in encoded_label) and \
+                    self.analyzer._dga_score(encoded_label) < 0.7:
+                return
             qtype = int(getattr(pkt[DNSQR], 'qtype', 0))
             key = (pkt[IP].src, zone)
             rec = self._hits.get(key)
@@ -4093,11 +5003,11 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
                 'category': 'c2',
                 'title': 'Cobalt Strike DNS Beacon pattern',
                 'description': (
-                    f'Host {src} queried {rec["hits"]} long-random-label '
-                    f'subdomain(s) under {zone} with CS-style prefix '
+                    f'O host {src} consultou {rec["hits"]} subdomínio(s) com '
+                    f'label longo e aleatório sob {zone} com prefixo estilo CS '
                     f'"{rec["first_prefix"]}". qtypes={qtypes_str}. '
-                    f'First seen at ts={rec["first_ts"]:.2f}. Consistent '
-                    'with Cobalt Strike DNS Beacon C2.'
+                    f'Visto pela primeira vez em ts={rec["first_ts"]:.2f}. '
+                    'Consistente com C2 via Cobalt Strike DNS Beacon.'
                 ),
                 'ip': src,
                 'details': {
@@ -4110,10 +5020,11 @@ class CobaltStrikeDnsBeaconStreamingDetector(StreamingDetector):
                     'first_ts': rec['first_ts'],
                 },
                 'recommendation': (
-                    'CS DNS Beacons are extremely stealthy — they often run '
-                    'when HTTP egress is blocked. Sinkhole the parent zone, '
-                    'preserve memory/disk on the source host, and cross-'
-                    'check for concurrent CobaltStrike HTTP-side hits.'
+                    'CS DNS Beacons são extremamente furtivos — costumam '
+                    'operar quando a saída HTTP está bloqueada. Faça sinkhole '
+                    'da zona-pai, preserve memória/disco no host de origem e '
+                    'verifique se há hits simultâneos do lado HTTP do Cobalt '
+                    'Strike.'
                 ),
                 'mitre_attack': {
                     'technique_id': 'T1071.004',
@@ -4245,8 +5156,8 @@ class ModernTunnelStreamingDetector(StreamingDetector):
                 'category': 'tunneling',
                 'title': 'DNS-over-QUIC (DoQ) to External Resolver',
                 'description': (
-                    f'Host {src} sent {rec["count"]} DoQ packets to {dst}:{dport}. '
-                    'DoQ cega as detecções DNS do perímetro (DGA, NXDOMAIN, TLDs).'
+                    f'O host {src} enviou {rec["count"]} pacotes DoQ para {dst}:{dport}. '
+                    'O DoQ cega as detecções DNS do perímetro (DGA, NXDOMAIN, TLDs).'
                 ),
                 'ip': src,
                 'details': {
@@ -4261,18 +5172,20 @@ class ModernTunnelStreamingDetector(StreamingDetector):
             })
 
         for (src, dst, dport), rec in self.wg_flows.items():
-            sev = 'high' if rec['non_standard'] else 'medium'
+            # Default port = a declared VPN (inventory item, low); another
+            # port = deliberate disguise (high).
+            sev = 'high' if rec['non_standard'] else 'low'
             port_qual = 'non-standard' if rec['non_standard'] else 'default'
             alerts.append({
                 'severity': sev,
                 'category': 'tunneling',
                 'title': f'WireGuard Handshake on {port_qual} port',
                 'description': (
-                    f'Host {src} initiated a WireGuard handshake to '
-                    f'{dst}:{dport} (148B init, type=1). '
-                    + ('Port is not the WireGuard default (51820), '
-                       'suggesting deliberate evasion.' if rec['non_standard']
-                       else 'Default port — flag for awareness only.')
+                    f'O host {src} iniciou um handshake WireGuard para '
+                    f'{dst}:{dport} (init de 148B, type=1). '
+                    + ('A porta não é a padrão do WireGuard (51820), '
+                       'sugerindo evasão deliberada.' if rec['non_standard']
+                       else 'Porta padrão — sinalizado apenas para conhecimento.')
                 ),
                 'ip': src,
                 'details': {
@@ -4295,9 +5208,10 @@ class ModernTunnelStreamingDetector(StreamingDetector):
                 'category': 'tunneling',
                 'title': 'OpenVPN on Non-Standard UDP Port',
                 'description': (
-                    f'Host {src} OpenVPN Hard-Reset opcodes para {dst}:{dport} '
-                    f'({rec["count"]} pacotes, opcodes={sorted(rec["opcodes"])}). '
-                    'Porta não é a default OpenVPN (1194).'
+                    f'O host {src} enviou opcodes OpenVPN Hard-Reset para '
+                    f'{dst}:{dport} ({rec["count"]} pacotes, '
+                    f'opcodes={sorted(rec["opcodes"])}). '
+                    'A porta não é a padrão do OpenVPN (1194).'
                 ),
                 'ip': src,
                 'details': {
@@ -4643,6 +5557,13 @@ class OperationalExposureStreamingDetector(StreamingDetector):
         for port in (sport, dport):
             if port not in self._c.EXPOSED_DB_PORTS:
                 continue
+            # Same ephemeral-port trap as the ICS detector: 1433/1521/3306
+            # sit inside legacy/NAT ephemeral ranges. When the OTHER side is
+            # a well-known service (443, 22, 53...), the DB-looking number is
+            # just a client's source port, not a database listening.
+            other = dport if port == sport else sport
+            if other < 1024 or other in self._c.ALPN_WEB_OK_PORTS:
+                continue
             client_is_external = False
             server_ip = None
             client_ip = None
@@ -4738,8 +5659,17 @@ class OperationalExposureStreamingDetector(StreamingDetector):
     def finalize(self):
         alerts = []
         for (label, server_ip, client_ip, port), rec in self.db_exposure.items():
-            sev = 'high' if rec['handshake_seen'] else 'medium'
             conn_status = self.tracker.status(server_ip, client_ip, port)
+            if rec['handshake_seen']:
+                sev = 'high'
+            elif conn_status in ('established', 'open_no_ack'):
+                # Port answered the internet (SYN-ACK): exposed, even if no
+                # DB protocol bytes were captured.
+                sev = 'medium'
+            else:
+                # RST / silence / ICMP: internet background scanning that
+                # never reached a listening database.
+                sev = 'low'
             bytes_exchanged = self.tracker.bytes_exchanged(
                 server_ip, client_ip, port,
             )
@@ -4778,8 +5708,27 @@ class OperationalExposureStreamingDetector(StreamingDetector):
                 ),
             })
 
+        # Pipe fan-out per source: distinct targets per pipe tier.
+        fanout = defaultdict(set)
+        for (src, dst, pname) in self.dcerpc_pipes:
+            fanout[(src, self._pipe_tier(pname))].add(dst)
         for (src, dst, pname), rec in self.dcerpc_pipes.items():
             pipe_desc = self._c.DCERPC_LATERAL_PIPES.get(pname, pname)
+            tier = self._pipe_tier(pname)
+            n_targets = len(fanout[(src, tier)])
+            severity = {'exec': 'high', 'admin': 'medium'}.get(tier, 'low')
+            reason = None
+            if not self.analyzer._is_local_ip(src):
+                severity = 'critical'
+                reason = 'origem externa à rede'
+            elif tier == 'exec' and n_targets >= 3:
+                severity = 'critical'
+                reason = (f'execução remota em {n_targets} hosts '
+                          '(onda de PsExec/SCM)')
+            elif n_targets >= 5:
+                severity = 'high' if tier != 'exec' else 'critical'
+                reason = (f'mesmo pipe acessado em {n_targets} hosts '
+                          '(enumeração em massa, ex.: BloodHound/SharpHound)')
             # SMB pipes podem rodar em 445 ou 139 — soma os dois lados.
             bytes_exchanged = (
                 self.tracker.bytes_exchanged(dst, src, 445)
@@ -4790,19 +5739,31 @@ class OperationalExposureStreamingDetector(StreamingDetector):
                 or self.tracker.status(dst, src, 139)
                 or 'established'  # pipe access by definition requires session
             )
+            description = (
+                f'{src} → {dst} acessou named-pipe \\PIPE\\{pname} '
+                f'({pipe_desc}) — {rec["count"]} request(s).'
+            )
+            if reason:
+                description += f' Agravante: {reason}.'
+            elif tier == 'routine':
+                description += (
+                    ' Este pipe é usado rotineiramente por membros do domínio '
+                    '(logon, resolução de nomes, troca de senha, impressão, '
+                    'listagem de compartilhamentos) — relevante apenas em '
+                    'volume ou vindo de origem inesperada.'
+                )
             alerts.append({
-                'severity': 'high',
+                'severity': severity,
                 'category': 'lateral',
                 'title': f'DCERPC Lateral-Movement Pipe: \\PIPE\\{pname}',
-                'description': (
-                    f'{src} → {dst} acessou named-pipe \\PIPE\\{pname} '
-                    f'({pipe_desc}) — {rec["count"]} request(s).'
-                ),
+                'description': description,
                 'ip': src,
                 'details': {
                     'src': src, 'dst': dst,
                     'src_ip': src, 'dst_ip': dst,
                     'pipe': pname, 'pipe_description': pipe_desc,
+                    'pipe_tier': tier,
+                    'targets_for_tier': n_targets,
                     'count': rec['count'], 'first_ts': rec['ts'],
                     'connection_status': conn_status,
                     'connection_established':
@@ -4817,6 +5778,19 @@ class OperationalExposureStreamingDetector(StreamingDetector):
                 ),
             })
         return alerts
+
+    # Remote-execution pipes vs remote-admin vs pipes every domain member
+    # uses all day (lsarpc name lookups, netlogon secure channel, samr
+    # password changes, srvsvc share listing in Explorer, spoolss printing).
+    # Treating all of them as "high lateral movement" flooded AD networks.
+    _PIPE_TIERS = {
+        'svcctl': 'exec', 'atsvc': 'exec',
+        'winreg': 'admin', 'eventlog': 'admin',
+    }
+
+    @classmethod
+    def _pipe_tier(cls, pname):
+        return cls._PIPE_TIERS.get(pname, 'routine')
 
 
 class DcerpcBindStreamingDetector(StreamingDetector):
@@ -4836,9 +5810,28 @@ class DcerpcBindStreamingDetector(StreamingDetector):
         self._c = _c
         # (src, dst, uuid) → {count, ts}
         self.binds = {}
+        # Hosts answering Kerberos (port 88) = domain controllers. Lets
+        # finalize recognise DC<->DC replication (MS-DRSR is DCSync only
+        # when the caller is NOT a DC).
+        self.kdcs = set()
+
+    # Interfaces with a routine legitimate use that context can confirm.
+    _DRSR = 'e3514235-4b06-11d1-ab04-00c04fc2dcd2'
+    _PRINT = {'12345678-1234-abcd-ef00-0123456789ab',   # MS-RPRN
+              '76f03f96-cdfd-44fc-a22c-64950a001209'}   # MS-PAR
 
     def update(self, pkt):
-        if IP not in pkt or TCP not in pkt:
+        if IP not in pkt:
+            return
+        # Server side of Kerberos -> DC. SYN/any TCP or UDP to 88.
+        try:
+            if (TCP in pkt and int(pkt[TCP].dport) == 88) or \
+                    (UDP in pkt and int(pkt[UDP].dport) == 88):
+                if len(self.kdcs) < 1000:
+                    self.kdcs.add(pkt[IP].dst)
+        except Exception:
+            pass
+        if TCP not in pkt:
             return
         if DCERPC_BIND_LAYER is None or DCERPC_BIND_LAYER not in pkt:
             return
@@ -4859,20 +5852,46 @@ class DcerpcBindStreamingDetector(StreamingDetector):
 
     def finalize(self):
         alerts = []
+        clients_per_server = defaultdict(set)
+        for (src, dst, u) in self.binds:
+            clients_per_server[(dst, u)].add(src)
         for (src, dst, u), rec in self.binds.items():
             label, severity, tech_id, tech_name, tac_id, tac_name = \
                 self._c.DCERPC_DANGEROUS_INTERFACES[u]
+            context = None
+            if not self.analyzer._is_local_ip(src):
+                severity = 'critical'
+                context = 'origem externa à rede'
+            elif u == self._DRSR and src in self.kdcs and dst in self.kdcs:
+                # Both ends serve Kerberos: DC-to-DC replication, the
+                # everyday use of DRSUAPI. DCSync = a NON-DC calling it.
+                severity = 'low'
+                context = ('origem e destino são controladores de domínio '
+                           '(replicação AD normal)')
+            elif (u in self._PRINT and dst not in self.kdcs
+                  and len(clients_per_server[(dst, u)]) >= 3):
+                # Since the 2021 PrintNightmare hardening Windows clients
+                # print over RPC/TCP: MS-RPRN to a print server that serves
+                # many clients is printing. PrinterBug coerces a DC or a
+                # server that is NOT a shared print server.
+                severity = 'low'
+                context = (f'destino atende {len(clients_per_server[(dst, u)])} '
+                           'clientes nesta interface (servidor de impressão)')
+            description = (
+                f'{src} → {dst} fez bind na interface DCERPC {label} '
+                f'(UUID {u}) sobre ncacn_ip_tcp — {rec["count"]} bind(s). '
+                'Fazer bind nesta interface é uma primitiva de abuso conhecida.'
+            )
+            if context:
+                description += f' Contexto: {context}.'
             alerts.append({
                 'severity': severity,
                 'category': 'lateral',
                 'title': f'DCERPC Bind to High-Risk Interface: {label}',
-                'description': (
-                    f'{src} → {dst} bound the DCERPC interface {label} '
-                    f'(UUID {u}) over ncacn_ip_tcp — {rec["count"]} bind(s). '
-                    'Binding this interface is a known abuse primitive.'
-                ),
+                'description': description,
                 'ip': src,
                 'details': {
+                    'context': context,
                     'src': src, 'dst': dst,
                     'src_ip': src, 'dst_ip': dst,
                     'interface': label,

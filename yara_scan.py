@@ -328,10 +328,10 @@ def scan_and_alert(scan_id, results, settings) -> int:
                 f"{', '.join(rule_names[:3]) or 'unknown rule'}"
             ),
             'description': (
-                f"File {meta.get('filename') or sha256[:12]} "
-                f"({meta.get('size_bytes', 0)} bytes) carved from "
-                f"{meta.get('protocol', 'http')} flow matched "
-                f"{len(rule_names)} YARA rule(s): "
+                f"O arquivo {meta.get('filename') or sha256[:12]} "
+                f"({meta.get('size_bytes', 0)} bytes) extraído de um fluxo "
+                f"{meta.get('protocol', 'http')} correspondeu a "
+                f"{len(rule_names)} regra(s) YARA: "
                 f"{', '.join(rule_names)}. "
                 f"{(primary_meta.get('description') or '').strip()}"
             ).strip(),
@@ -345,9 +345,9 @@ def scan_and_alert(scan_id, results, settings) -> int:
                 'severity': payload.get('severity'),
             },
             'recommendation': (
-                "Pull the artifact from data/artifacts/, validate the YARA "
-                "rule's intent, and pivot on source_url to identify other "
-                "affected hosts."
+                "Recupere o artefato em data/artifacts/, valide a intenção da "
+                "regra YARA e pivote pelo source_url para identificar outros "
+                "hosts afetados."
             ),
             'mitre_attack': {
                 'technique_id': 'T1105',
