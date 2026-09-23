@@ -241,6 +241,14 @@ def enrich_results_with_names_and_groups(results, settings):
     except Exception as e:
         print(f"[routes/common] host_risk recompute failed: {e}")
 
+    # Machine view (IPv4 + IPv6 of the same MAC summed, user-edited names).
+    # After risk scores, which it aggregates per machine.
+    try:
+        from host_view import attach_host_view
+        attach_host_view(results)
+    except Exception as e:
+        print(f"[routes/common] host view failed: {e}")
+
     return results
 
 
@@ -309,12 +317,15 @@ def analyze_pcap_background(filepath, filename, job_id):
 
         settings = load_settings()
         try:
-            settings['device_types'] = {
-                ip: (info.get('device_type') or 'Computador')
-                for ip, info in db.get_all_ip_names().items()
-            }
+            settings['device_types'] = db.get_device_types_by_ip()
         except Exception:
-            settings['device_types'] = {}
+            settings.setdefault('device_types', {})
+        # Manual IP<->machine bindings and exclusions made by the user.
+        try:
+            settings['host_bindings'] = db.get_host_binding_settings()
+        except Exception as e:
+            print(f"host bindings unavailable: {e}")
+            settings['host_bindings'] = {}
         analyzer = PCAPAnalyzer(filepath, settings,
                                 progress_callback=progress_cb)
 

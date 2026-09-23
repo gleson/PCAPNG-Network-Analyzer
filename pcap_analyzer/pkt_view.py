@@ -18,8 +18,10 @@ from scapy.all import IP, IPv6, TCP, UDP, ARP, DNS, DNSQR, ICMP, Raw, Ether
 
 try:
     from scapy.layers.dhcp import DHCP as _ScapyDHCP
+    from scapy.layers.dhcp import BOOTP as _ScapyBOOTP
 except Exception:
     _ScapyDHCP = None  # type: ignore
+    _ScapyBOOTP = None  # type: ignore
 
 # LLMNR (UDP 5355) and NBT-NS (UDP 137) are name-service protocols scapy
 # dissects into their OWN classes — NOT the generic DNS class — so detectors
@@ -36,6 +38,10 @@ try:
 except Exception:
     _ScapyNBNS = None  # type: ignore
     _ScapyNBNSResp = None  # type: ignore
+try:
+    from scapy.layers.netbios import NBNSRegistrationRequest as _ScapyNBNSReg
+except Exception:
+    _ScapyNBNSReg = None  # type: ignore
 
 # Kerberos over TCP/88: scapy dissects the 4-byte RFC4120 length prefix into
 # KerberosTCPHeader and (often) the whole ASN.1 message into a Kerberos layer,
@@ -188,6 +194,13 @@ class _DHCPLayerView:
     __slots__ = ('options',)
 
 
+class _BootpLayerView:
+    """BOOTP header fields that bind a client MAC to an IPv4 address:
+    ``chaddr`` (client MAC, 'aa:bb:..' str), ``ciaddr`` (address the client
+    already holds) and ``yiaddr`` (address the server hands out)."""
+    __slots__ = ('op', 'chaddr', 'ciaddr', 'yiaddr')
+
+
 class _NameResponseView:
     """Normalised view of an LLMNR / NBT-NS message: response flag + answers.
 
@@ -198,7 +211,11 @@ class _NameResponseView:
     # qname: the name being answered (lowercased str, '' when unknown). A
     # host answering only for its OWN name is normal; Responder answers for
     # whatever anyone asks.
-    __slots__ = ('qr', 'ancount', 'qname')
+    # host_name / addr: the name as sent (original case, padding stripped)
+    # and the address it resolves to — from a response answer or an NBNS
+    # name registration. Lets the host-identity aggregator learn a machine's
+    # own name when the address is the sender's.
+    __slots__ = ('qr', 'ancount', 'qname', 'host_name', 'addr')
 
 
 class _Smb2CreateView:
@@ -552,6 +569,8 @@ def extract_pkt_view(pkt):
             layer.qr = int(llmnr.qr) if llmnr.qr is not None else 0
             layer.ancount = int(llmnr.ancount) if llmnr.ancount is not None else 0
             layer.qname = ''
+            layer.host_name = ''
+            layer.addr = None
             try:
                 qd = llmnr.qd
                 if isinstance(qd, (list, tuple)):
@@ -560,7 +579,17 @@ def extract_pkt_view(pkt):
                     nm = qd.qname
                     if isinstance(nm, bytes):
                         nm = nm.decode('utf-8', errors='ignore')
-                    layer.qname = (nm or '').strip().rstrip('.').lower()
+                    layer.host_name = (nm or '').strip().rstrip('.')
+                    layer.qname = layer.host_name.lower()
+            except Exception:
+                pass
+            try:
+                an = llmnr.an
+                if isinstance(an, (list, tuple)):
+                    an = an[0] if an else None
+                rdata = getattr(an, 'rdata', None) if an is not None else None
+                if rdata:
+                    layer.addr = str(rdata)
             except Exception:
                 pass
             view._layers[_ScapyLLMNRResp] = layer
@@ -574,12 +603,29 @@ def extract_pkt_view(pkt):
             layer.qr = int(nb.RESPONSE) if nb.RESPONSE is not None else 0
             layer.ancount = int(nb.ANCOUNT) if nb.ANCOUNT is not None else 0
             layer.qname = ''
+            layer.host_name = ''
+            layer.addr = None
             try:
                 if _ScapyNBNSResp is not None and _ScapyNBNSResp in pkt:
-                    nm = pkt[_ScapyNBNSResp].RR_NAME
+                    resp = pkt[_ScapyNBNSResp]
+                    nm = resp.RR_NAME
                     if isinstance(nm, bytes):
                         nm = nm.decode('ascii', errors='ignore')
-                    layer.qname = (nm or '').strip().lower()
+                    layer.host_name = (nm or '').strip()
+                    layer.qname = layer.host_name.lower()
+                    entries = getattr(resp, 'ADDR_ENTRY', None) or []
+                    if entries:
+                        layer.addr = str(entries[0].NB_ADDRESS)
+                elif _ScapyNBNSReg is not None and _ScapyNBNSReg in pkt:
+                    # Name registration: a host announcing its OWN NetBIOS
+                    # name and address at boot. Kept out of `qname` so the
+                    # LLMNR/NBT-NS poisoning detector does not count it.
+                    reg = pkt[_ScapyNBNSReg]
+                    nm = reg.QUESTION_NAME
+                    if isinstance(nm, bytes):
+                        nm = nm.decode('ascii', errors='ignore')
+                    layer.host_name = (nm or '').strip()
+                    layer.addr = str(reg.NB_ADDRESS) if reg.NB_ADDRESS else None
             except Exception:
                 pass
             view._layers[_ScapyNBNS] = layer
@@ -627,11 +673,26 @@ def extract_pkt_view(pkt):
                     if not isinstance(opt, tuple) or len(opt) < 2:
                         continue
                     name = opt[0]
-                    if name in ('vendor_class_id', 'hostname', 'param_req_list'):
+                    if name in ('vendor_class_id', 'hostname', 'param_req_list',
+                                'message-type', 'requested_addr'):
                         keep.append(opt)
             layer = _DHCPLayerView()
             layer.options = keep
             view._layers[_ScapyDHCP] = layer
+        except Exception:
+            pass
+
+    if _ScapyBOOTP is not None and _ScapyBOOTP in pkt:
+        try:
+            b = pkt[_ScapyBOOTP]
+            layer = _BootpLayerView()
+            layer.op = int(b.op) if b.op is not None else 0
+            ch = bytes(b.chaddr or b'')[:6]
+            layer.chaddr = (':'.join(f'{x:02x}' for x in ch)
+                            if len(ch) == 6 else None)
+            layer.ciaddr = str(b.ciaddr) if b.ciaddr else None
+            layer.yiaddr = str(b.yiaddr) if b.yiaddr else None
+            view._layers[_ScapyBOOTP] = layer
         except Exception:
             pass
 
@@ -645,11 +706,15 @@ NBNS_LAYER = _ScapyNBNS
 SMB2_CREATE_LAYER = _ScapySMB2Create
 DCERPC_BIND_LAYER = _ScapyDceRpc5Bind
 NDP_LAYER = _ScapyICMPv6NA
+BOOTP_LAYER = _ScapyBOOTP
+DHCP_LAYER = _ScapyDHCP
 
 
 __all__ = [
     "PktView",
     "extract_pkt_view",
+    "BOOTP_LAYER",
+    "DHCP_LAYER",
     "LLMNR_LAYER",
     "NBNS_LAYER",
     "SMB2_CREATE_LAYER",

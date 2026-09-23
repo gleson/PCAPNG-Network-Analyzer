@@ -22,9 +22,9 @@ VALID_SEVERITIES = {"critical", "high", "medium", "low", "info", "informational"
 def test_registry_counts():
     """Registry sizes are part of the engine's contract; a silent drop of a
     detector should fail here, not in production."""
-    assert len(STREAMING_DETECTORS) == 34
-    assert len(POST_DETECTORS) == 20
-    assert len(STREAMING_AGGREGATORS) == 15
+    assert len(STREAMING_DETECTORS) == 35  # + HostExfiltration
+    assert len(POST_DETECTORS) == 21  # + HostMultipleAddresses
+    assert len(STREAMING_AGGREGATORS) == 16  # + HostIdentity
 
 
 def test_kev_enricher_is_last_post_detector():

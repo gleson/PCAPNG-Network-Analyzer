@@ -2930,6 +2930,162 @@ class SustainedExfilRatioStreamingDetector(StreamingDetector):
         return alerts
 
 
+class HostExfiltrationStreamingDetector(StreamingDetector):
+    """Upload volume per MACHINE (all its IPv4 + IPv6 addresses) to one
+    destination.
+
+    VolumeExfiltrationStreamingDetector works per (local IP, external IP)
+    pair and only when exactly one side is RFC1918/ULA, so:
+      * a host splitting an upload between its IPv4 and IPv6 addresses
+        stays under the threshold on each address, and
+      * a LAN host with a GLOBAL IPv6 address uploading to the internet is
+        invisible (both ends look "external").
+    This detector groups by host (HostIdentityAggregator's IP -> host map)
+    and by destination (the hostname seen in DNS/SNI/Host when known, so a
+    dual-stack server's IPv4 and IPv6 addresses count as one destination).
+
+    To avoid duplicates it stays silent when a single classic pair inside
+    the group already crosses the thresholds on its own — that one was
+    reported by the per-pair detector.
+    """
+    name = 'host_exfil'
+
+    MAX_PAIRS = 500_000
+
+    def __init__(self, analyzer):
+        super().__init__(analyzer)
+        self.threshold_bytes = self.thresholds.get(
+            'exfil_min_bytes_out', 10 * 1024 * 1024)
+        self.ratio_threshold = self.thresholds.get('exfil_min_ratio', 5.0)
+        # (inside_ip, peer_ip) -> [out, in, first_ts, last_ts]
+        self.pairs = {}
+
+    def _bump(self, key, idx, size, ts):
+        rec = self.pairs.get(key)
+        if rec is None:
+            if len(self.pairs) >= self.MAX_PAIRS:
+                return
+            rec = self.pairs[key] = [0, 0, ts, ts]
+        rec[idx] += size
+        if ts < rec[2]:
+            rec[2] = ts
+        if ts > rec[3]:
+            rec[3] = ts
+
+    def update(self, pkt):
+        if IP not in pkt:
+            return
+        src = pkt[IP].src
+        dst = pkt[IP].dst
+        size = len(pkt)
+        ts = float(pkt.time)
+        # Which end is "ours" is only known after the host map is built, so
+        # every packet with a non-local end is booked from both viewpoints.
+        if not self.analyzer._is_local_ip(dst):
+            self._bump((src, dst), 0, size, ts)
+        if not self.analyzer._is_local_ip(src):
+            self._bump((dst, src), 1, size, ts)
+
+    def _dest_key(self, peer):
+        try:
+            names = self.analyzer._hostname_index().get(peer) or set()
+        except Exception:
+            names = set()
+        if names:
+            from ..constants import base_zone
+            name = sorted(names)[0]
+            return base_zone(name.split('.'))
+        return peer
+
+    def finalize(self):
+        ip_host = getattr(self.analyzer, '_ip_host', None) or {}
+        hosts_by_key = getattr(self.analyzer, '_hosts_by_key', None) or {}
+        if not ip_host or not self.pairs:
+            return []
+        is_local = self.analyzer._is_local_ip
+        groups = {}
+        for (inside, peer), (out_b, in_b, first, last) in self.pairs.items():
+            hk = ip_host.get(inside)
+            if hk is None or peer in ip_host:
+                continue  # not one of our machines, or LAN <-> LAN
+            key = (hk, self._dest_key(peer))
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {'out': 0, 'in': 0, 'ips': set(),
+                                   'peers': {}, 'first': first, 'last': last,
+                                   'covered': False}
+            g['out'] += out_b
+            g['in'] += in_b
+            if out_b:
+                g['ips'].add(inside)
+            g['peers'][peer] = g['peers'].get(peer, 0) + out_b
+            g['first'] = min(g['first'], first)
+            g['last'] = max(g['last'], last)
+            # Would the classic per-pair detector have fired on this pair?
+            if (is_local(inside) and not is_local(peer)
+                    and out_b >= self.threshold_bytes
+                    and out_b / max(in_b, 1) >= self.ratio_threshold):
+                g['covered'] = True
+
+        alerts = []
+        for (hk, dest), g in groups.items():
+            if g['covered'] or g['out'] < self.threshold_bytes:
+                continue
+            ratio = g['out'] / max(g['in'], 1)
+            if ratio < self.ratio_threshold:
+                continue
+            ips = sorted(g['ips'])
+            top_peer = max(g['peers'], key=g['peers'].get)
+            top_ip = max(ips, key=lambda ip: self.pairs.get((ip, top_peer), [0])[0]) \
+                if ips else None
+            severity = 'high' if g['out'] >= self.threshold_bytes * 5 else 'medium'
+            host = hosts_by_key.get(hk) or {}
+            details = {
+                'host_key': hk,
+                'host_mac': host.get('mac'),
+                'host_name': host.get('discovered_name'),
+                'contributing_ips': ips,
+                'src_ip': top_ip,
+                'dst_ip': top_peer,
+                'destination': dest,
+                'destination_ips': sorted(g['peers'])[:10],
+                'bytes_out': g['out'],
+                'bytes_in': g['in'],
+                'ratio': round(ratio, 2),
+                'duration_seconds': round(g['last'] - g['first'], 2),
+                'first_ts': g['first'],
+                'last_ts': g['last'],
+            }
+            label = host.get('discovered_name') or host.get('mac') or hk
+            description = (
+                f'A máquina {label} enviou {g["out"] / 1024 / 1024:.1f} MB '
+                f'para {dest} somando {len(ips)} endereço(s) '
+                f'({", ".join(ips[:4])}) — razão saída/entrada {ratio:.1f}x. '
+                'Nenhum endereço isolado passou do limite; o volume só '
+                'aparece somando IPv4 e IPv6 da mesma máquina.'
+            )
+            recommendation = (
+                'Confirme a aplicação responsável pelo upload e o destino. '
+                'Tráfego dividido entre IPv4 e IPv6 pode ser apenas o '
+                'sistema operacional alternando entre as pilhas, mas também '
+                'é uma forma de ficar abaixo de limites por endereço.'
+            )
+            severity, description, recommendation = _apply_sanctioned_downgrade(
+                self.analyzer, top_peer, severity, details,
+                description, recommendation,
+            )
+            alerts.append({
+                'severity': severity,
+                'category': 'exfil',
+                'title': 'Possible Data Exfiltration (Host Aggregate)',
+                'description': description,
+                'ip': top_ip,
+                'details': details,
+                'recommendation': recommendation,
+            })
+        return alerts
+
+
 class InternalLateralStreamingDetector(StreamingDetector):
     """Streaming de _detect_internal_lateral."""
     name = 'internal_lateral'
@@ -5942,6 +6098,7 @@ STREAMING_DETECTORS = [
     IcmpTunnelingStreamingDetector,
     VolumeExfiltrationStreamingDetector,
     SustainedExfilRatioStreamingDetector,
+    HostExfiltrationStreamingDetector,
     InternalLateralStreamingDetector,
     BeaconingStreamingDetector,
     ConnectionBeaconingStreamingDetector,

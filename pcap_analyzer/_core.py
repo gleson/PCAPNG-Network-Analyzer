@@ -422,6 +422,18 @@ class PCAPAnalyzer:
         except Exception as e:
             print(f"[pcap_analyzer] alert normalization failed: {e}")
 
+        # Host identity: tag per-IP rows and alerts with the machine (MAC /
+        # manual host) the address belongs to, so the UI can group them.
+        try:
+            from .hosts import annotate_with_hosts
+            annotate_with_hosts(
+                self.results, alerts,
+                getattr(self, '_ip_host', None) or {},
+                getattr(self, '_hosts_by_key', None) or {},
+            )
+        except Exception as e:
+            print(f"[pcap_analyzer] host annotation failed: {e}")
+
         try:
             from mitre_attack import annotate_alerts
             annotate_alerts(alerts)

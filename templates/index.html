@@ -384,12 +384,45 @@
                 <div class="tab-pane fade" id="ips" role="tabpanel">
                     <div class="card shadow-sm">
                         <div class="card-header d-flex justify-content-between align-items-center">
-                            <span><i class="fas fa-server"></i> Lista de IPs Detectados</span>
-                            <button class="btn btn-sm btn-outline-success" id="manage-ip-names-btn" data-bs-toggle="modal" data-bs-target="#ipNamesModal">
-                                <i class="fas fa-tags"></i> Gerenciar Nomes
-                            </button>
+                            <span id="ips-card-title"><i class="fas fa-server"></i> Lista de IPs Detectados</span>
+                            <div class="d-flex gap-2 flex-wrap">
+                                <div class="btn-group btn-group-sm" role="group" aria-label="Agrupar por">
+                                    <input type="radio" class="btn-check" name="ips-view-mode" id="ips-view-ip" value="ip" checked>
+                                    <label class="btn btn-outline-primary" for="ips-view-ip"><i class="fas fa-network-wired"></i> Por IP</label>
+                                    <input type="radio" class="btn-check" name="ips-view-mode" id="ips-view-host" value="host">
+                                    <label class="btn btn-outline-primary" for="ips-view-host" title="Soma IPv4 e IPv6 da mesma máquina (MAC)"><i class="fas fa-desktop"></i> Por Máquina</label>
+                                </div>
+                                <button class="btn btn-sm btn-outline-secondary d-none" id="new-host-btn" title="Criar máquina manual (ex.: servidor de outra sub-rede)">
+                                    <i class="fas fa-plus"></i> Nova máquina
+                                </button>
+                                <button class="btn btn-sm btn-outline-success" id="manage-ip-names-btn" data-bs-toggle="modal" data-bs-target="#ipNamesModal">
+                                    <i class="fas fa-tags"></i> Gerenciar Nomes
+                                </button>
+                            </div>
                         </div>
-                        <div class="card-body">
+                        <div class="card-body" id="hosts-pane" hidden>
+                            <table id="hosts-table" class="table table-striped table-hover" style="width:100%">
+                                <thead>
+                                    <tr>
+                                        <th>Nome</th>
+                                        <th>MAC</th>
+                                        <th>IPv4</th>
+                                        <th>IPv6</th>
+                                        <th>Dispositivo</th>
+                                        <th title="Maior risk score entre os IPs da máquina">Risk</th>
+                                        <th>Pacotes Env.</th>
+                                        <th>Pacotes Rec.</th>
+                                        <th>Bytes Env.</th>
+                                        <th>Bytes Rec.</th>
+                                        <th>Protocolos</th>
+                                        <th>Alertas</th>
+                                        <th>Ações</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="hosts-tbody"></tbody>
+                            </table>
+                        </div>
+                        <div class="card-body" id="ips-pane">
                             <table id="ips-table" class="table table-striped table-hover" style="width:100%">
                                 <thead>
                                     <tr>
@@ -1035,6 +1068,66 @@
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
                     <button type="button" class="btn btn-primary" id="save-ip-name-btn">
+                        <i class="fas fa-save"></i> Salvar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Machine (host) -->
+    <div class="modal fade" id="hostModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-desktop"></i> <span id="host-modal-title">Máquina</span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="host-id">
+                    <div id="host-name-changed-alert" class="alert alert-warning py-2 d-flex justify-content-between align-items-center" hidden>
+                        <span id="host-name-changed-text"></span>
+                        <button type="button" class="btn btn-sm btn-outline-dark" id="host-ack-name-btn">Ciente</button>
+                    </div>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="host-name">Nome</label>
+                            <input type="text" class="form-control" id="host-name" maxlength="100" placeholder="Ex: PDH02">
+                            <small class="text-muted" id="host-discovered-hint"></small>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="host-device-type">Tipo de Dispositivo</label>
+                            <select class="form-select" id="host-device-type"></select>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label" for="host-description">Descrição (opcional)</label>
+                            <textarea class="form-control" id="host-description" rows="2"></textarea>
+                        </div>
+                        <div class="col-12 small text-muted" id="host-meta"></div>
+                    </div>
+                    <hr>
+                    <h6>Endereços associados</h6>
+                    <table class="table table-sm align-middle mb-2">
+                        <thead>
+                            <tr><th>IP</th><th>Tipo</th><th>Associação</th><th class="text-end">Ações</th></tr>
+                        </thead>
+                        <tbody id="host-ips-tbody"></tbody>
+                    </table>
+                    <div class="input-group input-group-sm">
+                        <input type="text" class="form-control" id="host-bind-ip" placeholder="IPv4 ou IPv6 para associar (prefira o fe80:: em vez de IPv6 temporário)">
+                        <button class="btn btn-outline-primary" type="button" id="host-bind-btn"><i class="fas fa-link"></i> Associar IP</button>
+                    </div>
+                    <small class="text-muted d-block mt-1">
+                        Associações manuais valem para as próximas análises. Se o IP aparecer com outro MAC, o app gera um
+                        alerta de conflito em vez de somar o tráfego.
+                    </small>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-danger me-auto" id="host-delete-btn" hidden>
+                        <i class="fas fa-trash"></i> Excluir máquina
+                    </button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Fechar</button>
+                    <button type="button" class="btn btn-primary" id="host-save-btn">
                         <i class="fas fa-save"></i> Salvar
                     </button>
                 </div>

@@ -2512,8 +2512,163 @@ class KevEnricherDetector(PostDetector):
 # extends after each post-detector — so any detector placed after it would
 # have its CVE references invisible to KEV matching. The rest are
 # order-independent (guarded by test_engine_contract).
+class HostMultipleAddressesDetector(PostDetector):
+    """A machine (MAC) holding more addresses than a normal host does.
+
+    Normal dual-stack host: ONE IPv4 plus several IPv6 addresses (one
+    link-local fe80::, plus global / temporary privacy addresses that rotate
+    daily). So the rule is per address TYPE, not per family:
+
+      * 2+ IPv4 at the SAME time      -> medium (secondary IP / alias / spoof)
+      * 2+ IPv4 at different times    -> low    (DHCP handed out a new lease)
+      * 2+ IPv6 link-local            -> medium (one per interface is normal)
+      * any number of global IPv6     -> no alert
+
+    Router-like MACs (gateways legitimately own many interface addresses)
+    and addresses the USER bound by hand are left out. Manual bindings the
+    capture contradicts are reported here too.
+    """
+    name = 'host_multiple_addresses'
+
+    def run(self):
+        analyzer = self.analyzer
+        alerts = []
+        for host in (analyzer.results.get('hosts') or []):
+            if host.get('gateway_like'):
+                continue
+            auto = [a for a in host.get('addresses') or []
+                    if a.get('binding') == 'auto']
+            v4 = [a for a in auto if a.get('scope') in ('v4_private', 'v4_public')]
+            ll6 = [a for a in auto if a.get('scope') == 'v6_link_local']
+            if len(v4) >= 2:
+                alerts.append(self._v4_alert(host, v4))
+            if len(ll6) >= 2:
+                alerts.append(self._ll6_alert(host, ll6))
+        for c in getattr(analyzer, '_host_conflicts', None) or []:
+            alerts.append(self._conflict_alert(c))
+        return alerts
+
+    @staticmethod
+    def _label(host):
+        name = host.get('discovered_name')
+        mac = host.get('mac') or host.get('host_key')
+        return f'{name} ({mac})' if name else mac
+
+    @staticmethod
+    def _overlapping(addrs):
+        for i, a in enumerate(addrs):
+            for b in addrs[i + 1:]:
+                if None in (a.get('first_ts'), a.get('last_ts'),
+                            b.get('first_ts'), b.get('last_ts')):
+                    continue
+                if a['first_ts'] <= b['last_ts'] and b['first_ts'] <= a['last_ts']:
+                    return True
+        return False
+
+    @staticmethod
+    def _base_details(host, addrs):
+        return {
+            'host_key': host.get('host_key'),
+            'host_mac': host.get('mac'),
+            'mac_address': host.get('mac'),
+            'host_name': host.get('discovered_name'),
+            'addresses': [
+                {'ip': a['ip'], 'first_ts': a.get('first_ts'),
+                 'last_ts': a.get('last_ts'), 'sources': a.get('sources')}
+                for a in addrs
+            ],
+            'address_count': len(addrs),
+            'first_ts': min((a['first_ts'] for a in addrs
+                             if a.get('first_ts') is not None), default=None),
+            'last_ts': max((a['last_ts'] for a in addrs
+                            if a.get('last_ts') is not None), default=None),
+        }
+
+    def _v4_alert(self, host, v4):
+        overlapping = self._overlapping(v4)
+        ips = [a['ip'] for a in v4]
+        details = self._base_details(host, v4)
+        details['simultaneous'] = overlapping
+        if overlapping:
+            severity = 'medium'
+            note = ('Os endereços foram usados AO MESMO TEMPO: IP secundário '
+                    'configurado na placa, alias, ou uma máquina se passando '
+                    'por outra (spoofing).')
+        else:
+            severity = 'low'
+            note = ('Os endereços foram usados em momentos diferentes — '
+                    'típico de o DHCP ter entregue um novo IP à máquina.')
+        return {
+            'severity': severity,
+            'category': 'mac',
+            'title': 'Host with Multiple IPv4 Addresses',
+            'description': (
+                f'A máquina {self._label(host)} usou {len(ips)} endereços '
+                f'IPv4 ({", ".join(ips[:5])}). {note}'
+            ),
+            'ip': ips[0],
+            'details': details,
+            'recommendation': (
+                'Confirme se a máquina tem IP secundário configurado ou '
+                'reserva de DHCP. Se não houver explicação, correlacione com '
+                'alertas de ARP spoofing no mesmo período. Se for esperado, '
+                'associe os IPs manualmente à máquina para silenciar este '
+                'alerta.'
+            ),
+        }
+
+    def _ll6_alert(self, host, ll6):
+        ips = [a['ip'] for a in ll6]
+        return {
+            'severity': 'medium',
+            'category': 'mac',
+            'title': 'Host with Multiple IPv6 Link-Local Addresses',
+            'description': (
+                f'A máquina {self._label(host)} usou {len(ips)} endereços '
+                f'IPv6 link-local ({", ".join(ips[:5])}). Cada interface tem '
+                'um único endereço fe80:: — mais de um no mesmo MAC indica '
+                'interfaces virtuais/bridge, reconfiguração da pilha ou '
+                'spoofing de NDP.'
+            ),
+            'ip': ips[0],
+            'details': self._base_details(host, ll6),
+            'recommendation': (
+                'Verifique se a máquina roda VMs/containers em bridge ou teve '
+                'a pilha IPv6 reiniciada. Sem explicação, correlacione com '
+                'alertas de NDP spoofing.'
+            ),
+        }
+
+    @staticmethod
+    def _conflict_alert(c):
+        return {
+            'severity': 'medium',
+            'category': 'mac',
+            'title': 'Manual Host Binding Conflict',
+            'description': (
+                f'O IP {c["ip"]} foi associado manualmente à máquina de MAC '
+                f'{c.get("expected_mac")}, mas nesta captura ele aparece com o '
+                f'MAC {c.get("observed_mac")}. Para não misturar duas máquinas, '
+                'o tráfego deste IP NÃO foi somado à máquina associada.'
+            ),
+            'ip': c['ip'],
+            'details': {
+                'host_key': c.get('host_key'),
+                'expected_mac': c.get('expected_mac'),
+                'observed_mac': c.get('observed_mac'),
+                'mac_address': c.get('observed_mac'),
+            },
+            'recommendation': (
+                'Provavelmente o DHCP entregou este IP a outra máquina. '
+                'Revise a associação manual (ou crie uma reserva de DHCP). Se '
+                'o MAC observado não for conhecido, investigue spoofing.'
+            ),
+        }
+
+
 POST_DETECTORS = [
     IpMacChangesDetector,
+    HostMultipleAddressesDetector,
     OldTlsVersionDetector,
     SuspiciousSniDetector,
     KnownBadJa3Detector,

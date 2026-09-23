@@ -12,6 +12,7 @@ from .alerts import alerts_bp
 from .rules import rules_bp
 from .admin import admin_bp
 from .config import config_bp
+from .hosts import hosts_bp
 from .ui import ui_bp
 
 ALL_BLUEPRINTS = (
@@ -22,6 +23,7 @@ ALL_BLUEPRINTS = (
     rules_bp,
     admin_bp,
     config_bp,
+    hosts_bp,
     ui_bp,
 )
 

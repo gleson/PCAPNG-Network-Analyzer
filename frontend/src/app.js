@@ -204,6 +204,7 @@ $(document).ready(function() {
     $('#save-ip-name-btn').on('click', saveIpName);
     $('#add-ip-name-btn').on('click', addIpNameFromModal);
     $('#export-ip-names-btn').on('click', exportIpNames);
+    bindHostUi();
     $('#import-ip-names-btn').on('click', () => $('#import-ip-names-file').trigger('click'));
     $('#import-ip-names-file').on('change', importIpNamesFromFile);
     $('#cancel-edit-ip-name').on('click', function(ev) { ev.preventDefault(); resetIpNameForm(); });
@@ -869,7 +870,16 @@ function checkForResults() {
     });
 }
 
+// Last results query, so edits (e.g. renaming a machine) can refresh the
+// same view (a given scan / the aggregate) instead of jumping to the latest.
+let lastResultsArgs = [];
+
+function reloadCurrentResults() {
+    loadResults(...lastResultsArgs);
+}
+
 function loadResults(scanId = null, view = 'single', scanIds = null, dateFrom = null, dateTo = null) {
+    lastResultsArgs = [scanId, view, scanIds, dateFrom, dateTo];
     let url = '/api/results';
     const params = [];
 
@@ -919,6 +929,7 @@ function renderResults(data) {
 
     renderOverview(data);
     renderIPs(data);
+    renderHosts(data);
     renderProtocols(data);
     renderAlerts(data);
 
@@ -1144,9 +1155,13 @@ function renderIPs(data) {
             `<span class="badge bg-danger">${ip.alert_count}</span>` :
             '<span class="badge bg-success">0</span>';
 
-        const nameCell = ip.name ?
+        let nameCell = ip.name ?
             `<span class="text-success">${escapeHtml(ip.name)}</span>` :
             '<span class="text-muted">-</span>';
+        // IP que pertence a uma máquina (IPv4 + IPv6 pelo MAC): atalho para ela.
+        if (ip.host_id) {
+            nameCell += ` <button class="btn btn-link btn-sm p-0 open-host-btn" data-host-id="${Number(ip.host_id)}" title="Ver a máquina deste IP"><i class="fas fa-desktop"></i></button>`;
+        }
 
         // MAC(s) de origem observados para este IP. Fica pesquisável na busca
         // do DataTable, permitindo localizar o IP a partir de um MAC visto em
@@ -1606,6 +1621,13 @@ function confirmAction(opts) {
 // `details`; quando há um destino conhecido mostramos os dois lados de forma
 // explícita. Sem destino, cai para a linha "IP:" simples de sempre — o que
 // também cobre alertas antigos gravados antes de `details` incluir dst_ip.
+// Máquina dona do IP do alerta (host_view.py): nome + atalho para o modal.
+function hostTag(alert) {
+    if (!alert.host_id) return '';
+    const label = alert.host_name || 'máquina';
+    return ` <button class="btn btn-sm btn-outline-secondary py-0 open-host-btn" data-host-id="${Number(alert.host_id)}" title="Abrir a máquina"><i class="fas fa-desktop"></i> ${escHtml(label)}</button>`;
+}
+
 function renderAlertEndpoints(alert) {
     const d = alert.details || {};
 
@@ -1649,7 +1671,7 @@ function renderAlertEndpoints(alert) {
 
     if (!dst) {
         return alert.ip
-            ? `<p class="mb-1"><strong>IP:</strong> <code>${escHtml(alert.ip)}</code></p>`
+            ? `<p class="mb-1"><strong>IP:</strong> <code>${escHtml(alert.ip)}</code>${hostTag(alert)}</p>`
             : '';
     }
 
@@ -1660,7 +1682,7 @@ function renderAlertEndpoints(alert) {
 
     let html = '';
     if (src) {
-        html += `<p class="mb-1"><strong>IP de origem:</strong> <code>${escHtml(src)}</code></p>`;
+        html += `<p class="mb-1"><strong>IP de origem:</strong> <code>${escHtml(src)}</code>${hostTag(alert)}</p>`;
     }
     html += `<p class="mb-1"><strong>IP de destino:</strong> ${dstHtml}</p>`;
 
@@ -2168,6 +2190,323 @@ function bulkMarkFilteredAsFP() {
             complete: () => { $btn.prop('disabled', false).html(orig); },
         });
     });
+}
+
+// ==================== MÁQUINAS (IPv4 + IPv6 pelo MAC) ====================
+//
+// results.hosts_view (host_view.py) traz uma entrada por máquina com os
+// endereços IPv4/IPv6 e o tráfego de todos eles somado. O nome exibido é o
+// que o usuário definiu; o "nome encontrado" na rede fica só no modal.
+
+const IP_SCOPE_LABELS = {
+    v4_private: 'IPv4 privado',
+    v4_public: 'IPv4 público',
+    v4_link_local: 'IPv4 link-local',
+    v6_link_local: 'IPv6 link-local',
+    v6_ula: 'IPv6 ULA',
+    v6_global: 'IPv6 global',
+};
+
+let hostsDataTable = null;
+let ipsViewMode = 'ip';
+try { ipsViewMode = localStorage.getItem('ipsViewMode') === 'host' ? 'host' : 'ip'; } catch (e) { /* storage indisponível */ }
+
+function setIpsViewMode(mode) {
+    ipsViewMode = mode === 'host' ? 'host' : 'ip';
+    try { localStorage.setItem('ipsViewMode', ipsViewMode); } catch (e) { /* ignore */ }
+    const hostMode = ipsViewMode === 'host';
+    $('#ips-view-host').prop('checked', hostMode);
+    $('#ips-view-ip').prop('checked', !hostMode);
+    $('#hosts-pane').prop('hidden', !hostMode);
+    $('#ips-pane').prop('hidden', hostMode);
+    $('#new-host-btn').toggleClass('d-none', !hostMode);
+    $('#ips-card-title').html(hostMode
+        ? '<i class="fas fa-desktop"></i> Máquinas (IPv4 + IPv6 somados)'
+        : '<i class="fas fa-server"></i> Lista de IPs Detectados');
+    const table = hostMode ? hostsDataTable : ipsDataTable;
+    if (table) table.columns.adjust();
+}
+
+function hostAddressCell(list) {
+    if (!list || list.length === 0) return '<span class="text-muted">-</span>';
+    const first = `<code>${escHtml(list[0])}</code>`;
+    const extra = list.length > 1
+        ? ` <span class="badge bg-light text-dark" title="${escHtml(list.join('\n'))}">+${list.length - 1}</span>`
+        : '';
+    return first + extra;
+}
+
+// <td> com todos os IPs em data-search: a busca do DataTable acha qualquer um.
+function hostAddressTd(list) {
+    return `<td data-search="${escHtml((list || []).join(' '))}">${hostAddressCell(list)}</td>`;
+}
+
+function renderHosts(data) {
+    const hosts = data.hosts_view || [];
+    const tbody = $('#hosts-tbody');
+    if (hostsDataTable) {
+        hostsDataTable.clear().destroy();
+        hostsDataTable = null;
+    }
+    tbody.empty();
+
+    hosts.forEach(h => {
+        const name = h.name || '';
+        let nameCell = name
+            ? `<span class="text-success">${escHtml(name)}</span>`
+            : '<span class="text-muted">sem nome</span>';
+        if (h.discovered_name_previous) {
+            nameCell += ` <i class="fas fa-exclamation-triangle text-warning" title="O nome desta máquina na rede mudou: ${escHtml(h.discovered_name_previous)} → ${escHtml(h.discovered_name || '')}"></i>`;
+        }
+        if (h.is_manual) {
+            nameCell += ' <span class="badge bg-secondary" title="Máquina criada manualmente">manual</span>';
+        }
+        const riskScore = Number.isFinite(h.risk_score) ? h.risk_score : 0;
+        let riskClass = 'bg-success';
+        if (riskScore >= 70) riskClass = 'bg-danger';
+        else if (riskScore >= 40) riskClass = 'bg-warning text-dark';
+        else if (riskScore >= 15) riskClass = 'bg-info text-dark';
+        const protocols = (h.protocols || []).map(p => `<span class="badge bg-info">${escHtml(p)}</span>`).join(' ');
+        const alertsBadge = h.alert_count > 0
+            ? `<span class="badge bg-danger">${h.alert_count}</span>`
+            : '<span class="badge bg-success">0</span>';
+
+        tbody.append(`
+            <tr>
+                <td>${nameCell}</td>
+                <td>${h.mac ? `<code>${escHtml(h.mac)}</code>` : '<span class="text-muted">-</span>'}</td>
+                ${hostAddressTd(h.ipv4)}
+                ${hostAddressTd(h.ipv6)}
+                <td>${deviceTypeBadge(h.device_type || 'Computador')}</td>
+                <td data-order="${riskScore}"><span class="badge ${riskClass}">${riskScore}</span></td>
+                <td data-order="${h.packets_sent}">${formatNumber(h.packets_sent)}</td>
+                <td data-order="${h.packets_received}">${formatNumber(h.packets_received)}</td>
+                <td data-order="${h.bytes_sent}">${formatBytes(h.bytes_sent)}</td>
+                <td data-order="${h.bytes_received}">${formatBytes(h.bytes_received)}</td>
+                <td>${protocols || '-'}</td>
+                <td data-order="${h.alert_count}">${alertsBadge}</td>
+                <td>
+                    <button class="btn btn-sm btn-outline-primary open-host-btn" data-host-id="${Number(h.id)}" title="Editar máquina / associar IPs">
+                        <i class="fas fa-edit"></i>
+                    </button>
+                </td>
+            </tr>
+        `);
+    });
+
+    hostsDataTable = $('#hosts-table').DataTable({
+        order: [[8, 'desc']],
+        pageLength: 25,
+        language: { url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/pt-BR.json' },
+    });
+    setIpsViewMode(ipsViewMode);
+}
+
+function fillHostDeviceTypes(selected) {
+    const sel = $('#host-device-type');
+    if (sel.children().length === 0) {
+        $('#edit-ip-device-type option').each(function() {
+            sel.append($('<option>').val(this.value).text(this.textContent));
+        });
+    }
+    sel.val(selected || 'Computador');
+}
+
+function openHostModal(hostId) {
+    $.ajax({
+        url: `/api/hosts/${Number(hostId)}`,
+        type: 'GET',
+        success: function(resp) {
+            if (!resp.success) return;
+            renderHostModal(resp.data);
+            bootstrap.Modal.getOrCreateInstance('#hostModal').show();
+        },
+        error: function() { showNotify('Erro ao carregar a máquina', 'error'); }
+    });
+}
+
+function newHostModal() {
+    renderHostModal(null);
+    bootstrap.Modal.getOrCreateInstance('#hostModal').show();
+}
+
+function renderHostModal(h) {
+    const isNew = !h;
+    $('#host-id').val(isNew ? '' : h.id);
+    $('#host-modal-title').text(isNew ? 'Nova máquina (manual)' : (h.display_name || h.mac_address || 'Máquina'));
+    $('#host-name').val(isNew ? '' : (h.name || ''));
+    $('#host-description').val(isNew ? '' : (h.description || ''));
+    fillHostDeviceTypes(isNew ? null : h.device_type);
+
+    const discovered = !isNew && h.discovered_name;
+    $('#host-discovered-hint').text(discovered
+        ? `Nome encontrado na rede: ${h.discovered_name}. Deixe em branco para voltar a ele.`
+        : (isNew ? 'Máquina sem MAC: associe os IPs abaixo depois de salvar.' : 'Nenhum nome encontrado na rede.'));
+
+    const changed = !isNew && h.discovered_name_previous;
+    $('#host-name-changed-alert').prop('hidden', !changed);
+    if (changed) {
+        $('#host-name-changed-text').text(
+            `O nome desta máquina na rede mudou de ${h.discovered_name_previous} para ${h.discovered_name}. O nome exibido não foi alterado.`);
+    }
+
+    const meta = [];
+    if (!isNew) {
+        if (h.mac_address) meta.push(`MAC: ${h.mac_address}`);
+        if (h.is_manual) meta.push('Criada manualmente');
+        if (h.first_seen_at) meta.push(`Vista primeiro em ${new Date(h.first_seen_at).toLocaleString('pt-BR')}`);
+        if (h.last_seen_at) meta.push(`última vez em ${new Date(h.last_seen_at).toLocaleString('pt-BR')}`);
+    }
+    $('#host-meta').text(meta.join(' · '));
+
+    const tbody = $('#host-ips-tbody').empty();
+    const ips = isNew ? [] : (h.ips || []);
+    if (ips.length === 0) {
+        tbody.append('<tr><td colspan="4" class="text-muted">Nenhum endereço associado.</td></tr>');
+    }
+    ips.forEach(b => {
+        const source = b.excluded
+            ? '<span class="badge bg-light text-dark" title="Associação automática removida por você; não volta nas próximas análises">removido</span>'
+            : (b.source === 'manual'
+                ? `<span class="badge bg-primary" title="${escHtml(b.created_by ? 'por ' + b.created_by : '')}">manual</span>`
+                : '<span class="badge bg-secondary">automática</span>');
+        const action = b.excluded
+            ? `<button class="btn btn-sm btn-outline-primary host-rebind-btn" data-ip="${escHtml(b.ip)}" title="Associar de novo (manual)"><i class="fas fa-undo"></i></button>`
+            : `<button class="btn btn-sm btn-outline-danger host-unbind-btn" data-ip="${escHtml(b.ip)}" title="Desassociar"><i class="fas fa-unlink"></i></button>`;
+        tbody.append(`
+            <tr class="${b.excluded ? 'text-muted' : ''}">
+                <td><code>${escHtml(b.ip)}</code></td>
+                <td>${escHtml(IP_SCOPE_LABELS[b.scope] || (b.family === 6 ? 'IPv6' : 'IPv4'))}</td>
+                <td>${source}</td>
+                <td class="text-end">${action}</td>
+            </tr>`);
+    });
+
+    $('#host-bind-ip').val('').prop('disabled', isNew);
+    $('#host-bind-btn').prop('disabled', isNew);
+    $('#host-delete-btn').prop('hidden', isNew || !h.is_manual);
+}
+
+function saveHost() {
+    const id = $('#host-id').val();
+    const payload = {
+        name: $('#host-name').val().trim(),
+        description: $('#host-description').val().trim(),
+        device_type: $('#host-device-type').val(),
+    };
+    if (!id && !payload.name) {
+        showNotify('Informe um nome para a máquina', 'warning');
+        return;
+    }
+    $.ajax({
+        url: id ? `/api/hosts/${Number(id)}` : '/api/hosts',
+        type: id ? 'PATCH' : 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify(payload),
+        success: function(resp) {
+            if (!resp.success) return;
+            showNotify(id ? 'Máquina salva' : 'Máquina criada — agora associe os IPs', 'success');
+            renderHostModal(resp.data);
+            reloadCurrentResults();
+        },
+        error: function(xhr) {
+            showNotify((xhr.responseJSON && xhr.responseJSON.error) || 'Erro ao salvar a máquina', 'error');
+        }
+    });
+}
+
+function bindHostIp(ipOverride) {
+    const id = $('#host-id').val();
+    const ip = (ipOverride || $('#host-bind-ip').val() || '').trim();
+    if (!id || !ip) return;
+    $.ajax({
+        url: `/api/hosts/${Number(id)}/ips`,
+        type: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ ip }),
+        success: function(resp) {
+            if (!resp.success) return;
+            showNotify(`IP ${ip} associado`, 'success');
+            renderHostModal(resp.data);
+            reloadCurrentResults();
+        },
+        error: function(xhr) {
+            showNotify((xhr.responseJSON && xhr.responseJSON.error) || 'Erro ao associar o IP', 'error');
+        }
+    });
+}
+
+function unbindHostIp(ip) {
+    const id = $('#host-id').val();
+    if (!id || !ip) return;
+    $.ajax({
+        url: `/api/hosts/${Number(id)}/ips?ip=${encodeURIComponent(ip)}`,
+        type: 'DELETE',
+        success: function(resp) {
+            if (!resp.success) return;
+            showNotify(resp.outcome === 'excluded'
+                ? `IP ${ip} removido — não será associado de novo automaticamente`
+                : `IP ${ip} desassociado`, 'success');
+            renderHostModal(resp.data);
+            reloadCurrentResults();
+        },
+        error: function() { showNotify('Erro ao desassociar o IP', 'error'); }
+    });
+}
+
+function ackHostNameChange() {
+    const id = $('#host-id').val();
+    if (!id) return;
+    $.ajax({
+        url: `/api/hosts/${Number(id)}`,
+        type: 'PATCH',
+        contentType: 'application/json',
+        data: JSON.stringify({ acknowledge_name_change: true }),
+        success: function(resp) {
+            if (resp.success) { renderHostModal(resp.data); reloadCurrentResults(); }
+        }
+    });
+}
+
+function deleteHost() {
+    const id = $('#host-id').val();
+    if (!id) return;
+    const btn = $('#host-delete-btn');
+    // Confirmação em dois cliques (sem confirm() nativo).
+    if (!btn.data('armed')) {
+        btn.data('armed', true).html('<i class="fas fa-trash"></i> Clique de novo para confirmar');
+        setTimeout(() => btn.data('armed', false).html('<i class="fas fa-trash"></i> Excluir máquina'), 4000);
+        return;
+    }
+    $.ajax({
+        url: `/api/hosts/${Number(id)}`,
+        type: 'DELETE',
+        success: function(resp) {
+            if (!resp.success) return;
+            bootstrap.Modal.getInstance('#hostModal').hide();
+            showNotify('Máquina excluída', 'success');
+            reloadCurrentResults();
+        },
+        error: function(xhr) {
+            showNotify((xhr.responseJSON && xhr.responseJSON.error) || 'Erro ao excluir', 'error');
+        }
+    });
+}
+
+function bindHostUi() {
+    $('input[name="ips-view-mode"]').on('change', function() { setIpsViewMode(this.value); });
+    $('#new-host-btn').on('click', newHostModal);
+    $('#host-save-btn').on('click', saveHost);
+    $('#host-bind-btn').on('click', () => bindHostIp());
+    $('#host-bind-ip').on('keydown', e => { if (e.key === 'Enter') bindHostIp(); });
+    $('#host-ack-name-btn').on('click', ackHostNameChange);
+    $('#host-delete-btn').on('click', deleteHost);
+    $('#host-ips-tbody')
+        .on('click', '.host-unbind-btn', function() { unbindHostIp($(this).attr('data-ip')); })
+        .on('click', '.host-rebind-btn', function() { bindHostIp($(this).attr('data-ip')); });
+    $(document).on('click', '.open-host-btn', function() { openHostModal($(this).attr('data-host-id')); });
+    // Tabela escondida no carregamento: recalcula colunas ao abrir a aba.
+    $('button[data-bs-target="#ips"]').on('shown.bs.tab', () => setIpsViewMode(ipsViewMode));
 }
 
 // ==================== IP NAMES ====================

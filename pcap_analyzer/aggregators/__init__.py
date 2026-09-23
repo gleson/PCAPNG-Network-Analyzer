@@ -1621,9 +1621,128 @@ class DnsResolutionAggregator(StreamingAggregator):
         self.analyzer._dns_ip_names = self.ip_names
 
 
+class HostIdentityAggregator(StreamingAggregator):
+    """One host per MAC with all its IPv4/IPv6 addresses (see hosts.py).
+
+    Feeds ARP, IPv6 Neighbor Discovery, DHCP and Ethernet-source bindings
+    plus self-announced names (DHCP option 12, NetBIOS registration/answer,
+    LLMNR/mDNS answers for the sender's own address) into HostObservations.
+    finalize() applies the user's manual bindings from
+    ``settings['host_bindings']`` and exposes:
+
+      results['hosts']          list of host dicts
+      analyzer._ip_host         {ip: host_key}
+      analyzer._hosts_by_key    {host_key: host}
+      analyzer._host_conflicts  manual bindings contradicted by the capture
+    """
+    name = 'host_identity'
+
+    MDNS_PORT = 5353
+
+    def __init__(self, analyzer):
+        super().__init__(analyzer)
+        from ..hosts import HostObservations
+        from ..pkt_view import (
+            BOOTP_LAYER, DHCP_LAYER, LLMNR_LAYER, NBNS_LAYER, NDP_LAYER,
+        )
+        self.obs = HostObservations()
+        self._bootp = BOOTP_LAYER
+        self._dhcp = DHCP_LAYER
+        self._llmnr = LLMNR_LAYER
+        self._nbns = NBNS_LAYER
+        self._ndp = NDP_LAYER
+
+    def update(self, pkt):
+        try:
+            ts = float(pkt.time)
+        except Exception:
+            ts = None
+        obs = self.obs
+        src_mac = pkt[Ether].src if Ether in pkt else None
+        src_ip = pkt[IP].src if IP in pkt else None
+
+        if ARP in pkt:
+            a = pkt[ARP]
+            if a.hwsrc and a.psrc and a.psrc != '0.0.0.0':
+                obs.observe(a.hwsrc, a.psrc, 'arp', ts)
+
+        if self._ndp is not None and self._ndp in pkt:
+            nd = pkt[self._ndp]
+            if nd.lladdr:
+                if nd.nd_type == 136 and nd.tgt:
+                    obs.observe(nd.lladdr, nd.tgt, 'ndp', ts)
+                elif nd.nd_type == 135 and nd.src_ip and nd.src_ip != '::':
+                    obs.observe(nd.lladdr, nd.src_ip, 'ndp', ts)
+
+        if self._bootp is not None and self._bootp in pkt:
+            self._observe_dhcp(pkt, ts)
+
+        if src_mac and src_ip:
+            obs.observe(src_mac, src_ip, 'l2', ts)
+            self._observe_names(pkt, src_mac, src_ip)
+
+    def _observe_dhcp(self, pkt, ts):
+        b = pkt[self._bootp]
+        if not b.chaddr:
+            return
+        msg_type = None
+        hostname = None
+        if self._dhcp is not None and self._dhcp in pkt:
+            for opt in pkt[self._dhcp].options or []:
+                if opt[0] == 'message-type':
+                    msg_type = opt[1]
+                elif opt[0] == 'hostname':
+                    hostname = opt[1]
+        if b.ciaddr and b.ciaddr != '0.0.0.0':
+            self.obs.observe(b.chaddr, b.ciaddr, 'dhcp', ts)
+        # ACK (5): the server confirms the lease for this client MAC.
+        if msg_type == 5 and b.yiaddr and b.yiaddr != '0.0.0.0':
+            self.obs.observe(b.chaddr, b.yiaddr, 'dhcp', ts)
+        if hostname and b.op == 1:
+            self.obs.observe_name(b.chaddr, hostname, 'dhcp')
+
+    def _observe_names(self, pkt, src_mac, src_ip):
+        # A name only identifies THIS machine when the address it maps to is
+        # the sender's own (Responder-style poisoning answers for others).
+        for layer_cls, source in ((self._nbns, 'nbns'), (self._llmnr, 'llmnr')):
+            if layer_cls is not None and layer_cls in pkt:
+                v = pkt[layer_cls]
+                if getattr(v, 'host_name', None) and getattr(v, 'addr', None) == src_ip:
+                    self.obs.observe_name(src_mac, v.host_name, source)
+        if UDP in pkt and DNS in pkt and int(pkt[UDP].sport) == self.MDNS_PORT:
+            d = pkt[DNS]
+            if d.qr != 1 or not d.an:
+                return
+            for rr in d.an:
+                try:
+                    if int(rr.type) not in (1, 28) or str(rr.rdata) != src_ip:
+                        continue
+                    name = rr.rrname
+                    if isinstance(name, bytes):
+                        name = name.decode('utf-8', errors='ignore')
+                    if name.rstrip('.').lower().endswith('.local'):
+                        self.obs.observe_name(src_mac, name, 'mdns')
+                except Exception:
+                    continue
+
+    def finalize(self, results):
+        from ..hosts import build_hosts
+        cfg = (self.analyzer.settings or {}).get('host_bindings') or {}
+        hosts, ip_host, conflicts = build_hosts(
+            self.obs,
+            manual=cfg.get('manual') or [],
+            excluded=cfg.get('excluded') or [],
+        )
+        results['hosts'] = hosts
+        self.analyzer._ip_host = ip_host
+        self.analyzer._hosts_by_key = {h['host_key']: h for h in hosts}
+        self.analyzer._host_conflicts = conflicts
+
+
 STREAMING_AGGREGATORS = [
     SummaryAggregator,
     DnsResolutionAggregator,
+    HostIdentityAggregator,
     MacIpAggregator,
     IpStatsAggregator,
     ProtocolStatsAggregator,

@@ -99,12 +99,15 @@ def analyze_pcap_task(self, filepath, filename):
         )
 
         try:
-            settings['device_types'] = {
-                ip: (info.get('device_type') or 'Computador')
-                for ip, info in db.get_all_ip_names().items()
-            }
+            settings['device_types'] = db.get_device_types_by_ip()
         except Exception:
             settings.setdefault('device_types', {})
+        # Manual IP<->machine bindings and exclusions made by the user.
+        try:
+            settings['host_bindings'] = db.get_host_binding_settings()
+        except Exception as e:
+            print(f"host bindings unavailable: {e}")
+            settings['host_bindings'] = {}
 
         analyzer = PCAPAnalyzer(filepath, settings,
                                 progress_callback=progress_cb)

@@ -336,6 +336,12 @@ def get_results():
             if not results['ips']:
                 return jsonify({"success": False, "error": "No analysis results available"}), 404
 
+            try:
+                from host_view import attach_host_view
+                attach_host_view(results)
+            except Exception as e:
+                print(f"[scans] host view failed: {e}")
+
             return jsonify({"success": True, "data": results, "view": "aggregate"})
 
         elif scan_id:

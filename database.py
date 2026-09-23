@@ -447,6 +447,49 @@ def init_database():
             END $$;
         """)
 
+        # Machines: one row per MAC (or per user-created "manual" host), with
+        # the name the network announced (discovered_name, app-controlled) and
+        # the name the user sees and edits (name). See pcap_analyzer/hosts.py.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hosts (
+                id SERIAL PRIMARY KEY,
+                host_key TEXT UNIQUE NOT NULL,
+                mac_address TEXT,
+                is_manual BOOLEAN NOT NULL DEFAULT FALSE,
+                discovered_name TEXT,
+                discovered_name_previous TEXT,
+                discovered_name_changed_at TIMESTAMPTZ,
+                name TEXT,
+                name_edited BOOLEAN NOT NULL DEFAULT FALSE,
+                description TEXT,
+                device_type TEXT,
+                first_seen_at TIMESTAMPTZ,
+                last_seen_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        # IP <-> machine bindings. source='auto' rows come from captures;
+        # 'manual' rows are user decisions. excluded=TRUE records that the
+        # user removed an automatic binding, so later scans don't re-add it.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS host_ips (
+                id SERIAL PRIMARY KEY,
+                host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+                ip_address TEXT NOT NULL,
+                family SMALLINT,
+                scope TEXT,
+                source TEXT NOT NULL DEFAULT 'auto',
+                excluded BOOLEAN NOT NULL DEFAULT FALSE,
+                first_seen_at TIMESTAMPTZ,
+                last_seen_at TIMESTAMPTZ,
+                created_by TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (host_id, ip_address)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_host_ips_ip ON host_ips(ip_address)')
+
         conn.commit()
 
 
@@ -805,6 +848,13 @@ def save_scan(results, filename):
         print(f"[database] asset recording failed: {e}")
 
     try:
+        hosts = results.get('hosts') or []
+        if hosts:
+            record_hosts(scan_id, scan_time, hosts)
+    except Exception as e:
+        print(f"[database] host recording failed: {e}")
+
+    try:
         if suppression_hits:
             increment_suppression_hits(suppression_hits)
     except Exception as e:
@@ -1006,6 +1056,387 @@ def delete_ip_name(ip_address):
         deleted = cursor.rowcount > 0
         conn.commit()
         return deleted
+
+
+# ==================== HOSTS (machines: IPv4 + IPv6 by MAC) ====================
+#
+# A host is one machine. Discovered hosts are keyed by MAC; hosts the user
+# creates by hand get a 'manual:<id>' key. Two names are kept:
+#   discovered_name  what the network announced (DHCP/NetBIOS/LLMNR/mDNS) —
+#                    maintained by the app, never shown as the main label
+#   name             what the user sees; copied from discovered_name (or from
+#                    a legacy per-IP label) the first time, then only changed
+#                    by the user. When the network name later changes, the
+#                    old one goes to discovered_name_previous so the UI can
+#                    flag it instead of silently renaming the machine.
+
+_UNSET = object()
+
+
+def _epoch_to_dt(ts):
+    try:
+        v = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if v < 946684800:  # pre-2000: no plausible capture clock
+        return None
+    try:
+        return datetime.fromtimestamp(v, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_scan_time(scan_time_iso):
+    try:
+        dt = datetime.fromisoformat(str(scan_time_iso))
+    except (TypeError, ValueError):
+        dt = datetime.now()
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
+
+
+def _host_row(row):
+    d = dict(row)
+    for key in ('discovered_name_changed_at', 'first_seen_at', 'last_seen_at',
+                'created_at', 'updated_at'):
+        if hasattr(d.get(key), 'isoformat'):
+            d[key] = d[key].isoformat()
+    # device_type stays None when unset so a per-IP label's type is not
+    # overridden by a default; the UI shows 'Computador' in that case.
+    d['display_name'] = d.get('name') or d.get('discovered_name') or ''
+    d['name_changed_on_network'] = bool(d.get('discovered_name_previous'))
+    ips = d.get('ips')
+    if isinstance(ips, str):
+        d['ips'] = json.loads(ips)
+    elif ips is None:
+        d['ips'] = []
+    return d
+
+
+_HOSTS_SELECT = '''
+    SELECT h.*,
+           COALESCE(json_agg(json_build_object(
+               'ip', hi.ip_address, 'family', hi.family, 'scope', hi.scope,
+               'source', hi.source, 'excluded', hi.excluded,
+               'first_seen_at', hi.first_seen_at,
+               'last_seen_at', hi.last_seen_at,
+               'created_by', hi.created_by)
+               ORDER BY hi.family, hi.ip_address)
+               FILTER (WHERE hi.id IS NOT NULL), '[]') AS ips
+    FROM hosts h
+    LEFT JOIN host_ips hi ON hi.host_id = h.id
+'''
+
+
+def record_hosts(scan_id, scan_time_iso, hosts):  # noqa: ARG001 (scan_id kept for symmetry)
+    """Upsert the hosts an analysis found (results['hosts']).
+
+    * New MAC host: name = the user's legacy per-IP label for one of its
+      addresses (IPv4 first) if any, else the discovered name.
+    * Existing host: discovered_name is refreshed (old value kept in
+      discovered_name_previous when it changes); name is filled only while
+      empty, or replaced by a per-IP label while the user never edited it.
+    * Automatic IP bindings are upserted; manual and user-excluded rows are
+      never touched here.
+    """
+    if not hosts:
+        return
+    scan_dt = _parse_scan_time(scan_time_iso)
+    ip_labels = get_all_ip_names()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        for h in hosts:
+            key = h.get('host_key')
+            if not key:
+                continue
+            addrs = h.get('addresses') or []
+            firsts = [d for d in (_epoch_to_dt(a.get('first_ts')) for a in addrs) if d]
+            lasts = [d for d in (_epoch_to_dt(a.get('last_ts')) for a in addrs) if d]
+            first_seen = min(firsts) if firsts else scan_dt
+            last_seen = max(lasts) if lasts else scan_dt
+            discovered = h.get('discovered_name')
+            label = None
+            for a in sorted(addrs, key=lambda a: (a.get('family') or 9, a['ip'])):
+                info = ip_labels.get(a['ip'])
+                if info and info.get('name'):
+                    label = info
+                    break
+
+            cursor.execute('SELECT * FROM hosts WHERE host_key = %s FOR UPDATE', (key,))
+            row = cursor.fetchone()
+            if row is None:
+                if h.get('manual'):
+                    continue  # the user deleted this manual host meanwhile
+                cursor.execute('''
+                    INSERT INTO hosts (host_key, mac_address, is_manual,
+                        discovered_name, name, name_edited, description,
+                        device_type, first_seen_at, last_seen_at)
+                    VALUES (%s, %s, FALSE, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                ''', (
+                    key, h.get('mac'), discovered,
+                    label['name'] if label else discovered,
+                    bool(label),
+                    label.get('description') if label else None,
+                    label.get('device_type') if label else None,
+                    first_seen, last_seen,
+                ))
+                host_id = cursor.fetchone()['id']
+            else:
+                host_id = row['id']
+                sets = ['last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s)',
+                        'first_seen_at = LEAST(COALESCE(first_seen_at, %s), %s)',
+                        'updated_at = NOW()']
+                params = [last_seen, last_seen, first_seen, first_seen]
+                if discovered and discovered != row['discovered_name']:
+                    if row['discovered_name']:
+                        sets += ['discovered_name_previous = %s',
+                                 'discovered_name_changed_at = NOW()']
+                        params.append(row['discovered_name'])
+                    sets.append('discovered_name = %s')
+                    params.append(discovered)
+                if not row['name_edited'] and label:
+                    sets += ['name = %s', 'name_edited = TRUE',
+                             'device_type = COALESCE(device_type, %s)',
+                             'description = COALESCE(description, %s)']
+                    params += [label['name'], label.get('device_type'),
+                               label.get('description')]
+                elif not row['name'] and discovered:
+                    sets.append('name = %s')
+                    params.append(discovered)
+                params.append(host_id)
+                cursor.execute(
+                    f'UPDATE hosts SET {", ".join(sets)} WHERE id = %s', params)
+
+            auto_rows = []
+            for a in addrs:
+                a_first = _epoch_to_dt(a.get('first_ts')) or scan_dt
+                a_last = _epoch_to_dt(a.get('last_ts')) or scan_dt
+                if a.get('binding') == 'manual':
+                    cursor.execute('''
+                        UPDATE host_ips SET
+                            last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
+                            first_seen_at = LEAST(COALESCE(first_seen_at, %s), %s)
+                        WHERE host_id = %s AND ip_address = %s
+                    ''', (a_last, a_last, a_first, a_first, host_id, a['ip']))
+                    continue
+                auto_rows.append((host_id, a['ip'], a.get('family'),
+                                  a.get('scope'), a_first, a_last))
+            if auto_rows:
+                psycopg2.extras.execute_values(cursor, '''
+                    INSERT INTO host_ips (host_id, ip_address, family, scope,
+                                          first_seen_at, last_seen_at)
+                    VALUES %s
+                    ON CONFLICT (host_id, ip_address) DO UPDATE SET
+                        family = EXCLUDED.family,
+                        scope = EXCLUDED.scope,
+                        first_seen_at = LEAST(host_ips.first_seen_at, EXCLUDED.first_seen_at),
+                        last_seen_at = GREATEST(host_ips.last_seen_at, EXCLUDED.last_seen_at)
+                ''', auto_rows)
+        conn.commit()
+
+
+def list_hosts():
+    """All machines with their IP bindings (excluded ones flagged)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(_HOSTS_SELECT + '''
+            GROUP BY h.id
+            ORDER BY LOWER(COALESCE(h.name, h.discovered_name, h.host_key))
+        ''')
+        return [_host_row(r) for r in cursor.fetchall()]
+
+
+def get_host(host_id):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(_HOSTS_SELECT + ' WHERE h.id = %s GROUP BY h.id', (host_id,))
+        row = cursor.fetchone()
+        return _host_row(row) if row else None
+
+
+def create_manual_host(name, description=None, device_type=None):
+    """A machine that exists only by user action (e.g. a server in another
+    subnet whose MAC the capture never sees). Returns the new id."""
+    import uuid
+    if device_type and device_type not in DEVICE_TYPES:
+        device_type = None
+    key = 'manual:' + uuid.uuid4().hex[:12]
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO hosts (host_key, is_manual, name, name_edited,
+                               description, device_type)
+            VALUES (%s, TRUE, %s, TRUE, %s, %s) RETURNING id
+        ''', (key, name, description, device_type))
+        host_id = cursor.fetchone()['id']
+        conn.commit()
+        return host_id
+
+
+def update_host(host_id, name=_UNSET, description=_UNSET, device_type=_UNSET,
+                acknowledge_name_change=False):
+    """Edit a machine. name='' resets it to the discovered name (and marks
+    it as not edited, so it follows future per-IP labels again)."""
+    sets, params = [], []
+    if name is not _UNSET:
+        name = (name or '').strip()
+        if name:
+            sets += ['name = %s', 'name_edited = TRUE']
+            params.append(name)
+        else:
+            sets += ['name = discovered_name', 'name_edited = FALSE']
+    if description is not _UNSET:
+        sets.append('description = %s')
+        params.append(description or None)
+    if device_type is not _UNSET:
+        if device_type and device_type not in DEVICE_TYPES:
+            raise ValueError('invalid device_type')
+        sets.append('device_type = %s')
+        params.append(device_type or None)
+    if acknowledge_name_change:
+        sets += ['discovered_name_previous = NULL',
+                 'discovered_name_changed_at = NULL']
+    if not sets:
+        return get_host(host_id)
+    sets.append('updated_at = NOW()')
+    params.append(host_id)
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f'UPDATE hosts SET {", ".join(sets)} WHERE id = %s', params)
+        found = cursor.rowcount > 0
+        conn.commit()
+    return get_host(host_id) if found else None
+
+
+def delete_host(host_id):
+    """Delete a MANUAL machine (its bindings go with it). Discovered hosts
+    cannot be deleted — the next capture would recreate them; unbind their
+    IPs instead. Returns True/False; raises ValueError for discovered hosts."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT is_manual FROM hosts WHERE id = %s', (host_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        if not row['is_manual']:
+            raise ValueError('only manual hosts can be deleted')
+        cursor.execute('DELETE FROM hosts WHERE id = %s', (host_id,))
+        conn.commit()
+        return True
+
+
+def bind_host_ip(host_id, ip, created_by=None):
+    """Manually bind `ip` to a machine. The IP leaves any OTHER machine's
+    manual bindings (an address belongs to one machine by user decision).
+    Raises ValueError for addresses a host cannot own."""
+    from pcap_analyzer.hosts import classify_ip
+    try:
+        ip = str(ipaddress.ip_address(str(ip).strip()))
+    except ValueError:
+        raise ValueError('invalid IP address')
+    family, scope = classify_ip(ip)
+    if family is None:
+        raise ValueError('address cannot belong to a host (multicast/broadcast/unspecified)')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM hosts WHERE id = %s', (host_id,))
+        if cursor.fetchone() is None:
+            return False
+        cursor.execute('''
+            DELETE FROM host_ips
+            WHERE ip_address = %s AND source = 'manual' AND host_id <> %s
+        ''', (ip, host_id))
+        cursor.execute('''
+            INSERT INTO host_ips (host_id, ip_address, family, scope, source,
+                                  excluded, created_by)
+            VALUES (%s, %s, %s, %s, 'manual', FALSE, %s)
+            ON CONFLICT (host_id, ip_address) DO UPDATE SET
+                source = 'manual', excluded = FALSE,
+                created_by = EXCLUDED.created_by, created_at = NOW()
+        ''', (host_id, ip, family, scope, created_by))
+        conn.commit()
+        return True
+
+
+def unbind_host_ip(host_id, ip):
+    """Remove an IP from a machine. A manual binding is deleted; an automatic
+    one is marked excluded so later captures do not re-bind it.
+    Returns 'deleted', 'excluded' or None (no such binding)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, source FROM host_ips WHERE host_id = %s AND ip_address = %s
+        ''', (host_id, ip))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if row['source'] == 'manual':
+            cursor.execute('DELETE FROM host_ips WHERE id = %s', (row['id'],))
+            outcome = 'deleted'
+        else:
+            cursor.execute('UPDATE host_ips SET excluded = TRUE WHERE id = %s', (row['id'],))
+            outcome = 'excluded'
+        conn.commit()
+        return outcome
+
+
+def get_host_binding_settings():
+    """User decisions the analysis engine must honour
+    (settings['host_bindings'] for HostIdentityAggregator)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT h.host_key, h.mac_address, hi.ip_address, hi.source, hi.excluded
+            FROM host_ips hi JOIN hosts h ON h.id = hi.host_id
+            WHERE hi.source = 'manual' OR hi.excluded
+        ''')
+        manual, excluded = [], []
+        for r in cursor.fetchall():
+            if r['excluded']:
+                excluded.append({'host_key': r['host_key'], 'ip': r['ip_address']})
+            else:
+                manual.append({'host_key': r['host_key'], 'ip': r['ip_address'],
+                               'mac': r['mac_address']})
+        return {'manual': manual, 'excluded': excluded}
+
+
+def get_ip_host_map():
+    """{ip: machine} for every bound IP. A manual binding wins; otherwise the
+    automatic binding seen most recently (DHCP may have moved the address)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT DISTINCT ON (hi.ip_address)
+                   hi.ip_address, hi.source, h.id, h.host_key, h.mac_address,
+                   h.is_manual, h.name, h.discovered_name,
+                   h.discovered_name_previous, h.description, h.device_type
+            FROM host_ips hi JOIN hosts h ON h.id = hi.host_id
+            WHERE NOT hi.excluded
+            ORDER BY hi.ip_address, (hi.source = 'manual') DESC,
+                     hi.last_seen_at DESC NULLS LAST
+        ''')
+        out = {}
+        for r in cursor.fetchall():
+            d = dict(r)
+            d['display_name'] = d.get('name') or d.get('discovered_name') or ''
+            out[d.pop('ip_address')] = d
+        return out
+
+
+def get_device_types_by_ip():
+    """IP -> device type for the detectors: per-IP labels, overridden by the
+    machine's type when the IP is bound to a machine that has one."""
+    types = {ip: (info.get('device_type') or DEVICE_TYPE_DEFAULT)
+             for ip, info in get_all_ip_names().items()}
+    try:
+        for ip, h in get_ip_host_map().items():
+            if h.get('device_type'):
+                types[ip] = h['device_type']
+    except Exception as e:
+        print(f"[database] host device types unavailable: {e}")
+    return types
 
 
 # ==================== GEOLOCATION OPERATIONS ====================
